@@ -10,6 +10,7 @@ FetchContent_MakeAvailable(googletest)
 add_executable(multi_index_lru_test
     container_test.cpp
     zerialize_test.cpp
+    expirable_test.cpp
 )
 
 target_link_libraries(multi_index_lru_test PRIVATE

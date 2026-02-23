@@ -11,6 +11,7 @@ This library provides an LRU cache that supports multiple indices for efficient 
 - **Composite keys**: Index by combinations of fields (e.g., tenant_id + user_id)
 - **LRU eviction**: Automatically evicts least recently used items when capacity is exceeded
 - **Access tracking**: `find()` operations automatically refresh the item's position in the LRU order
+- **TTL expiration**: Items automatically expire after a configurable time-to-live
 - **Zerialize support**: Cache serialized binary data (MsgPack, CBOR, JSON, Flex, ZERA) with extracted indices
 - **C++20**: Modern C++ with concepts, `[[nodiscard]]`, etc.
 - **Based on Boost.MultiIndex**: Leverages the battle-tested Boost library
@@ -124,6 +125,150 @@ auto by_id = cache.find<IdTag>(1);
 auto by_email = cache.find<EmailTag>(std::string("alice@example.com"));
 auto by_name = cache.find<NameTag>(std::string("Alice"));
 ```
+
+---
+
+## ExpirableContainer (TTL-based expiration)
+
+`ExpirableContainer` extends `Container` with time-to-live (TTL) semantics. Items automatically expire after a configurable duration. Accessing items via `find()` refreshes their expiration timer.
+
+### Basic Usage
+
+```cpp
+#include <multi_index_lru/expirable_container.hpp>
+#include <boost/multi_index/hashed_index.hpp>
+#include <boost/multi_index/ordered_index.hpp>
+
+using namespace std::chrono_literals;
+
+struct Session {
+    std::string session_id;
+    int user_id;
+    std::string username;
+};
+
+struct SessionIdTag {};
+struct UserIdTag {};
+
+// Key extractors that work through TimestampedValue wrapper
+struct SessionIdExtractor {
+    using result_type = std::string;
+    template <typename T>
+    result_type operator()(const T& wrapped) const { 
+        return wrapped.value.session_id; 
+    }
+};
+
+struct UserIdExtractor {
+    using result_type = int;
+    template <typename T>
+    result_type operator()(const T& wrapped) const { 
+        return wrapped.value.user_id; 
+    }
+};
+
+using SessionCache = multi_index_lru::ExpirableContainer<
+    Session,
+    boost::multi_index::indexed_by<
+        boost::multi_index::hashed_unique<
+            boost::multi_index::tag<SessionIdTag>,
+            SessionIdExtractor>,
+        boost::multi_index::ordered_non_unique<
+            boost::multi_index::tag<UserIdTag>,
+            UserIdExtractor>>>;
+
+int main() {
+    // Capacity 1000, 30-minute session timeout
+    SessionCache cache(1000, 30min);
+    
+    cache.insert(Session{"sess-001", 1, "alice"});
+    cache.insert(Session{"sess-002", 1, "alice"});  // Alice has 2 sessions
+    cache.insert(Session{"sess-003", 2, "bob"});
+    
+    // Find refreshes TTL (keeps session alive)
+    auto it = cache.find<SessionIdTag>(std::string("sess-001"));
+    if (it != cache.end<SessionIdTag>()) {
+        std::cout << "Session for: " << it->username << "\n";
+    }
+    
+    // find_no_update does NOT refresh TTL
+    auto it2 = cache.find_no_update<SessionIdTag>(std::string("sess-002"));
+    
+    // Find all sessions for a user
+    auto [begin, end] = cache.equal_range<UserIdTag>(1);
+    for (auto iter = begin; iter != end; ++iter) {
+        std::cout << "Session: " << iter->session_id << "\n";
+    }
+    
+    // Periodic cleanup of expired items
+    cache.cleanup_expired();
+    
+    // Change TTL for future accesses
+    cache.set_ttl(1h);
+}
+```
+
+### Key Differences from Container
+
+| Feature | `Container` | `ExpirableContainer` |
+|---------|-------------|---------------------|
+| Eviction | LRU only | LRU + TTL |
+| `find()` | Updates LRU position | Updates LRU + refreshes TTL |
+| `find_no_update()` | Doesn't update LRU | Doesn't update LRU or TTL |
+| `cleanup_expired()` | N/A | Removes expired items |
+| Key extractors | Use `member<>` directly | Must drill through `TimestampedValue` |
+
+### Key Extractors for ExpirableContainer
+
+Since `ExpirableContainer` wraps values in `TimestampedValue<Value>`, key extractors must access `wrapped.value`:
+
+```cpp
+// Custom extractor for regular struct
+struct IdExtractor {
+    using result_type = int;
+    template <typename T>
+    result_type operator()(const T& wrapped) const { 
+        return wrapped.value.id; 
+    }
+};
+
+// For zerialize entries, use timestamped_key<N, Entry>
+using Entry = multi_index_lru::ZerializeEntry<std::tuple<int64_t, std::string>>;
+
+using ExpirableZerializeCache = multi_index_lru::ExpirableContainer<
+    Entry,
+    boost::multi_index::indexed_by<
+        boost::multi_index::ordered_unique<
+            boost::multi_index::tag<IdTag>,
+            multi_index_lru::timestamped_key<0, Entry>>,  // Use timestamped_key
+        boost::multi_index::ordered_non_unique<
+            boost::multi_index::tag<NameTag>,
+            multi_index_lru::timestamped_key<1, Entry>>>>;
+```
+
+### API Reference - ExpirableContainer
+
+```cpp
+template <typename Value, typename IndexSpecifierList, typename Allocator = std::allocator<Value>>
+class ExpirableContainer;
+```
+
+#### Constructor
+
+- `ExpirableContainer(size_type max_size, duration_type ttl)` - Create with capacity and TTL
+
+#### TTL-specific Methods
+
+- `void cleanup_expired()` - Remove all expired items (call periodically)
+- `duration_type ttl() const` - Get current TTL
+- `void set_ttl(duration_type new_ttl)` - Change TTL for future accesses
+
+#### Lookup Methods
+
+- `template<typename Tag> auto find(const auto& key)` - Find, check TTL, refresh if not expired
+- `template<typename Tag> auto find_no_update(const auto& key)` - Find without checking/refreshing TTL
+- `template<typename Tag> auto equal_range(const auto& key)` - Range query, removes expired, refreshes others
+- `template<typename Tag> auto equal_range_no_update(const auto& key)` - Range query without updates
 
 ---
 

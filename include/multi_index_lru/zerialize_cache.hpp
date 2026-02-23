@@ -18,6 +18,7 @@
 /// @brief LRU cache for zerialize data with compile-time index configuration
 
 #include <multi_index_lru/container.hpp>
+#include <multi_index_lru/expirable_container.hpp>
 #include <multi_index_lru/zerialize_entry.hpp>
 
 #include <boost/multi_index/composite_key.hpp>
@@ -51,6 +52,28 @@ template <std::size_t N, typename Entry>
 struct key {
     using result_type = std::tuple_element_t<N, typename Entry::keys_type>;
 
+    result_type operator()(const Entry& entry) const {
+        return std::get<N>(entry.keys);
+    }
+};
+
+/// @brief Key extractor that works through TimestampedValue wrapper
+/// @tparam N Index of the key in the tuple
+/// @tparam Entry The underlying ZerializeEntry type (without TimestampedValue wrapper)
+///
+/// Use this with ExpirableContainer which wraps entries in TimestampedValue.
+template <std::size_t N, typename Entry>
+struct timestamped_key {
+    using result_type = std::tuple_element_t<N, typename Entry::keys_type>;
+
+    // Extract from TimestampedValue<Entry>
+    template <typename TimestampedEntry>
+        requires requires(const TimestampedEntry& t) { t.value.keys; }
+    result_type operator()(const TimestampedEntry& wrapped) const {
+        return std::get<N>(wrapped.value.keys);
+    }
+
+    // Also support direct Entry access (for flexibility)
     result_type operator()(const Entry& entry) const {
         return std::get<N>(entry.keys);
     }

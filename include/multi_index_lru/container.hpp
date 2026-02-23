@@ -23,12 +23,18 @@
 #include <boost/multi_index/sequenced_index.hpp>
 #include <boost/multi_index_container.hpp>
 
+#include <cassert>
+#include <chrono>
 #include <cstddef>
 #include <tuple>
 #include <type_traits>
 #include <utility>
 
 namespace multi_index_lru {
+
+// Forward declaration
+template <typename Value, typename IndexSpecifierList, typename Allocator>
+class ExpirableContainer;
 
 namespace detail {
 
@@ -77,6 +83,68 @@ struct add_seq_index<boost::multi_index::indexed_by<Indices...>> {
 
 template <typename IndexList>
 using add_seq_index_t = typename add_seq_index<IndexList>::type;
+
+/// Wrapper that adds timestamp to stored values for TTL tracking
+template <typename Value>
+struct TimestampedValue {
+    Value value;
+    mutable std::chrono::steady_clock::time_point last_accessed;
+    
+    TimestampedValue() = default;
+    
+    explicit TimestampedValue(const Value& val) 
+        : value(val), last_accessed(std::chrono::steady_clock::now()) {}
+        
+    explicit TimestampedValue(Value&& val) 
+        : value(std::move(val)), last_accessed(std::chrono::steady_clock::now()) {}
+    
+    // Implicit conversions for transparent access
+    operator Value&() { return value; }
+    operator const Value&() const { return value; }
+    
+    Value* operator->() { return &value; }
+    const Value* operator->() const { return &value; }
+
+    Value& operator*() { return value; }
+    const Value& operator*() const { return value; }
+    
+    Value& get() { return value; }
+    const Value& get() const { return value; }
+};
+
+/// Iterator wrapper that transparently unwraps TimestampedValue
+template <typename Iterator>
+class TimestampedIteratorWrapper {
+public:
+    using iterator_type = Iterator;
+    using wrapped_type = typename std::iterator_traits<Iterator>::value_type;
+    using value_type = decltype(std::declval<wrapped_type>().value);
+    using difference_type = typename std::iterator_traits<Iterator>::difference_type;
+    using pointer = std::remove_reference_t<value_type>*;
+    using reference = value_type&;
+    using iterator_category = typename std::iterator_traits<Iterator>::iterator_category;
+
+    TimestampedIteratorWrapper() = default;
+    TimestampedIteratorWrapper(Iterator iter) : iter_(std::move(iter)) {}
+    
+    // Unwrap to get the inner value
+    auto& operator*() const { return iter_->value; }
+    auto* operator->() const { return &(iter_->value); }
+    
+    TimestampedIteratorWrapper& operator++() { ++iter_; return *this; }
+    TimestampedIteratorWrapper operator++(int) { auto tmp = *this; ++iter_; return tmp; }
+    TimestampedIteratorWrapper& operator--() { --iter_; return *this; }
+    TimestampedIteratorWrapper operator--(int) { auto tmp = *this; --iter_; return tmp; }
+    
+    bool operator==(const TimestampedIteratorWrapper& other) const { return iter_ == other.iter_; }
+    bool operator!=(const TimestampedIteratorWrapper& other) const { return iter_ != other.iter_; }
+    
+    // Access to underlying iterator for internal use
+    Iterator base() const { return iter_; }
+    
+private:
+    Iterator iter_;
+};
 
 }  // namespace detail
 
@@ -173,6 +241,43 @@ public:
         return it;
     }
 
+    /// @brief Find element without updating LRU position
+    /// @tparam Tag Index tag type
+    /// @param key Key to search for
+    /// @return Iterator to found element, or end() if not found
+    template <typename Tag, typename Key = void>
+    auto find_no_update(const auto& key) {
+        return container_.template get<Tag>().find(key);
+    }
+
+    /// @brief Find range of elements with matching key (for non-unique indices)
+    /// @tparam Tag Index tag type  
+    /// @param key Key to search for
+    /// @return Pair of iterators defining the range
+    ///
+    /// All elements in range are moved to front (most recently used).
+    template <typename Tag, typename Key = void>
+    auto equal_range(const auto& key) {
+        auto& primary_index = container_.template get<Tag>();
+        auto [begin, end] = primary_index.equal_range(key);
+        
+        auto& seq_index = container_.template get<0>();
+        for (auto it = begin; it != end; ++it) {
+            seq_index.relocate(seq_index.begin(), container_.template project<0>(it));
+        }
+        
+        return std::pair{begin, end};
+    }
+
+    /// @brief Find range of elements without updating LRU position
+    /// @tparam Tag Index tag type
+    /// @param key Key to search for
+    /// @return Pair of iterators defining the range
+    template <typename Tag, typename Key = void>
+    auto equal_range_no_update(const auto& key) {
+        return container_.template get<Tag>().equal_range(key);
+    }
+
     /// @brief Check if element exists by key
     /// @tparam Tag Index tag type
     /// @tparam Key Key type (can often be deduced)
@@ -260,6 +365,21 @@ public:
     /// @brief Access underlying boost::multi_index_container (const)
     [[nodiscard]] const auto& get_container() const noexcept { return container_; }
 
+    /// @brief Get a specific index by tag
+    /// @tparam Tag Index tag type
+    template <typename Tag>
+    [[nodiscard]] auto& get_index() { return container_.template get<Tag>(); }
+
+    /// @brief Get a specific index by tag (const)
+    template <typename Tag>
+    [[nodiscard]] const auto& get_index() const { return container_.template get<Tag>(); }
+
+    /// @brief Get the sequenced (LRU) index
+    [[nodiscard]] auto& get_sequenced() { return container_.template get<0>(); }
+
+    /// @brief Get the sequenced (LRU) index (const)
+    [[nodiscard]] const auto& get_sequenced() const { return container_.template get<0>(); }
+
 private:
     using ExtendedIndexSpecifierList = detail::add_seq_index_t<IndexSpecifierList>;
 
@@ -270,6 +390,10 @@ private:
 
     BoostContainer container_;
     size_type max_size_;
+
+    // Allow ExpirableContainer to access internals
+    template <typename V, typename I, typename A>
+    friend class ExpirableContainer;
 };
 
 }  // namespace multi_index_lru
