@@ -406,6 +406,25 @@ ctest  # Run tests
 
 - `MULTI_INDEX_LRU_BUILD_TESTS` - Build tests (default: ON)
 - `MULTI_INDEX_LRU_BUILD_EXAMPLES` - Build examples (default: ON)
+- `MULTI_INDEX_LRU_USE_BOOST_DEVELOP` - Use Boost.MultiIndex develop branch (default: OFF)
+
+### Using Boost.MultiIndex Develop Branch
+
+The develop branch of Boost.MultiIndex contains a [major refactoring](https://bannalia.blogspot.com/2025/12/boostmultiindex-refactored.html) for Boost 1.91 that:
+
+- Replaces Boost.MPL with Boost.Mp11 and C++11 variadic templates
+- Significantly reduces type name lengths (better error messages, smaller binaries)
+- Makes `composite_key` truly variadic (no more `BOOST_MULTI_INDEX_LIMIT_COMPOSITE_KEY_SIZE`)
+
+To use the develop branch:
+
+```bash
+mkdir build && cd build
+cmake .. -DMULTI_INDEX_LRU_USE_BOOST_DEVELOP=ON
+cmake --build .
+```
+
+This will automatically fetch the required Boost modules from GitHub. Note that installation (`cmake --install`) is not available when using this option.
 
 ## How It Works
 
