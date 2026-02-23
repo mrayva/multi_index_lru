@@ -1,0 +1,9 @@
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+
+find_dependency(Boost 1.74)
+
+include("${CMAKE_CURRENT_LIST_DIR}/multi_index_lru-targets.cmake")
+
+check_required_components(multi_index_lru)
