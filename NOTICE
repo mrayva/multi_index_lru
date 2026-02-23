@@ -1,0 +1,15 @@
+multi_index_lru
+Copyright 2024 Yandex LLC and userver contributors
+Copyright 2026 multi_index_lru contributors
+
+This project is derived from the multi-index-lru library, which is part of
+the userver framework (https://github.com/userver-framework/userver).
+
+The original work is licensed under the Apache License, Version 2.0.
+
+Modifications from the original:
+- Removed userver framework dependencies (USERVER_NAMESPACE macros, etc.)
+- Adapted to be a standalone header-only library
+- Added C++20 features ([[nodiscard]], noexcept, auto parameters)
+- Added iteration support and get_container() accessor
+- Created standalone CMake build system

@@ -191,4 +191,7 @@ Based on the multi-index-lru library from [userver](https://github.com/userver-f
 
 ## License
 
-MIT License (or your preferred license)
+Apache License 2.0 - see [LICENSE](LICENSE) for details.
+
+This project is derived from the userver framework, which is also licensed under Apache 2.0.
+See [NOTICE](NOTICE) for attribution.
