@@ -22,6 +22,7 @@
 
 #include <cassert>
 #include <chrono>
+#include <stdexcept>
 
 namespace multi_index_lru {
 
@@ -76,6 +77,9 @@ public:
     explicit ExpirableContainer(size_type max_size, duration_type ttl)
         : container_(max_size), ttl_(ttl)
     {
+        if (ttl.count() <= 0) {
+            throw std::invalid_argument("TTL must be positive");
+        }
         assert(ttl.count() > 0 && "TTL must be positive");
     }
 
@@ -152,6 +156,16 @@ public:
         return detail::TimestampedIteratorWrapper{it};
     }
 
+    /// @brief Find element without updating timestamp or checking TTL (const overload)
+    /// @tparam Tag Index tag type
+    /// @param key Key to search for
+    /// @return Wrapped iterator to found element, or end() if not found
+    template <typename Tag, typename Key = void>
+    auto find_no_update(const auto& key) const {
+        auto it = container_.template find_no_update<Tag>(key);
+        return detail::TimestampedIteratorWrapper{it};
+    }
+
     /// @brief Find range of elements, checking TTL and refreshing timestamps
     /// @tparam Tag Index tag type
     /// @param key Key to search for
@@ -202,6 +216,18 @@ public:
             detail::TimestampedIteratorWrapper{end}};
     }
 
+    /// @brief Find range of elements without updating timestamps (const overload)
+    /// @tparam Tag Index tag type
+    /// @param key Key to search for
+    /// @return Pair of wrapped iterators defining the range
+    template <typename Tag, typename Key = void>
+    auto equal_range_no_update(const auto& key) const {
+        auto [begin, end] = container_.template equal_range_no_update<Tag>(key);
+        return std::pair{
+            detail::TimestampedIteratorWrapper{begin},
+            detail::TimestampedIteratorWrapper{end}};
+    }
+
     /// @brief Check if element exists (checking TTL)
     /// @tparam Tag Index tag type
     /// @param key Key to search for
@@ -209,6 +235,15 @@ public:
     template <typename Tag, typename Key = void>
     bool contains(const auto& key) {
         return this->template find<Tag, Key>(key) != this->template end<Tag>();
+    }
+
+    /// @brief Check if element exists without updating timestamp or checking TTL
+    /// @tparam Tag Index tag type
+    /// @param key Key to search for
+    /// @return true if element exists, even if expired
+    template <typename Tag, typename Key = void>
+    bool contains_no_update(const auto& key) const {
+        return this->template find_no_update<Tag, Key>(key) != this->template end<Tag>();
     }
 
     /// @brief Erase element by key
@@ -276,6 +311,9 @@ public:
 
     /// @brief Set new TTL (affects future accesses, not existing timestamps)
     void set_ttl(duration_type new_ttl) {
+        if (new_ttl.count() <= 0) {
+            throw std::invalid_argument("TTL must be positive");
+        }
         assert(new_ttl.count() > 0 && "TTL must be positive");
         ttl_ = new_ttl;
     }

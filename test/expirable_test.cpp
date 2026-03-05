@@ -23,6 +23,7 @@
 #include <gtest/gtest.h>
 
 #include <chrono>
+#include <stdexcept>
 #include <string>
 #include <thread>
 
@@ -171,6 +172,15 @@ TEST_F(ExpirableBasicTest, SetCapacity) {
     EXPECT_LE(cache.size(), 2);
 }
 
+TEST_F(ExpirableBasicTest, ParameterValidation) {
+    EXPECT_THROW((EasierUserCache{0, 1h}), std::invalid_argument);
+    EXPECT_THROW((EasierUserCache{3, 0ms}), std::invalid_argument);
+
+    EasierUserCache cache(3, 1h);
+    EXPECT_THROW(cache.set_capacity(0), std::invalid_argument);
+    EXPECT_THROW(cache.set_ttl(0ms), std::invalid_argument);
+}
+
 // =============================================================================
 // TTL Expiration Tests
 // =============================================================================
@@ -234,6 +244,21 @@ TEST(ExpirableTTLTest, FindNoUpdateDoesNotRefresh) {
     
     // Should now be expired
     EXPECT_EQ(cache.find<IdTag>(1), cache.end<IdTag>());
+}
+
+TEST(ExpirableTTLTest, ContainsNoUpdateDoesNotRefresh) {
+    EasierUserCache cache(100, 80ms);
+
+    cache.insert(ExpirableUserValue{1, "alice@test.com", "Alice"});
+    std::this_thread::sleep_for(50ms);
+
+    EXPECT_TRUE(cache.contains_no_update<IdTag>(1));
+    EXPECT_FALSE(cache.contains_no_update<IdTag>(999));
+
+    std::this_thread::sleep_for(50ms);
+
+    // contains() checks TTL and should remove the expired element.
+    EXPECT_FALSE(cache.contains<IdTag>(1));
 }
 
 TEST(ExpirableTTLTest, CleanupExpired) {
@@ -316,6 +341,21 @@ TEST(ExpirableEqualRangeTest, EqualRangeRemovesExpired) {
     // Expired items should be removed
     EXPECT_EQ(begin, end);
     EXPECT_EQ(cache.size(), 0);
+}
+
+TEST(ExpirableEqualRangeTest, EqualRangeNoUpdateConstOverload) {
+    MultiNameCache cache(10, 1h);
+    cache.insert(ExpirableUserValue{1, "john1@test.com", "John"});
+    cache.insert(ExpirableUserValue{2, "john2@test.com", "John"});
+
+    const auto& const_cache = cache;
+    auto [begin, end] = const_cache.equal_range_no_update<NameTag>(std::string("John"));
+
+    int count = 0;
+    for (auto it = begin; it != end; ++it) {
+        ++count;
+    }
+    EXPECT_EQ(count, 2);
 }
 
 // =============================================================================

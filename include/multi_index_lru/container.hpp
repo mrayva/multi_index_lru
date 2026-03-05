@@ -26,6 +26,7 @@
 #include <cassert>
 #include <chrono>
 #include <cstddef>
+#include <stdexcept>
 #include <tuple>
 #include <type_traits>
 #include <utility>
@@ -189,7 +190,11 @@ public:
     /// @param max_size Maximum number of elements before LRU eviction
     explicit Container(size_type max_size)
         : max_size_(max_size)
-    {}
+    {
+        if (max_size_ == 0) {
+            throw std::invalid_argument("Container capacity must be greater than 0");
+        }
+    }
 
     /// @brief Emplace a new element
     /// @param args Arguments forwarded to value constructor
@@ -250,6 +255,15 @@ public:
         return container_.template get<Tag>().find(key);
     }
 
+    /// @brief Find element without updating LRU position (const overload)
+    /// @tparam Tag Index tag type
+    /// @param key Key to search for
+    /// @return Iterator to found element, or end() if not found
+    template <typename Tag, typename Key = void>
+    auto find_no_update(const auto& key) const {
+        return container_.template get<Tag>().find(key);
+    }
+
     /// @brief Find range of elements with matching key (for non-unique indices)
     /// @tparam Tag Index tag type  
     /// @param key Key to search for
@@ -278,6 +292,15 @@ public:
         return container_.template get<Tag>().equal_range(key);
     }
 
+    /// @brief Find range of elements without updating LRU position (const overload)
+    /// @tparam Tag Index tag type
+    /// @param key Key to search for
+    /// @return Pair of iterators defining the range
+    template <typename Tag, typename Key = void>
+    auto equal_range_no_update(const auto& key) const {
+        return container_.template get<Tag>().equal_range(key);
+    }
+
     /// @brief Check if element exists by key
     /// @tparam Tag Index tag type
     /// @tparam Key Key type (can often be deduced)
@@ -288,6 +311,16 @@ public:
     template <typename Tag, typename Key = void>
     bool contains(const auto& key) {
         return this->template find<Tag, Key>(key) != container_.template get<Tag>().end();
+    }
+
+    /// @brief Check if element exists by key without updating LRU position
+    /// @tparam Tag Index tag type
+    /// @tparam Key Key type (can often be deduced)
+    /// @param key Key to search for
+    /// @return true if element exists
+    template <typename Tag, typename Key = void>
+    bool contains_no_update(const auto& key) const {
+        return this->template find_no_update<Tag, Key>(key) != this->template end<Tag>();
     }
 
     /// @brief Erase element by key
@@ -314,6 +347,9 @@ public:
     ///
     /// If new capacity is smaller than current size, LRU elements are evicted.
     void set_capacity(size_type new_capacity) {
+        if (new_capacity == 0) {
+            throw std::invalid_argument("Container capacity must be greater than 0");
+        }
         max_size_ = new_capacity;
         auto& seq_index = container_.template get<0>();
         while (container_.size() > max_size_) {

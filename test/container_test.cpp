@@ -1,5 +1,6 @@
 #include <multi_index_lru/container.hpp>
 
+#include <stdexcept>
 #include <string>
 
 #include <gtest/gtest.h>
@@ -116,6 +117,13 @@ TEST_F(LRUUsersTest, Clear) {
     EXPECT_EQ(cache.size(), 0);
 }
 
+TEST_F(LRUUsersTest, CapacityValidation) {
+    EXPECT_THROW((UserCache{0}), std::invalid_argument);
+
+    UserCache cache(2);
+    EXPECT_THROW(cache.set_capacity(0), std::invalid_argument);
+}
+
 TEST_F(LRUUsersTest, Erase) {
     UserCache cache(3);
     cache.emplace(User{1, "a@test.com", "A"});
@@ -128,6 +136,22 @@ TEST_F(LRUUsersTest, Erase) {
 
     // Erase non-existent
     EXPECT_FALSE(cache.erase<IdTag>(999));
+}
+
+TEST_F(LRUUsersTest, ContainsNoUpdateDoesNotRefreshLru) {
+    UserCache cache(2);
+    cache.emplace(User{1, "a@test.com", "A"});
+    cache.emplace(User{2, "b@test.com", "B"});
+
+    EXPECT_TRUE(cache.contains_no_update<IdTag>(1));
+    EXPECT_FALSE(cache.contains_no_update<IdTag>(999));
+
+    // contains_no_update must not affect recency; id=1 remains LRU and gets evicted.
+    cache.emplace(User{3, "c@test.com", "C"});
+
+    EXPECT_FALSE(cache.contains_no_update<IdTag>(1));
+    EXPECT_TRUE(cache.contains_no_update<IdTag>(2));
+    EXPECT_TRUE(cache.contains_no_update<IdTag>(3));
 }
 
 class ProductsTest : public ::testing::Test {
@@ -183,6 +207,17 @@ TEST_F(ProductsTest, ProductEviction) {
 
     EXPECT_NE(cache.find<NameTag>(std::string("Keyboard")), cache.end<NameTag>());
     EXPECT_EQ(cache.find<NameTag>(std::string("Mouse")), cache.end<NameTag>());
+}
+
+TEST_F(ProductsTest, EqualRangeNoUpdateConstOverload) {
+    ProductCache cache(3);
+    cache.emplace(Product{"A1", "Laptop", 999.99});
+    cache.emplace(Product{"A2", "Mouse", 29.99});
+
+    const auto& const_cache = cache;
+    auto [begin, end] = const_cache.equal_range_no_update<NameTag>(std::string("Laptop"));
+    ASSERT_NE(begin, end);
+    EXPECT_EQ(begin->sku, "A1");
 }
 
 TEST(HashedIndexTest, SimpleUsage) {

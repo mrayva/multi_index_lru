@@ -85,6 +85,11 @@ int main() {
     if (cache.contains<KeyTag>(std::string("key2"))) {
         // ...
     }
+
+    // Read-only existence check (does NOT refresh LRU)
+    if (cache.contains_no_update<KeyTag>(std::string("key2"))) {
+        // ...
+    }
     
     // Erase
     cache.erase<KeyTag>(std::string("key1"));
@@ -215,6 +220,7 @@ int main() {
 | Eviction | LRU only | LRU + TTL |
 | `find()` | Updates LRU position | Updates LRU + refreshes TTL |
 | `find_no_update()` | Doesn't update LRU | Doesn't update LRU or TTL |
+| `contains_no_update()` | Doesn't update LRU | Doesn't update LRU or TTL |
 | `cleanup_expired()` | N/A | Removes expired items |
 | Key extractors | Use `member<>` directly | Must drill through `TimestampedValue` |
 
@@ -255,13 +261,13 @@ class ExpirableContainer;
 
 #### Constructor
 
-- `ExpirableContainer(size_type max_size, duration_type ttl)` - Create with capacity and TTL
+- `ExpirableContainer(size_type max_size, duration_type ttl)` - Create with capacity and TTL (`max_size > 0`, `ttl > 0`, throws `std::invalid_argument` otherwise)
 
 #### TTL-specific Methods
 
 - `void cleanup_expired()` - Remove all expired items (call periodically)
 - `duration_type ttl() const` - Get current TTL
-- `void set_ttl(duration_type new_ttl)` - Change TTL for future accesses
+- `void set_ttl(duration_type new_ttl)` - Change TTL for future accesses (`new_ttl > 0`, throws `std::invalid_argument` otherwise)
 
 #### Lookup Methods
 
@@ -269,6 +275,8 @@ class ExpirableContainer;
 - `template<typename Tag> auto find_no_update(const auto& key)` - Find without checking/refreshing TTL
 - `template<typename Tag> auto equal_range(const auto& key)` - Range query, removes expired, refreshes others
 - `template<typename Tag> auto equal_range_no_update(const auto& key)` - Range query without updates
+- `template<typename Tag> bool contains(const auto& key)` - Existence check that also checks TTL and may erase expired
+- `template<typename Tag> bool contains_no_update(const auto& key)` - Existence check without TTL/LRU updates
 
 ---
 
@@ -462,7 +470,7 @@ class Container;
 
 #### Constructor
 
-- `explicit Container(size_type max_size)` - Create container with given capacity
+- `explicit Container(size_type max_size)` - Create container with given capacity (`max_size > 0`, throws `std::invalid_argument` otherwise)
 
 #### Insertion
 
@@ -474,6 +482,9 @@ class Container;
 
 - `template<typename Tag> auto find(const auto& key)` - Find by key, refreshes LRU position
 - `template<typename Tag> bool contains(const auto& key)` - Check existence, refreshes LRU
+- `template<typename Tag> auto find_no_update(const auto& key)` - Find by key without refreshing LRU
+- `template<typename Tag> auto equal_range_no_update(const auto& key)` - Range query without refreshing LRU
+- `template<typename Tag> bool contains_no_update(const auto& key)` - Existence check without refreshing LRU
 
 #### Removal
 
@@ -485,7 +496,7 @@ class Container;
 - `size_type size() const` - Current element count
 - `bool empty() const` - Check if empty
 - `size_type capacity() const` - Maximum capacity
-- `void set_capacity(size_type new_capacity)` - Change capacity (evicts if needed)
+- `void set_capacity(size_type new_capacity)` - Change capacity (evicts if needed, `new_capacity > 0`, throws `std::invalid_argument` otherwise)
 
 #### Iteration
 
