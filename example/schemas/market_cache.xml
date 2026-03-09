@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<sbe:messageSchema xmlns:sbe="http://fixprotocol.io/2016/sbe"
+                   package="market_cache"
+                   id="1"
+                   version="0"
+                   byteOrder="littleEndian">
+    <types>
+        <composite name="messageHeader">
+            <type name="blockLength" primitiveType="uint16"/>
+            <type name="templateId" primitiveType="uint16"/>
+            <type name="schemaId" primitiveType="uint16"/>
+            <type name="version" primitiveType="uint16"/>
+        </composite>
+        <type name="uint16_req" primitiveType="uint16" presence="required"/>
+        <type name="uint32_req" primitiveType="uint32" presence="required"/>
+    </types>
+
+    <sbe:message name="quote" id="2">
+        <field name="template_id" id="1" type="uint16_req"/>
+        <field name="security_id" id="2" type="uint32_req"/>
+    </sbe:message>
+</sbe:messageSchema>

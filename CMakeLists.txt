@@ -16,6 +16,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 option(MULTI_INDEX_LRU_BUILD_TESTS "Build tests" ON)
 option(MULTI_INDEX_LRU_BUILD_EXAMPLES "Build examples" ON)
 option(MULTI_INDEX_LRU_USE_BOOST_DEVELOP "Use Boost.MultiIndex develop branch (pre-1.91 refactored)" OFF)
+option(MULTI_INDEX_LRU_BUILD_SBEPP_EXAMPLE "Build the sbepp integration example" OFF)
 
 # Boost.MultiIndex handling
 if(MULTI_INDEX_LRU_USE_BOOST_DEVELOP)

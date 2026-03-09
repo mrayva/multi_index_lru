@@ -13,6 +13,7 @@ This library provides an LRU cache that supports multiple indices for efficient 
 - **Access tracking**: `find()` operations automatically refresh the item's position in the LRU order
 - **TTL expiration**: Items automatically expire after a configurable time-to-live
 - **Zerialize support**: Cache serialized binary data (MsgPack, CBOR, JSON, Flex, ZERA) with extracted indices
+- **SBE support**: Cache SBE payload bytes with extracted keys and build non-owning views on demand
 - **C++20**: Modern C++ with concepts, `[[nodiscard]]`, etc.
 - **Based on Boost.MultiIndex**: Leverages the battle-tested Boost library
 
@@ -459,6 +460,48 @@ process_message<zerialize::ZERA>(cache, zera_data);
 
 ---
 
+## SBE Integration (owning payload bytes)
+
+Use `sbe_cache.hpp` when your wire format is SBE and you want cache entries to own payload bytes safely.
+
+```cpp
+#include <multi_index_lru/sbe_cache.hpp>
+
+using Entry = multi_index_lru::SbeEntryWithKeys_t<std::uint16_t, std::uint32_t>;
+
+// View factory: construct your sbepp generated message view from bytes
+auto make_view = [](std::span<const uint8_t> bytes) {
+    return my_schema::MyMessage{bytes.data(), bytes.size()};
+};
+
+auto builder = multi_index_lru::make_sbe_entry_builder<Entry>(
+    make_view,
+    multi_index_lru::make_sbe_field<std::uint16_t>(&my_schema::MyMessage::templateId),
+    multi_index_lru::make_sbe_field<std::uint32_t>(&my_schema::MyMessage::securityId));
+
+Entry entry = builder.build(payload_bytes);  // payload bytes are copied/owned
+auto view = entry.view(make_view);           // non-owning view over owned bytes
+```
+
+For `ExpirableContainer`, use `sbe_timestamped_key<N, Entry>` in index definitions.
+
+Concrete `sbepp` example is available at `example/sbepp_cache.cpp` and uses schema `example/schemas/market_cache.xml`.
+Generate headers and build it like this:
+
+```bash
+# generate headers (requires sbeppc)
+sbeppc example/schemas/market_cache.xml -o /tmp/sbepp_generated
+
+# configure + build example (requires sbepp installed)
+cmake -S . -B build \
+  -DMULTI_INDEX_LRU_BUILD_SBEPP_EXAMPLE=ON \
+  -DMULTI_INDEX_LRU_SBEPP_GENERATED_DIR=/tmp/sbepp_generated
+cmake --build build --target sbepp_cache
+./build/example/sbepp_cache
+```
+
+---
+
 ## API Reference
 
 ### Container
@@ -562,6 +605,7 @@ ctest  # Run tests
 
 - `MULTI_INDEX_LRU_BUILD_TESTS` - Build tests (default: ON)
 - `MULTI_INDEX_LRU_BUILD_EXAMPLES` - Build examples (default: ON)
+- `MULTI_INDEX_LRU_BUILD_SBEPP_EXAMPLE` - Build real sbepp example (default: OFF)
 - `MULTI_INDEX_LRU_USE_BOOST_DEVELOP` - Use Boost.MultiIndex develop branch (default: OFF)
 
 ### Using Boost.MultiIndex Develop Branch
