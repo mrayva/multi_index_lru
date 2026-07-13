@@ -112,3 +112,59 @@ jobs:
 
       - name: Test
         run: ctest --test-dir build --output-on-failure
+
+  sbepp-integration:
+    name: sbepp 1.8.0 integration
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+
+      # Pin the commit behind the annotated 1.8.0 tag so sbeppc and the
+      # header-only runtime always come from exactly the same revision.
+      - uses: actions/checkout@v5
+        with:
+          repository: OleksandrKvl/sbepp
+          ref: 4185f7e37b9ae29d30c1e384a7f31d7c31d3f5e8
+          path: _deps/sbepp
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            g++-13 libboost1.83-dev libfmt-dev libpugixml-dev ninja-build
+
+      - name: Build and install pinned sbepp
+        run: |
+          cmake -S _deps/sbepp -B _build/sbepp -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$GITHUB_WORKSPACE/_install/sbepp" \
+            -DSBEPP_BUILD_SBEPPC=ON \
+            -DSBEPP_BUILD_TESTS=OFF
+          cmake --build _build/sbepp --parallel 2
+          cmake --install _build/sbepp
+
+      - name: Generate market-cache schema
+        run: |
+          _install/sbepp/bin/sbeppc \
+            --output-dir "$GITHUB_WORKSPACE/_generated/sbepp" \
+            example/schemas/market_cache.xml
+          test -f _generated/sbepp/market_cache/messages/quote.hpp
+
+      - name: Configure integration example
+        env:
+          CC: gcc-13
+          CXX: g++-13
+        run: >-
+          cmake -S . -B _build/integration -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_PREFIX_PATH="$GITHUB_WORKSPACE/_install/sbepp"
+          -DMULTI_INDEX_LRU_BUILD_TESTS=OFF
+          -DMULTI_INDEX_LRU_BUILD_EXAMPLES=ON
+          -DMULTI_INDEX_LRU_BUILD_SBEPP_EXAMPLE=ON
+          -DMULTI_INDEX_LRU_SBEPP_GENERATED_DIR="$GITHUB_WORKSPACE/_generated/sbepp"
+          -DCMAKE_CXX_FLAGS="-Wall -Wextra -Wpedantic -Werror"
+
+      - name: Build and run integration example
+        run: |
+          cmake --build _build/integration --target sbepp_cache --parallel 2
+          _build/integration/example/sbepp_cache

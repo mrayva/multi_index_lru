@@ -26,7 +26,7 @@ if(MULTI_INDEX_LRU_BUILD_SBEPP_EXAMPLE)
         multi_index_lru::multi_index_lru
         sbepp::sbepp
     )
-    target_include_directories(sbepp_cache PRIVATE
+    target_include_directories(sbepp_cache SYSTEM PRIVATE
         ${MULTI_INDEX_LRU_SBEPP_GENERATED_DIR}
     )
 endif()

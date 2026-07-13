@@ -26,7 +26,7 @@ This library provides an LRU cache that supports multiple indices for efficient 
 - Boost 1.74+ (CI covers 1.74, 1.83, 1.91, and scheduled MultiIndex `develop`)
 - CMake 3.20+ (for building tests/examples)
 - [zerialize](https://github.com/colinator/zerialize) (optional, for binary format caching)
-- [sbepp 1.8+](https://github.com/OleksandrKvl/sbepp) (optional, for the concrete SBE example; use matching `sbeppc` and library versions)
+- [sbepp 1.8+](https://github.com/OleksandrKvl/sbepp) (optional, for the concrete SBE example; CI pins 1.8.0 and uses matching `sbeppc` and library revisions)
 
 ## Installation
 
