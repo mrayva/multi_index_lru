@@ -19,6 +19,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 # Options
 option(MULTI_INDEX_LRU_BUILD_TESTS "Build tests" ON)
 option(MULTI_INDEX_LRU_BUILD_EXAMPLES "Build examples" ON)
+option(MULTI_INDEX_LRU_BUILD_BENCHMARKS "Build performance benchmarks" OFF)
 option(MULTI_INDEX_LRU_USE_BOOST_DEVELOP "Fetch a recent Boost.MultiIndex and its header dependencies" OFF)
 option(MULTI_INDEX_LRU_BUILD_SBEPP_EXAMPLE "Build the sbepp integration example" OFF)
 set(MULTI_INDEX_LRU_BOOST_GIT_TAG "develop" CACHE STRING
@@ -92,6 +93,10 @@ if(MULTI_INDEX_LRU_BUILD_EXAMPLES)
     add_subdirectory(example)
 endif()
 
+if(MULTI_INDEX_LRU_BUILD_BENCHMARKS)
+    add_subdirectory(benchmark)
+endif()
+
 # Installation (only when not using develop branch - it's not exportable)
 if(NOT MULTI_INDEX_LRU_USE_BOOST_DEVELOP)
     include(GNUInstallDirs)
@@ -104,6 +109,10 @@ if(NOT MULTI_INDEX_LRU_USE_BOOST_DEVELOP)
 
     install(DIRECTORY include/
         DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+    )
+
+    install(FILES LICENSE NOTICE README.md
+        DESTINATION ${CMAKE_INSTALL_DOCDIR}
     )
 
     install(EXPORT multi_index_lru-targets
@@ -129,4 +138,11 @@ if(NOT MULTI_INDEX_LRU_USE_BOOST_DEVELOP)
         ${CMAKE_CURRENT_BINARY_DIR}/multi_index_lru-config-version.cmake
         DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/multi_index_lru
     )
+
+    set(CPACK_PACKAGE_VENDOR "multi_index_lru contributors")
+    set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "${PROJECT_DESCRIPTION}")
+    set(CPACK_RESOURCE_FILE_LICENSE "${CMAKE_CURRENT_SOURCE_DIR}/LICENSE")
+    set(CPACK_RESOURCE_FILE_README "${CMAKE_CURRENT_SOURCE_DIR}/README.md")
+    set(CPACK_GENERATOR "TGZ")
+    include(CPack)
 endif()

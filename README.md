@@ -630,6 +630,7 @@ ctest  # Run tests
 
 - `MULTI_INDEX_LRU_BUILD_TESTS` - Build tests (default: ON)
 - `MULTI_INDEX_LRU_BUILD_EXAMPLES` - Build examples (default: ON)
+- `MULTI_INDEX_LRU_BUILD_BENCHMARKS` - Build Google Benchmark performance suite (default: OFF)
 - `MULTI_INDEX_LRU_BUILD_SBEPP_EXAMPLE` - Build real sbepp example (default: OFF)
 - `MULTI_INDEX_LRU_USE_BOOST_DEVELOP` - Fetch Boost.MultiIndex modules (default: OFF)
 - `MULTI_INDEX_LRU_BOOST_GIT_TAG` - Fetched Boost tag/branch (default: `develop`; use `boost-1.91.0` for a stable pin)
@@ -653,6 +654,37 @@ cmake --build .
 To test the latest stable Boost instead, add `-DMULTI_INDEX_LRU_BOOST_GIT_TAG=boost-1.91.0`.
 
 This will automatically fetch the required Boost modules from GitHub. Note that installation (`cmake --install`) is not available when using this option.
+
+### Benchmarks
+
+The opt-in benchmark target measures insertion with eviction (with and without node retention), lookup with LRU
+refresh, and read-only lookup at cache sizes of 1,024 and 65,536 entries:
+
+```bash
+cmake -S . -B build-benchmark \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DMULTI_INDEX_LRU_BUILD_TESTS=OFF \
+  -DMULTI_INDEX_LRU_BUILD_EXAMPLES=OFF \
+  -DMULTI_INDEX_LRU_BUILD_BENCHMARKS=ON
+cmake --build build-benchmark --target multi_index_lru_benchmark
+./build-benchmark/benchmark/multi_index_lru_benchmark
+```
+
+Google Benchmark 1.9.5 is fetched only when benchmarks are enabled. CI compiles and smoke-tests the suite but does
+not enforce timing thresholds, because shared-runner timings are not stable enough for regression decisions.
+
+### Packaging
+
+Standard installs include headers, CMake package metadata, `LICENSE`, `NOTICE`, and this README. A release archive
+can be produced with CPack:
+
+```bash
+cmake -S . -B build-release \
+  -DMULTI_INDEX_LRU_BUILD_TESTS=OFF \
+  -DMULTI_INDEX_LRU_BUILD_EXAMPLES=OFF
+cmake --build build-release
+cpack --config build-release/CPackConfig.cmake
+```
 
 ## How It Works
 
