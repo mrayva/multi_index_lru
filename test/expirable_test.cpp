@@ -75,7 +75,7 @@ struct ManualClock {
     using rep = duration::rep;
     using period = duration::period;
     using time_point = std::chrono::time_point<ManualClock, duration>;
-    static constexpr bool is_steady = true;
+    [[maybe_unused]] static constexpr bool is_steady = true;
 
     static time_point now() noexcept { return now_; }
     static void reset() noexcept { now_ = time_point{}; }

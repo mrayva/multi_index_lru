@@ -32,7 +32,7 @@ if(MULTI_INDEX_LRU_USE_BOOST_DEVELOP)
     
     # List of required Boost modules for multi_index
     set(BOOST_MODULES
-        assert bind config container_hash core integer mp11 multi_index
+        assert bind config container_hash core describe integer mp11 multi_index
         preprocessor smart_ptr throw_exception tuple type_traits utility
     )
     
