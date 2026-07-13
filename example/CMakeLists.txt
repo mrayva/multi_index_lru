@@ -15,7 +15,11 @@ if(MULTI_INDEX_LRU_BUILD_SBEPP_EXAMPLE)
         message(FATAL_ERROR "Set MULTI_INDEX_LRU_SBEPP_GENERATED_DIR to the directory with sbepp-generated headers")
     endif()
 
-    find_package(sbepp CONFIG REQUIRED)
+    if(NOT EXISTS "${MULTI_INDEX_LRU_SBEPP_GENERATED_DIR}/market_cache/messages/quote.hpp")
+        message(FATAL_ERROR "Expected generated header market_cache/messages/quote.hpp in MULTI_INDEX_LRU_SBEPP_GENERATED_DIR")
+    endif()
+
+    find_package(sbepp 1.8 CONFIG REQUIRED)
 
     add_executable(sbepp_cache sbepp_cache.cpp)
     target_link_libraries(sbepp_cache PRIVATE

@@ -25,7 +25,6 @@
 #include <chrono>
 #include <stdexcept>
 #include <string>
-#include <thread>
 
 using namespace std::chrono_literals;
 
@@ -71,6 +70,21 @@ struct ExpirableUserValue {
     std::string name;
 };
 
+struct ManualClock {
+    using duration = std::chrono::milliseconds;
+    using rep = duration::rep;
+    using period = duration::period;
+    using time_point = std::chrono::time_point<ManualClock, duration>;
+    static constexpr bool is_steady = true;
+
+    static time_point now() noexcept { return now_; }
+    static void reset() noexcept { now_ = time_point{}; }
+    static void advance(duration amount) noexcept { now_ += amount; }
+
+private:
+    static inline time_point now_{};
+};
+
 using SimpleUserCache = multi_index_lru::ExpirableContainer<
     ExpirableUserValue,
     boost::multi_index::indexed_by<
@@ -94,6 +108,15 @@ using EasierUserCache = multi_index_lru::ExpirableContainer<
         boost::multi_index::ordered_unique<
             boost::multi_index::tag<IdTag>,
             IdExtractor<multi_index_lru::detail::TimestampedValue<ExpirableUserValue>>>>>;
+
+using ManualUserCache = multi_index_lru::ExpirableContainer<
+    ExpirableUserValue,
+    boost::multi_index::indexed_by<
+        boost::multi_index::ordered_unique<
+            boost::multi_index::tag<IdTag>,
+            IdExtractor<multi_index_lru::detail::TimestampedValue<ExpirableUserValue, ManualClock>>>>,
+    std::allocator<ExpirableUserValue>,
+    ManualClock>;
 
 class ExpirableBasicTest : public ::testing::Test {
 protected:
@@ -145,6 +168,10 @@ TEST_F(ExpirableBasicTest, Erase) {
     EXPECT_TRUE(cache.erase<IdTag>(1));
     EXPECT_EQ(cache.size(), 1);
     EXPECT_EQ(cache.find<IdTag>(1), cache.end<IdTag>());
+
+    auto next = cache.erase(cache.find_no_update<IdTag>(2));
+    EXPECT_EQ(next, cache.end<IdTag>());
+    EXPECT_TRUE(cache.empty());
     
     EXPECT_FALSE(cache.erase<IdTag>(999));  // Non-existent
 }
@@ -186,7 +213,8 @@ TEST_F(ExpirableBasicTest, ParameterValidation) {
 // =============================================================================
 
 TEST(ExpirableTTLTest, ItemsExpire) {
-    EasierUserCache cache(100, 50ms);
+    ManualClock::reset();
+    ManualUserCache cache(100, 50ms);
     
     cache.insert(ExpirableUserValue{1, "alice@test.com", "Alice"});
     cache.insert(ExpirableUserValue{2, "bob@test.com", "Bob"});
@@ -196,7 +224,7 @@ TEST(ExpirableTTLTest, ItemsExpire) {
     EXPECT_NE(cache.find<IdTag>(2), cache.end<IdTag>());
     
     // Wait for TTL to expire
-    std::this_thread::sleep_for(70ms);
+    ManualClock::advance(70ms);
     
     // Items should be expired and removed on access
     EXPECT_EQ(cache.find<IdTag>(1), cache.end<IdTag>());
@@ -205,64 +233,68 @@ TEST(ExpirableTTLTest, ItemsExpire) {
 }
 
 TEST(ExpirableTTLTest, AccessRefreshesTTL) {
-    EasierUserCache cache(100, 100ms);
+    ManualClock::reset();
+    ManualUserCache cache(100, 100ms);
     
     cache.insert(ExpirableUserValue{1, "alice@test.com", "Alice"});
     
     // Wait 60ms
-    std::this_thread::sleep_for(60ms);
+    ManualClock::advance(60ms);
     
     // Access refreshes TTL
     EXPECT_NE(cache.find<IdTag>(1), cache.end<IdTag>());
     
     // Wait another 60ms (total 120ms from insert, but only 60ms from access)
-    std::this_thread::sleep_for(60ms);
+    ManualClock::advance(60ms);
     
     // Should still exist (TTL refreshed)
     EXPECT_NE(cache.find<IdTag>(1), cache.end<IdTag>());
     
     // Wait full TTL
-    std::this_thread::sleep_for(120ms);
+    ManualClock::advance(120ms);
     
     EXPECT_EQ(cache.find<IdTag>(1), cache.end<IdTag>());
 }
 
 TEST(ExpirableTTLTest, FindNoUpdateDoesNotRefresh) {
-    EasierUserCache cache(100, 80ms);
+    ManualClock::reset();
+    ManualUserCache cache(100, 80ms);
     
     cache.insert(ExpirableUserValue{1, "alice@test.com", "Alice"});
     
     // Wait 50ms
-    std::this_thread::sleep_for(50ms);
+    ManualClock::advance(50ms);
     
     // find_no_update does NOT refresh TTL
     auto it = cache.find_no_update<IdTag>(1);
     EXPECT_NE(it, cache.end<IdTag>());
     
     // Wait another 50ms (total 100ms > 80ms TTL)
-    std::this_thread::sleep_for(50ms);
+    ManualClock::advance(50ms);
     
     // Should now be expired
     EXPECT_EQ(cache.find<IdTag>(1), cache.end<IdTag>());
 }
 
 TEST(ExpirableTTLTest, ContainsNoUpdateDoesNotRefresh) {
-    EasierUserCache cache(100, 80ms);
+    ManualClock::reset();
+    ManualUserCache cache(100, 80ms);
 
     cache.insert(ExpirableUserValue{1, "alice@test.com", "Alice"});
-    std::this_thread::sleep_for(50ms);
+    ManualClock::advance(50ms);
 
     EXPECT_TRUE(cache.contains_no_update<IdTag>(1));
     EXPECT_FALSE(cache.contains_no_update<IdTag>(999));
 
-    std::this_thread::sleep_for(50ms);
+    ManualClock::advance(50ms);
 
     // contains() checks TTL and should remove the expired element.
     EXPECT_FALSE(cache.contains<IdTag>(1));
 }
 
 TEST(ExpirableTTLTest, CleanupExpired) {
-    EasierUserCache cache(100, 50ms);
+    ManualClock::reset();
+    ManualUserCache cache(100, 50ms);
     
     cache.insert(ExpirableUserValue{1, "alice@test.com", "Alice"});
     cache.insert(ExpirableUserValue{2, "bob@test.com", "Bob"});
@@ -270,7 +302,7 @@ TEST(ExpirableTTLTest, CleanupExpired) {
     EXPECT_EQ(cache.size(), 2);
     
     // Wait for expiration
-    std::this_thread::sleep_for(70ms);
+    ManualClock::advance(70ms);
     
     // Size still shows 2 (not cleaned up yet)
     EXPECT_EQ(cache.size(), 2);
@@ -310,6 +342,18 @@ using MultiNameCache = multi_index_lru::ExpirableContainer<
             boost::multi_index::tag<NameTag>,
             NameExtractor>>>;
 
+using ManualMultiNameCache = multi_index_lru::ExpirableContainer<
+    ExpirableUserValue,
+    boost::multi_index::indexed_by<
+        boost::multi_index::ordered_unique<
+            boost::multi_index::tag<IdTag>,
+            IdExtractor<multi_index_lru::detail::TimestampedValue<ExpirableUserValue, ManualClock>>>,
+        boost::multi_index::ordered_non_unique<
+            boost::multi_index::tag<NameTag>,
+            NameExtractor>>,
+    std::allocator<ExpirableUserValue>,
+    ManualClock>;
+
 TEST(ExpirableEqualRangeTest, BasicEqualRange) {
     MultiNameCache cache(10, 1h);
     
@@ -329,12 +373,13 @@ TEST(ExpirableEqualRangeTest, BasicEqualRange) {
 }
 
 TEST(ExpirableEqualRangeTest, EqualRangeRemovesExpired) {
-    MultiNameCache cache(10, 50ms);
+    ManualClock::reset();
+    ManualMultiNameCache cache(10, 50ms);
     
     cache.insert(ExpirableUserValue{1, "john1@test.com", "John"});
     cache.insert(ExpirableUserValue{2, "john2@test.com", "John"});
     
-    std::this_thread::sleep_for(70ms);
+    ManualClock::advance(70ms);
     
     auto [begin, end] = cache.equal_range<NameTag>(std::string("John"));
     
@@ -416,6 +461,18 @@ using ZerializeExpirableCache = multi_index_lru::ExpirableContainer<
             boost::multi_index::tag<NameTag>,
             ZNameExtractor<multi_index_lru::detail::TimestampedValue<ZEntry>>>>>;
 
+using ManualZerializeExpirableCache = multi_index_lru::ExpirableContainer<
+    ZEntry,
+    boost::multi_index::indexed_by<
+        boost::multi_index::ordered_unique<
+            boost::multi_index::tag<IdTag>,
+            ZIdExtractor<multi_index_lru::detail::TimestampedValue<ZEntry, ManualClock>>>,
+        boost::multi_index::ordered_non_unique<
+            boost::multi_index::tag<NameTag>,
+            ZNameExtractor<multi_index_lru::detail::TimestampedValue<ZEntry, ManualClock>>>>,
+    std::allocator<ZEntry>,
+    ManualClock>;
+
 TEST(ExpirableZerializeTest, BasicOperations) {
     ZerializeExpirableCache cache(3, 1h);
     
@@ -437,7 +494,8 @@ TEST(ExpirableZerializeTest, BasicOperations) {
 }
 
 TEST(ExpirableZerializeTest, TTLExpiration) {
-    ZerializeExpirableCache cache(100, 50ms);
+    ManualClock::reset();
+    ManualZerializeExpirableCache cache(100, 50ms);
     
     auto builder = multi_index_lru::make_entry_builder<ZEntry>(
         multi_index_lru::int64_field("id"),
@@ -449,7 +507,7 @@ TEST(ExpirableZerializeTest, TTLExpiration) {
     
     EXPECT_NE(cache.find<IdTag>(static_cast<int64_t>(42)), cache.end<IdTag>());
     
-    std::this_thread::sleep_for(70ms);
+    ManualClock::advance(70ms);
     
     EXPECT_EQ(cache.find<IdTag>(static_cast<int64_t>(42)), cache.end<IdTag>());
 }

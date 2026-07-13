@@ -10,6 +10,7 @@ This library provides an LRU cache that supports multiple indices for efficient 
 - **Multiple indices**: Look up items by different keys (ID, name, email, etc.)
 - **Composite keys**: Index by combinations of fields (e.g., tenant_id + user_id)
 - **LRU eviction**: Automatically evicts least recently used items when capacity is exceeded
+- **Node reuse**: Recycles evicted/erased nodes for assignable value types to reduce allocator traffic
 - **Access tracking**: `find()` operations automatically refresh the item's position in the LRU order
 - **TTL expiration**: Items automatically expire after a configurable time-to-live
 - **Zerialize support**: Cache serialized binary data (MsgPack, CBOR, JSON, Flex, ZERA) with extracted indices
@@ -20,9 +21,10 @@ This library provides an LRU cache that supports multiple indices for efficient 
 ## Requirements
 
 - C++20 compatible compiler (GCC 10+, Clang 12+, MSVC 2019+)
-- Boost 1.74+ (only headers needed, no linking required)
+- Boost 1.74+ (tested with Boost 1.91 and current MultiIndex `develop`)
 - CMake 3.20+ (for building tests/examples)
 - [zerialize](https://github.com/colinator/zerialize) (optional, for binary format caching)
+- [sbepp 1.8+](https://github.com/OleksandrKvl/sbepp) (optional, for the concrete SBE example; use matching `sbeppc` and library versions)
 
 ## Installation
 
@@ -256,7 +258,9 @@ using ExpirableZerializeCache = multi_index_lru::ExpirableContainer<
 ### API Reference - ExpirableContainer
 
 ```cpp
-template <typename Value, typename IndexSpecifierList, typename Allocator = std::allocator<Value>>
+template <typename Value, typename IndexSpecifierList,
+          typename Allocator = std::allocator<Value>,
+          typename Clock = std::chrono::steady_clock>
 class ExpirableContainer;
 ```
 
@@ -269,6 +273,8 @@ class ExpirableContainer;
 - `void cleanup_expired()` - Remove all expired items (call periodically)
 - `duration_type ttl() const` - Get current TTL
 - `void set_ttl(duration_type new_ttl)` - Change TTL for future accesses (`new_ttl > 0`, throws `std::invalid_argument` otherwise)
+- `Clock` can be replaced with a compatible clock for deterministic tests
+- `void shrink_to_fit()` - Release nodes retained for reuse
 
 #### Lookup Methods
 
@@ -490,7 +496,7 @@ Generate headers and build it like this:
 
 ```bash
 # generate headers (requires sbeppc)
-sbeppc example/schemas/market_cache.xml -o /tmp/sbepp_generated
+sbeppc --output-dir /tmp/sbepp_generated example/schemas/market_cache.xml
 
 # configure + build example (requires sbepp installed)
 cmake -S . -B build \
@@ -517,7 +523,8 @@ class Container;
 
 #### Insertion
 
-- `template<typename... Args> bool emplace(Args&&... args)` - Emplace element, returns true if newly inserted
+- `template<typename... Args> bool emplace(Args&&... args)` - Emplace element, returns insertion status
+- `template<typename... Args> auto emplace_with_iterator(Args&&... args)` - Emplace element, returns `pair<iterator, bool>`
 - `bool insert(const Value& value)` - Insert copy
 - `bool insert(Value&& value)` - Insert with move
 
@@ -532,7 +539,9 @@ class Container;
 #### Removal
 
 - `template<typename Tag> bool erase(const auto& key)` - Erase by key
-- `void clear()` - Remove all elements
+- `auto erase(iterator)` - Erase by iterator and return the following iterator
+- `void clear()` - Remove all elements and retain reusable nodes
+- `void shrink_to_fit()` - Release retained nodes
 
 #### Capacity
 
@@ -546,9 +555,17 @@ class Container;
 - `auto begin() / end()` - Iterate in LRU order (most recent first)
 - `template<typename Tag> auto end()` - End iterator for specific index
 
-#### Access to underlying container
+#### Underlying Container Access
 
-- `auto& get_container()` - Access the underlying `boost::multi_index_container`
+- `const auto& get_container() const` - Inspect the underlying container without mutation
+- `const auto& get_index<Tag>() const` - Inspect a tagged index
+- `const auto& get_sequenced() const` - Inspect the LRU sequence
+- `unsafe_get_container()`, `unsafe_get_index<Tag>()`, and `unsafe_get_sequenced()` - Explicit mutable escape hatches
+
+The legacy mutable `get_container()`, `get_index<Tag>()`, and `get_sequenced()` overloads are deprecated.
+Direct mutation can bypass LRU updates, node reuse, capacity enforcement, and expiration bookkeeping. Prefer the
+container's public insertion, lookup, erase, and iteration APIs. Use an `unsafe_*` accessor only when the caller
+maintains those invariants itself.
 
 ### ZerializeEntry
 
@@ -606,11 +623,12 @@ ctest  # Run tests
 - `MULTI_INDEX_LRU_BUILD_TESTS` - Build tests (default: ON)
 - `MULTI_INDEX_LRU_BUILD_EXAMPLES` - Build examples (default: ON)
 - `MULTI_INDEX_LRU_BUILD_SBEPP_EXAMPLE` - Build real sbepp example (default: OFF)
-- `MULTI_INDEX_LRU_USE_BOOST_DEVELOP` - Use Boost.MultiIndex develop branch (default: OFF)
+- `MULTI_INDEX_LRU_USE_BOOST_DEVELOP` - Fetch Boost.MultiIndex modules (default: OFF)
+- `MULTI_INDEX_LRU_BOOST_GIT_TAG` - Fetched Boost tag/branch (default: `develop`; use `boost-1.91.0` for a stable pin)
 
-### Using Boost.MultiIndex Develop Branch
+### Using Recent Boost.MultiIndex
 
-The develop branch of Boost.MultiIndex contains a [major refactoring](https://bannalia.blogspot.com/2025/12/boostmultiindex-refactored.html) for Boost 1.91 that:
+Boost 1.91 includes the MultiIndex refactoring that:
 
 - Replaces Boost.MPL with Boost.Mp11 and C++11 variadic templates
 - Significantly reduces type name lengths (better error messages, smaller binaries)
@@ -624,11 +642,13 @@ cmake .. -DMULTI_INDEX_LRU_USE_BOOST_DEVELOP=ON
 cmake --build .
 ```
 
+To test the latest stable Boost instead, add `-DMULTI_INDEX_LRU_BOOST_GIT_TAG=boost-1.91.0`.
+
 This will automatically fetch the required Boost modules from GitHub. Note that installation (`cmake --install`) is not available when using this option.
 
 ## How It Works
 
-The container wraps a `boost::multi_index_container` and automatically prepends a `sequenced` index to track access order. When elements are accessed via `find()` or `contains()`, they are moved to the front of the sequence. When the container exceeds capacity during insertion, the element at the back (least recently used) is evicted.
+The container wraps a `boost::multi_index_container` and automatically prepends a `sequenced` index to track access order. When elements are accessed via `find()` or `contains()`, they are moved to the front of the sequence. When the container exceeds capacity during insertion, the element at the back (least recently used) is evicted. For assignable value types, extracted nodes are retained and reused; call `shrink_to_fit()` to release that memory.
 
 For zerialize data, the `ZerializeEntry` stores both the original serialized bytes and extracted keys. Keys are extracted once at insertion time, enabling O(1) or O(log n) lookups without repeated deserialization. Full deserialization only happens on demand via `deserialize<Format>()`.
 

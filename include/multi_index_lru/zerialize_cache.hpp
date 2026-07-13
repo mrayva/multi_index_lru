@@ -50,7 +50,8 @@ concept ZerializeDeserializer = requires(D d, std::span<const uint8_t> data) {
 /// @tparam N Index of the key in the tuple
 template <std::size_t N, typename Entry>
 struct key {
-    using result_type = std::tuple_element_t<N, typename Entry::keys_type>;
+    using key_type = std::tuple_element_t<N, typename Entry::keys_type>;
+    using result_type = const key_type&;
 
     result_type operator()(const Entry& entry) const {
         return std::get<N>(entry.keys);
@@ -64,7 +65,8 @@ struct key {
 /// Use this with ExpirableContainer which wraps entries in TimestampedValue.
 template <std::size_t N, typename Entry>
 struct timestamped_key {
-    using result_type = std::tuple_element_t<N, typename Entry::keys_type>;
+    using key_type = std::tuple_element_t<N, typename Entry::keys_type>;
+    using result_type = const key_type&;
 
     // Extract from TimestampedValue<Entry>
     template <typename TimestampedEntry>

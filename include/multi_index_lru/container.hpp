@@ -26,15 +26,16 @@
 #include <cassert>
 #include <chrono>
 #include <cstddef>
+#include <iterator>
 #include <stdexcept>
 #include <tuple>
 #include <type_traits>
 #include <utility>
+#include <vector>
 
 namespace multi_index_lru {
 
-// Forward declaration
-template <typename Value, typename IndexSpecifierList, typename Allocator>
+template <typename Value, typename IndexSpecifierList, typename Allocator, typename Clock>
 class ExpirableContainer;
 
 namespace detail {
@@ -86,18 +87,24 @@ template <typename IndexList>
 using add_seq_index_t = typename add_seq_index<IndexList>::type;
 
 /// Wrapper that adds timestamp to stored values for TTL tracking
-template <typename Value>
+template <typename Value, typename Clock = std::chrono::steady_clock>
 struct TimestampedValue {
     Value value;
-    mutable std::chrono::steady_clock::time_point last_accessed;
+    mutable typename Clock::time_point last_accessed;
     
     TimestampedValue() = default;
-    
-    explicit TimestampedValue(const Value& val) 
-        : value(val), last_accessed(std::chrono::steady_clock::now()) {}
+
+    explicit TimestampedValue(const Value& val)
+        : TimestampedValue(Clock::now(), val) {}
+
+    explicit TimestampedValue(Value&& val)
+        : TimestampedValue(Clock::now(), std::move(val)) {}
+
+    TimestampedValue(typename Clock::time_point now, const Value& val)
+        : value(val), last_accessed(now) {}
         
-    explicit TimestampedValue(Value&& val) 
-        : value(std::move(val)), last_accessed(std::chrono::steady_clock::now()) {}
+    TimestampedValue(typename Clock::time_point now, Value&& val)
+        : value(std::move(val)), last_accessed(now) {}
     
     // Implicit conversions for transparent access
     operator Value&() { return value; }
@@ -198,21 +205,51 @@ public:
 
     /// @brief Emplace a new element
     /// @param args Arguments forwarded to value constructor
-    /// @return true if element was newly inserted, false if existing element was updated
+    /// @return true if newly inserted, false if an existing element was refreshed
+    template <typename... Args>
+    bool emplace(Args&&... args) {
+        return emplace_with_iterator(std::forward<Args>(args)...).second;
+    }
+
+    /// @brief Emplace a new element and return its iterator
+    /// @param args Arguments forwarded to value constructor
+    /// @return Pair of iterator and insertion status
     ///
     /// If an element with matching key(s) exists, it's moved to front (most recently used).
     /// If insertion would exceed capacity, the least recently used element is evicted.
     template <typename... Args>
-    bool emplace(Args&&... args) {
+    auto emplace_with_iterator(Args&&... args) {
         auto& seq_index = container_.template get<0>();
-        auto result = seq_index.emplace_front(std::forward<Args>(args)...);
+
+        std::pair<decltype(seq_index.begin()), bool> result;
+        if constexpr (kCanReuseNodes) {
+            if (!free_nodes_.empty()) {
+                auto node = std::move(free_nodes_.back());
+                free_nodes_.pop_back();
+
+                node.value() = Value(std::forward<Args>(args)...);
+                auto inserted = seq_index.insert(seq_index.begin(), std::move(node));
+                result = {inserted.position, inserted.inserted};
+                if (!inserted.inserted) {
+                    free_nodes_.emplace_back(std::move(inserted.node));
+                }
+            } else {
+                result = seq_index.emplace_front(std::forward<Args>(args)...);
+            }
+        } else {
+            result = seq_index.emplace_front(std::forward<Args>(args)...);
+        }
 
         if (!result.second) {
             seq_index.relocate(seq_index.begin(), result.first);
         } else if (seq_index.size() > max_size_) {
-            seq_index.pop_back();
+            if constexpr (kCanReuseNodes) {
+                free_nodes_.emplace_back(seq_index.extract(std::prev(seq_index.end())));
+            } else {
+                seq_index.pop_back();
+            }
         }
-        return result.second;
+        return result;
     }
 
     /// @brief Insert a value (copy)
@@ -330,7 +367,30 @@ public:
     /// @return true if element was erased, false if not found
     template <typename Tag, typename Key = void>
     bool erase(const auto& key) {
-        return container_.template get<Tag>().erase(key) > 0;
+        auto it = this->template find_no_update<Tag, Key>(key);
+        if (it == this->template end<Tag>()) {
+            return false;
+        }
+        erase(it);
+        return true;
+    }
+
+    /// @brief Erase an element and return the following iterator in the same index
+    template <typename Iterator>
+    auto erase(Iterator it) {
+        auto& seq_index = container_.template get<0>();
+        auto seq_it = container_.template project<0>(it);
+        if (seq_it == seq_index.end()) {
+            return it;
+        }
+
+        ++it;
+        if constexpr (kCanReuseNodes) {
+            free_nodes_.emplace_back(seq_index.extract(seq_it));
+        } else {
+            seq_index.erase(seq_it);
+        }
+        return it;
     }
 
     /// @brief Get current number of elements
@@ -351,14 +411,32 @@ public:
             throw std::invalid_argument("Container capacity must be greater than 0");
         }
         max_size_ = new_capacity;
+        if (container_.size() <= max_size_) {
+            return;
+        }
+
+        shrink_to_fit();
         auto& seq_index = container_.template get<0>();
         while (container_.size() > max_size_) {
             seq_index.pop_back();
         }
     }
 
-    /// @brief Remove all elements
-    void clear() noexcept { container_.clear(); }
+    /// @brief Release nodes retained for reuse
+    void shrink_to_fit() { free_nodes_.clear(); }
+
+    /// @brief Remove all elements, retaining reusable nodes when possible
+    void clear() {
+        if constexpr (kCanReuseNodes) {
+            auto& seq_index = container_.template get<0>();
+            free_nodes_.reserve(free_nodes_.size() + container_.size());
+            while (!seq_index.empty()) {
+                free_nodes_.emplace_back(seq_index.extract(std::prev(seq_index.end())));
+            }
+        } else {
+            container_.clear();
+        }
+    }
 
     /// @brief Get end iterator for specified index
     /// @tparam Tag Index tag type
@@ -394,27 +472,41 @@ public:
         return container_.template get<0>().end();
     }
 
-    /// @brief Access underlying boost::multi_index_container
-    /// @return Reference to internal container
-    [[nodiscard]] auto& get_container() noexcept { return container_; }
-
-    /// @brief Access underlying boost::multi_index_container (const)
+    /// @brief Inspect the underlying boost::multi_index_container
     [[nodiscard]] const auto& get_container() const noexcept { return container_; }
 
-    /// @brief Get a specific index by tag
-    /// @tparam Tag Index tag type
+    /// @deprecated Use unsafe_get_container() to acknowledge invariant bypass
+    [[deprecated("mutable raw access bypasses LRU and node-pool invariants; use unsafe_get_container()")]]
+    [[nodiscard]] auto& get_container() noexcept { return container_; }
+
+    /// @brief Mutably access the underlying container
+    /// @warning Mutations can bypass recency tracking and node reuse. The caller must preserve all container invariants.
+    [[nodiscard]] auto& unsafe_get_container() noexcept { return container_; }
+
+    /// @brief Inspect a specific index by tag
     template <typename Tag>
+    [[nodiscard]] const auto& get_index() const noexcept { return container_.template get<Tag>(); }
+
+    /// @deprecated Use unsafe_get_index() to acknowledge invariant bypass
+    template <typename Tag>
+    [[deprecated("mutable raw access bypasses LRU and node-pool invariants; use unsafe_get_index()")]]
     [[nodiscard]] auto& get_index() { return container_.template get<Tag>(); }
 
-    /// @brief Get a specific index by tag (const)
+    /// @brief Mutably access a specific index by tag
+    /// @warning Mutations can bypass recency tracking and node reuse. The caller must preserve all container invariants.
     template <typename Tag>
-    [[nodiscard]] const auto& get_index() const { return container_.template get<Tag>(); }
+    [[nodiscard]] auto& unsafe_get_index() { return container_.template get<Tag>(); }
 
-    /// @brief Get the sequenced (LRU) index
+    /// @brief Inspect the sequenced (LRU) index
+    [[nodiscard]] const auto& get_sequenced() const noexcept { return container_.template get<0>(); }
+
+    /// @deprecated Use unsafe_get_sequenced() to acknowledge invariant bypass
+    [[deprecated("mutable raw access bypasses LRU and node-pool invariants; use unsafe_get_sequenced()")]]
     [[nodiscard]] auto& get_sequenced() { return container_.template get<0>(); }
 
-    /// @brief Get the sequenced (LRU) index (const)
-    [[nodiscard]] const auto& get_sequenced() const { return container_.template get<0>(); }
+    /// @brief Mutably access the sequenced (LRU) index
+    /// @warning Reordering or erasing directly can violate recency and node-pool invariants.
+    [[nodiscard]] auto& unsafe_get_sequenced() { return container_.template get<0>(); }
 
 private:
     using ExtendedIndexSpecifierList = detail::add_seq_index_t<IndexSpecifierList>;
@@ -424,11 +516,18 @@ private:
         ExtendedIndexSpecifierList,
         Allocator>;
 
+    static constexpr bool kCanReuseNodes = std::is_assignable_v<Value&, Value>;
+
+    /// @pre The container is not empty
+    [[nodiscard]] auto find_last_accessed_no_update() const {
+        return std::prev(container_.template get<0>().end());
+    }
+
     BoostContainer container_;
     size_type max_size_;
+    std::vector<typename BoostContainer::node_type> free_nodes_;
 
-    // Allow ExpirableContainer to access internals
-    template <typename V, typename I, typename A>
+    template <typename V, typename I, typename A, typename C>
     friend class ExpirableContainer;
 };
 

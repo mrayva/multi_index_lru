@@ -68,7 +68,8 @@ using SbeEntryWithKeys_t = SbeEntry<std::tuple<KeyTypes...>>;
 /// @brief Key extractor for SbeEntry tuple keys
 template <std::size_t N, typename Entry>
 struct sbe_key {
-    using result_type = std::tuple_element_t<N, typename Entry::keys_type>;
+    using key_type = std::tuple_element_t<N, typename Entry::keys_type>;
+    using result_type = const key_type&;
 
     result_type operator()(const Entry& entry) const {
         return std::get<N>(entry.keys);
@@ -78,7 +79,8 @@ struct sbe_key {
 /// @brief Key extractor for TimestampedValue<SbeEntry> in ExpirableContainer
 template <std::size_t N, typename Entry>
 struct sbe_timestamped_key {
-    using result_type = std::tuple_element_t<N, typename Entry::keys_type>;
+    using key_type = std::tuple_element_t<N, typename Entry::keys_type>;
+    using result_type = const key_type&;
 
     template <typename TimestampedEntry>
         requires requires(const TimestampedEntry& t) { t.value.keys; }
@@ -103,14 +105,15 @@ public:
 
     /// @brief Build an entry from raw SBE bytes (bytes are copied into entry ownership)
     Entry build(std::span<const uint8_t> data) const {
-        auto view = std::invoke(view_factory_, data);
-        return build_impl(view, data, std::index_sequence_for<Extractors...>{});
+        std::vector<uint8_t> owned_data(data.begin(), data.end());
+        auto view = std::invoke(view_factory_, std::span<const uint8_t>{owned_data});
+        return build_impl(view, std::move(owned_data), std::index_sequence_for<Extractors...>{});
     }
 
 private:
     template <typename View, std::size_t... Is>
-    Entry build_impl(const View& view, std::span<const uint8_t> data, std::index_sequence<Is...>) const {
-        return Entry(keys_type(std::get<Is>(extractors_)(view)...), data);
+    Entry build_impl(const View& view, std::vector<uint8_t> data, std::index_sequence<Is...>) const {
+        return Entry(keys_type(std::get<Is>(extractors_)(view)...), std::move(data));
     }
 
     ViewFactory view_factory_;

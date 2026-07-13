@@ -20,7 +20,6 @@
 
 #include "container.hpp"
 
-#include <cassert>
 #include <chrono>
 #include <stdexcept>
 
@@ -61,13 +60,17 @@ namespace multi_index_lru {
 /// // Periodic cleanup of expired items
 /// cache.cleanup_expired();
 /// @endcode
-template <typename Value, typename IndexSpecifierList, typename Allocator = std::allocator<Value>>
+template <
+    typename Value,
+    typename IndexSpecifierList,
+    typename Allocator = std::allocator<Value>,
+    typename Clock = std::chrono::steady_clock>
 class ExpirableContainer {
 public:
     using value_type = Value;
     using allocator_type = Allocator;
     using size_type = std::size_t;
-    using clock_type = std::chrono::steady_clock;
+    using clock_type = Clock;
     using duration_type = std::chrono::milliseconds;
     using time_point_type = clock_type::time_point;
 
@@ -80,7 +83,6 @@ public:
         if (ttl.count() <= 0) {
             throw std::invalid_argument("TTL must be positive");
         }
-        assert(ttl.count() > 0 && "TTL must be positive");
     }
 
     /// @brief Emplace a new element
@@ -90,15 +92,11 @@ public:
     /// If an element with matching key(s) exists, its timestamp is refreshed.
     template <typename... Args>
     auto emplace(Args&&... args) {
-        auto result = container_.get_sequenced().emplace_front(
-            CacheItem{Value{std::forward<Args>(args)...}});
+        const auto now = clock_type::now();
+        auto result = container_.emplace_with_iterator(now, Value(std::forward<Args>(args)...));
 
         if (!result.second) {
-            result.first->last_accessed = clock_type::now();
-            container_.get_sequenced().relocate(
-                container_.get_sequenced().begin(), result.first);
-        } else if (container_.size() > container_.capacity()) {
-            container_.get_sequenced().pop_back();
+            result.first->last_accessed = now;
         }
 
         return std::pair{detail::TimestampedIteratorWrapper{result.first}, result.second};
@@ -123,21 +121,15 @@ public:
     /// If found and not expired, the access timestamp is refreshed.
     template <typename Tag, typename Key = void>
     auto find(const auto& key) {
-        auto now = clock_type::now();
-        auto& index = container_.template get_index<Tag>();
-        auto it = index.find(key);
+        const auto now = clock_type::now();
+        auto it = container_.template find<Tag, Key>(key);
         
-        if (it != index.end()) {
+        if (it != container_.template end<Tag>()) {
             if (now > it->last_accessed + ttl_) {
-                // Item expired - remove it
-                index.erase(it);
-                return detail::TimestampedIteratorWrapper{index.end()};
+                container_.erase(it);
+                return this->template end<Tag>();
             } else {
-                // Refresh timestamp and move to front
                 it->last_accessed = now;
-                container_.get_sequenced().relocate(
-                    container_.get_sequenced().begin(),
-                    container_.get_container().template project<0>(it));
             }
         }
         
@@ -175,28 +167,24 @@ public:
     /// have their timestamps refreshed.
     template <typename Tag, typename Key = void>
     auto equal_range(const auto& key) {
-        auto now = clock_type::now();
-        auto& index = container_.template get_index<Tag>();
-        auto range = index.equal_range(key);
+        const auto now = clock_type::now();
+        auto range = container_.template equal_range<Tag, Key>(key);
         
         auto it = range.first;
         bool changed = false;
         
         while (it != range.second) {
             if (now > it->last_accessed + ttl_) {
-                it = index.erase(it);
+                it = container_.erase(it);
                 changed = true;
             } else {
                 it->last_accessed = now;
-                container_.get_sequenced().relocate(
-                    container_.get_sequenced().begin(),
-                    container_.get_container().template project<0>(it));
                 ++it;
             }
         }
         
         if (changed) {
-            range = index.equal_range(key);
+            range = container_.template equal_range_no_update<Tag, Key>(key);
         }
         
         return std::pair{
@@ -255,6 +243,13 @@ public:
         return container_.template erase<Tag>(key);
     }
 
+    /// @brief Erase an element and return the following iterator in the same index
+    template <typename Iterator>
+        requires requires(Iterator it) { it.base(); }
+    auto erase(Iterator it) {
+        return detail::TimestampedIteratorWrapper{container_.erase(it.base())};
+    }
+
     /// @brief Get current number of elements (including expired)
     [[nodiscard]] size_type size() const noexcept { return container_.size(); }
 
@@ -271,21 +266,22 @@ public:
     }
 
     /// @brief Remove all elements
-    void clear() noexcept { container_.clear(); }
+    void clear() { container_.clear(); }
+
+    /// @brief Release nodes retained for reuse
+    void shrink_to_fit() { container_.shrink_to_fit(); }
 
     /// @brief Get end iterator for specified index
     /// @tparam Tag Index tag type
     template <typename Tag>
     [[nodiscard]] auto end() {
-        return detail::TimestampedIteratorWrapper{
-            container_.template get_index<Tag>().end()};
+        return detail::TimestampedIteratorWrapper{container_.template end<Tag>()};
     }
 
     /// @brief Get end iterator for specified index (const)
     template <typename Tag>
     [[nodiscard]] auto end() const {
-        return detail::TimestampedIteratorWrapper{
-            container_.template get_index<Tag>().end()};
+        return detail::TimestampedIteratorWrapper{container_.template end<Tag>()};
     }
 
     /// @brief Remove all expired elements
@@ -293,13 +289,12 @@ public:
     /// Scans from the back (oldest) and removes consecutive expired items.
     /// Call periodically to prevent memory bloat from expired entries.
     void cleanup_expired() {
-        auto now = clock_type::now();
-        auto& seq_index = container_.get_sequenced();
+        const auto now = clock_type::now();
 
-        while (!seq_index.empty()) {
-            auto it = seq_index.rbegin();
+        while (!container_.empty()) {
+            auto it = container_.find_last_accessed_no_update();
             if (now > it->last_accessed + ttl_) {
-                seq_index.pop_back();
+                container_.erase(it);
             } else {
                 break;
             }
@@ -314,12 +309,11 @@ public:
         if (new_ttl.count() <= 0) {
             throw std::invalid_argument("TTL must be positive");
         }
-        assert(new_ttl.count() > 0 && "TTL must be positive");
         ttl_ = new_ttl;
     }
 
 private:
-    using CacheItem = detail::TimestampedValue<Value>;
+    using CacheItem = detail::TimestampedValue<Value, Clock>;
     using CacheContainer = Container<CacheItem, IndexSpecifierList, 
         typename std::allocator_traits<Allocator>::template rebind_alloc<CacheItem>>;
 

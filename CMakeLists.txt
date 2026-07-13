@@ -1,5 +1,9 @@
 cmake_minimum_required(VERSION 3.20)
 
+if(POLICY CMP0167)
+    cmake_policy(SET CMP0167 NEW)
+endif()
+
 project(multi_index_lru
     VERSION 1.0.0
     DESCRIPTION "Header-only LRU container based on Boost.MultiIndex"
@@ -15,51 +19,47 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 # Options
 option(MULTI_INDEX_LRU_BUILD_TESTS "Build tests" ON)
 option(MULTI_INDEX_LRU_BUILD_EXAMPLES "Build examples" ON)
-option(MULTI_INDEX_LRU_USE_BOOST_DEVELOP "Use Boost.MultiIndex develop branch (pre-1.91 refactored)" OFF)
+option(MULTI_INDEX_LRU_USE_BOOST_DEVELOP "Fetch a recent Boost.MultiIndex and its header dependencies" OFF)
 option(MULTI_INDEX_LRU_BUILD_SBEPP_EXAMPLE "Build the sbepp integration example" OFF)
+set(MULTI_INDEX_LRU_BOOST_GIT_TAG "develop" CACHE STRING
+    "Git tag or branch used for fetched Boost modules (for example develop or boost-1.91.0)")
 
 # Boost.MultiIndex handling
 if(MULTI_INDEX_LRU_USE_BOOST_DEVELOP)
-    message(STATUS "Using Boost.MultiIndex from develop branch (refactored for Boost 1.91+)")
-    message(STATUS "This uses C++11 variadic templates and Boost.Mp11 instead of Boost.MPL")
+    message(STATUS "Fetching Boost.MultiIndex modules at ${MULTI_INDEX_LRU_BOOST_GIT_TAG}")
     
     include(FetchContent)
     
     # List of required Boost modules for multi_index
     set(BOOST_MODULES
-        multi_index config assert core type_traits static_assert
-        throw_exception preprocessor move mp11 tuple container_hash
-        describe bind iterator mpl utility smart_ptr integer detail
-        io function_types fusion typeof functional concept_check optional
+        assert bind config container_hash core integer mp11 multi_index
+        preprocessor smart_ptr throw_exception tuple type_traits utility
     )
     
     # Declare all modules
+    set(BOOST_FETCHCONTENT_NAMES)
     foreach(module ${BOOST_MODULES})
         FetchContent_Declare(
             boost_${module}
             GIT_REPOSITORY https://github.com/boostorg/${module}.git
-            GIT_TAG develop
-            SOURCE_DIR ${CMAKE_BINARY_DIR}/_deps/boost_${module}
+            GIT_TAG ${MULTI_INDEX_LRU_BOOST_GIT_TAG}
+            GIT_SHALLOW TRUE
+            SOURCE_SUBDIR multi_index_lru_headers_only
         )
-    endforeach()
-    
-    # Populate all modules (download only, don't add_subdirectory)
-    foreach(module ${BOOST_MODULES})
-        FetchContent_GetProperties(boost_${module})
-        if(NOT boost_${module}_POPULATED)
-            FetchContent_Populate(boost_${module})
-        endif()
+        list(APPEND BOOST_FETCHCONTENT_NAMES boost_${module})
     endforeach()
 
+    FetchContent_MakeAvailable(${BOOST_FETCHCONTENT_NAMES})
+
     # Create interface library for fetched Boost headers
-    add_library(boost_multi_index_develop INTERFACE)
+    add_library(boost_multi_index_fetched INTERFACE)
     foreach(module ${BOOST_MODULES})
-        target_include_directories(boost_multi_index_develop INTERFACE
-            ${CMAKE_BINARY_DIR}/_deps/boost_${module}/include
+        target_include_directories(boost_multi_index_fetched INTERFACE
+            ${boost_${module}_SOURCE_DIR}/include
         )
     endforeach()
     
-    set(BOOST_TARGET boost_multi_index_develop)
+    set(BOOST_TARGET boost_multi_index_fetched)
 else()
     # Use system-installed Boost
     find_package(Boost 1.74 REQUIRED)

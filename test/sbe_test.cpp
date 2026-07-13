@@ -115,6 +115,21 @@ TEST(SbeCacheTest, BuilderCopiesBytesAndIsLifetimeSafe) {
     EXPECT_EQ(view.security_id(), 1234U);
 }
 
+TEST(SbeCacheTest, NonOwningExtractedKeyPointsIntoOwnedPayload) {
+    using ViewEntry = multi_index_lru::SbeEntryWithKeys_t<std::span<const uint8_t>>;
+    auto builder = multi_index_lru::make_sbe_entry_builder<ViewEntry>(
+        MakeMockSbeView,
+        [](const MockSbeView& view) { return view.bytes.subspan(2, 4); });
+
+    auto payload = MakePayload(7, 1234);
+    auto entry = builder.build(payload);
+    payload[2] = 0xFF;
+
+    const auto key = std::get<0>(entry.keys);
+    EXPECT_EQ(key.data(), entry.raw_data().data() + 2);
+    EXPECT_EQ(key[0], static_cast<uint8_t>(1234 & 0xFFU));
+}
+
 TEST(SbeCacheTest, ContainerIndexesOverExtractedKeys) {
     auto builder = multi_index_lru::make_sbe_entry_builder<Entry>(
         MakeMockSbeView,

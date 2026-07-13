@@ -54,7 +54,7 @@ int main() {
 
     // Iterate in LRU order (most recent first)
     std::cout << "Items in LRU order (most recent first):\n";
-    for (const auto& entry : cache.get_container().get<0>()) {
+    for (const auto& entry : cache) {
         std::cout << "  " << entry.key << " = " << entry.value << "\n";
     }
 

@@ -1,7 +1,10 @@
 #include <multi_index_lru/container.hpp>
 
+#include <cstddef>
+#include <memory>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 
 #include <gtest/gtest.h>
 #include <boost/multi_index/hashed_index.hpp>
@@ -43,8 +46,10 @@ TEST_F(LRUUsersTest, BasicOperations) {
     UserCache cache(3);  // capacity == 3
 
     // Test insertion
-    cache.emplace(User{1, "alice@test.com", "Alice"});
-    cache.emplace(User{2, "bob@test.com", "Bob"});
+    EXPECT_TRUE(cache.emplace(User{1, "alice@test.com", "Alice"}));
+    auto [bob, inserted] = cache.emplace_with_iterator(User{2, "bob@test.com", "Bob"});
+    EXPECT_TRUE(inserted);
+    EXPECT_EQ(bob->id, 2);
     cache.emplace(User{3, "charlie@test.com", "Charlie"});
 
     EXPECT_EQ(cache.size(), 3);
@@ -138,6 +143,24 @@ TEST_F(LRUUsersTest, Erase) {
     EXPECT_FALSE(cache.erase<IdTag>(999));
 }
 
+TEST_F(LRUUsersTest, EraseLastElementReportsSuccess) {
+    UserCache cache(1);
+    cache.emplace(User{1, "a@test.com", "A"});
+
+    EXPECT_TRUE(cache.erase<IdTag>(1));
+    EXPECT_TRUE(cache.empty());
+}
+
+TEST_F(LRUUsersTest, EraseIteratorReturnsNext) {
+    UserCache cache(3);
+    cache.emplace(User{1, "a@test.com", "A"});
+    cache.emplace(User{2, "b@test.com", "B"});
+
+    auto next = cache.erase(cache.find_no_update<IdTag>(1));
+    ASSERT_NE(next, cache.end<IdTag>());
+    EXPECT_EQ(next->id, 2);
+}
+
 TEST_F(LRUUsersTest, ContainsNoUpdateDoesNotRefreshLru) {
     UserCache cache(2);
     cache.emplace(User{1, "a@test.com", "A"});
@@ -152,6 +175,24 @@ TEST_F(LRUUsersTest, ContainsNoUpdateDoesNotRefreshLru) {
     EXPECT_FALSE(cache.contains_no_update<IdTag>(1));
     EXPECT_TRUE(cache.contains_no_update<IdTag>(2));
     EXPECT_TRUE(cache.contains_no_update<IdTag>(3));
+}
+
+TEST_F(LRUUsersTest, RawAccessBoundary) {
+    UserCache cache(2);
+    cache.emplace(User{1, "a@test.com", "A"});
+
+    const auto& const_cache = cache;
+    static_assert(std::is_const_v<std::remove_reference_t<decltype(const_cache.get_container())>>);
+    static_assert(std::is_const_v<std::remove_reference_t<decltype(const_cache.get_index<IdTag>())>>);
+    static_assert(std::is_const_v<std::remove_reference_t<decltype(const_cache.get_sequenced())>>);
+
+    auto& unsafe_container = cache.unsafe_get_container();
+    auto& unsafe_index = cache.unsafe_get_index<IdTag>();
+    auto& unsafe_sequence = cache.unsafe_get_sequenced();
+
+    EXPECT_EQ(unsafe_container.size(), 1);
+    EXPECT_EQ(unsafe_index.size(), 1);
+    EXPECT_EQ(unsafe_sequence.size(), 1);
 }
 
 class ProductsTest : public ::testing::Test {
@@ -218,6 +259,76 @@ TEST_F(ProductsTest, EqualRangeNoUpdateConstOverload) {
     auto [begin, end] = const_cache.equal_range_no_update<NameTag>(std::string("Laptop"));
     ASSERT_NE(begin, end);
     EXPECT_EQ(begin->sku, "A1");
+}
+
+struct AllocationCounter {
+    static inline std::size_t allocations = 0;
+};
+
+template <typename T>
+struct CountingAllocator {
+    using value_type = T;
+
+    CountingAllocator() = default;
+
+    template <typename U>
+    CountingAllocator(const CountingAllocator<U>&) noexcept {}
+
+    [[nodiscard]] T* allocate(std::size_t count) {
+        ++AllocationCounter::allocations;
+        return std::allocator<T>{}.allocate(count);
+    }
+
+    void deallocate(T* ptr, std::size_t count) noexcept {
+        std::allocator<T>{}.deallocate(ptr, count);
+    }
+
+    template <typename U>
+    bool operator==(const CountingAllocator<U>&) const noexcept { return true; }
+};
+
+TEST_F(ProductsTest, ReusesExtractedNodes) {
+    using CountingCache = multi_index_lru::Container<
+        Product,
+        boost::multi_index::indexed_by<boost::multi_index::ordered_unique<
+            boost::multi_index::tag<SkuTag>,
+            boost::multi_index::member<Product, std::string, &Product::sku>>>,
+        CountingAllocator<Product>>;
+
+    AllocationCounter::allocations = 0;
+    CountingCache cache(2);
+    for (int i = 0; i < 20; ++i) {
+        cache.emplace(Product{"A" + std::to_string(i), "P", 1.0});
+    }
+    const auto allocations_after_warmup = AllocationCounter::allocations;
+
+    cache.clear();
+    for (int i = 20; i < 40; ++i) {
+        cache.emplace(Product{"A" + std::to_string(i), "P", 1.0});
+    }
+
+    EXPECT_EQ(AllocationCounter::allocations, allocations_after_warmup);
+    cache.shrink_to_fit();
+}
+
+TEST(ContainerTest, SupportsNonAssignableValues) {
+    struct IdTag {};
+    struct Value {
+        const int id;
+    };
+
+    using Cache = multi_index_lru::Container<
+        Value,
+        boost::multi_index::indexed_by<boost::multi_index::ordered_unique<
+            boost::multi_index::tag<IdTag>,
+            boost::multi_index::member<Value, const int, &Value::id>>>>;
+
+    Cache cache(1);
+    cache.emplace(Value{1});
+    cache.emplace(Value{2});
+
+    EXPECT_FALSE(cache.contains_no_update<IdTag>(1));
+    EXPECT_TRUE(cache.contains_no_update<IdTag>(2));
 }
 
 TEST(HashedIndexTest, SimpleUsage) {

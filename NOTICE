@@ -5,8 +5,9 @@ Copyright 2026 multi_index_lru contributors
 This project is derived from the multi-index-lru library, which is part of
 the userver framework (https://github.com/userver-framework/userver).
 
-The ExpirableContainer functionality is derived from the expirable branch at
-https://github.com/hzhdlrp/userver/tree/expirable/libraries/multi-index-lru
+The ExpirableContainer functionality was originally derived from the expirable
+branch at https://github.com/hzhdlrp/userver/tree/expirable/libraries/multi-index-lru
+and has since been synchronized with the implementation in userver develop.
 
 The original work is licensed under the Apache License, Version 2.0.
 
@@ -14,7 +15,9 @@ Modifications from the original:
 - Removed userver framework dependencies (USERVER_NAMESPACE macros, etc.)
 - Adapted to be a standalone header-only library
 - Added C++20 features ([[nodiscard]], noexcept, auto parameters)
-- Added iteration support and get_container() accessor
+- Added iteration support and explicit safe/unsafe underlying-container accessors
 - Created standalone CMake build system
 - Added ExpirableContainer with TTL-based expiration
 - Added zerialize integration for serialized binary data caching
+- Added owning-byte SBE/sbepp integration
+- Added reusable extracted-node pooling and an injectable expiration clock
