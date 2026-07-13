@@ -1,5 +1,7 @@
 # multi_index_lru
 
+[![CI](https://github.com/mrayva/multi_index_lru/actions/workflows/ci.yml/badge.svg)](https://github.com/mrayva/multi_index_lru/actions/workflows/ci.yml)
+
 A standalone, header-only C++20 LRU (Least Recently Used) cache container based on [Boost.MultiIndex](https://www.boost.org/doc/libs/release/libs/multi_index/doc/index.html).
 
 This library provides an LRU cache that supports multiple indices for efficient lookup by different keys, while automatically managing cache eviction based on access patterns.
@@ -20,8 +22,8 @@ This library provides an LRU cache that supports multiple indices for efficient 
 
 ## Requirements
 
-- C++20 compatible compiler (GCC 10+, Clang 12+, MSVC 2019+)
-- Boost 1.74+ (tested with Boost 1.91 and current MultiIndex `develop`)
+- C++20 compatible compiler (CI covers GCC 11/13 and Clang 14/18)
+- Boost 1.74+ (CI covers 1.74, 1.83, 1.91, and scheduled MultiIndex `develop`)
 - CMake 3.20+ (for building tests/examples)
 - [zerialize](https://github.com/colinator/zerialize) (optional, for binary format caching)
 - [sbepp 1.8+](https://github.com/OleksandrKvl/sbepp) (optional, for the concrete SBE example; use matching `sbeppc` and library versions)

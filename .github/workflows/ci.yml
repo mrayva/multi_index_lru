@@ -1,0 +1,114 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  compatibility:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: GCC 11 / Boost 1.74
+            runner: ubuntu-22.04
+            cc: gcc-11
+            cxx: g++-11
+            packages: g++-11 libboost1.74-dev
+            boost_develop: "OFF"
+            boost_tag: develop
+          - name: Clang 14 / Boost 1.74
+            runner: ubuntu-22.04
+            cc: clang-14
+            cxx: clang++-14
+            packages: clang-14 libboost1.74-dev
+            boost_develop: "OFF"
+            boost_tag: develop
+          - name: GCC 13 / Boost 1.83
+            runner: ubuntu-24.04
+            cc: gcc-13
+            cxx: g++-13
+            packages: g++-13 libboost1.83-dev
+            boost_develop: "OFF"
+            boost_tag: develop
+          - name: Clang 18 / Boost 1.83
+            runner: ubuntu-24.04
+            cc: clang-18
+            cxx: clang++-18
+            packages: clang-18 libboost1.83-dev
+            boost_develop: "OFF"
+            boost_tag: develop
+          - name: GCC 13 / Boost 1.91
+            runner: ubuntu-24.04
+            cc: gcc-13
+            cxx: g++-13
+            packages: g++-13
+            boost_develop: "ON"
+            boost_tag: boost-1.91.0
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y ninja-build ${{ matrix.packages }}
+
+      - name: Configure
+        env:
+          CC: ${{ matrix.cc }}
+          CXX: ${{ matrix.cxx }}
+        run: >-
+          cmake -S . -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DMULTI_INDEX_LRU_BUILD_TESTS=ON
+          -DMULTI_INDEX_LRU_BUILD_EXAMPLES=ON
+          -DMULTI_INDEX_LRU_USE_BOOST_DEVELOP=${{ matrix.boost_develop }}
+          -DMULTI_INDEX_LRU_BOOST_GIT_TAG=${{ matrix.boost_tag }}
+          -DCMAKE_CXX_FLAGS="-Wall -Wextra -Wpedantic -Werror"
+
+      - name: Build
+        run: cmake --build build --parallel 2
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  boost-develop:
+    name: Clang 18 / Boost develop
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y clang-18 ninja-build
+
+      - name: Configure
+        env:
+          CC: clang-18
+          CXX: clang++-18
+        run: >-
+          cmake -S . -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DMULTI_INDEX_LRU_BUILD_TESTS=ON
+          -DMULTI_INDEX_LRU_BUILD_EXAMPLES=ON
+          -DMULTI_INDEX_LRU_USE_BOOST_DEVELOP=ON
+          -DMULTI_INDEX_LRU_BOOST_GIT_TAG=develop
+          -DCMAKE_CXX_FLAGS="-Wall -Wextra -Wpedantic -Werror"
+
+      - name: Build
+        run: cmake --build build --parallel 2
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
