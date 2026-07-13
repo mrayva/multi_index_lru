@@ -72,7 +72,7 @@ public:
     using size_type = std::size_t;
     using clock_type = Clock;
     using duration_type = std::chrono::milliseconds;
-    using time_point_type = clock_type::time_point;
+    using time_point_type = typename clock_type::time_point;
 
     /// @brief Construct container with specified capacity and TTL
     /// @param max_size Maximum number of elements before LRU eviction
