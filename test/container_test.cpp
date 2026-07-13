@@ -311,6 +311,36 @@ TEST_F(ProductsTest, ReusesExtractedNodes) {
     cache.shrink_to_fit();
 }
 
+TEST_F(ProductsTest, ConfiguresRetainedNodePool) {
+    ProductCache cache(4, 1);
+    EXPECT_EQ(cache.node_pool_capacity(), 1);
+    EXPECT_EQ(cache.node_pool_size(), 0);
+
+    cache.emplace(Product{"A1", "One", 1.0});
+    cache.emplace(Product{"A2", "Two", 2.0});
+    cache.clear();
+    EXPECT_EQ(cache.node_pool_size(), 1);
+
+    cache.set_node_pool_capacity(0);
+    EXPECT_EQ(cache.node_pool_capacity(), 0);
+    EXPECT_EQ(cache.node_pool_size(), 0);
+    cache.emplace(Product{"A3", "Three", 3.0});
+    cache.erase<SkuTag>(std::string{"A3"});
+    EXPECT_EQ(cache.node_pool_size(), 0);
+}
+
+TEST_F(ProductsTest, DefaultNodePoolPreservesUnboundedRetention) {
+    ProductCache cache(2);
+    EXPECT_EQ(cache.node_pool_capacity(), ProductCache::unlimited_node_pool);
+
+    cache.set_capacity(5);
+    EXPECT_EQ(cache.node_pool_capacity(), ProductCache::unlimited_node_pool);
+
+    cache.set_node_pool_capacity(1);
+    cache.set_capacity(3);
+    EXPECT_EQ(cache.node_pool_capacity(), 1);
+}
+
 TEST(ContainerTest, SupportsNonAssignableValues) {
     struct IdTag {};
     struct Value {

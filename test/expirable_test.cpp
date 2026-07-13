@@ -199,6 +199,19 @@ TEST_F(ExpirableBasicTest, SetCapacity) {
     EXPECT_LE(cache.size(), 2);
 }
 
+TEST_F(ExpirableBasicTest, ConfiguresRetainedNodePool) {
+    EasierUserCache bounded(3, 1h, 1);
+    EXPECT_EQ(bounded.node_pool_capacity(), 1);
+
+    bounded.insert(ExpirableUserValue{1, "alice@test.com", "Alice"});
+    bounded.insert(ExpirableUserValue{2, "bob@test.com", "Bob"});
+    bounded.clear();
+    EXPECT_EQ(bounded.node_pool_size(), 1);
+
+    bounded.set_node_pool_capacity(0);
+    EXPECT_EQ(bounded.node_pool_size(), 0);
+}
+
 TEST_F(ExpirableBasicTest, ParameterValidation) {
     EXPECT_THROW((EasierUserCache{0, 1h}), std::invalid_argument);
     EXPECT_THROW((EasierUserCache{3, 0ms}), std::invalid_argument);

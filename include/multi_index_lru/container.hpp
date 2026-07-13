@@ -23,10 +23,12 @@
 #include <boost/multi_index/sequenced_index.hpp>
 #include <boost/multi_index_container.hpp>
 
+#include <algorithm>
 #include <cassert>
 #include <chrono>
 #include <cstddef>
 #include <iterator>
+#include <limits>
 #include <stdexcept>
 #include <tuple>
 #include <type_traits>
@@ -192,11 +194,18 @@ public:
     using value_type = Value;
     using allocator_type = Allocator;
     using size_type = std::size_t;
+    static constexpr size_type unlimited_node_pool = std::numeric_limits<size_type>::max();
 
     /// @brief Construct container with specified capacity
     /// @param max_size Maximum number of elements before LRU eviction
     explicit Container(size_type max_size)
-        : max_size_(max_size)
+        : Container(max_size, unlimited_node_pool) {}
+
+    /// @brief Construct container with specified cache and retained-node capacities
+    /// @param max_size Maximum number of elements before LRU eviction
+    /// @param node_pool_capacity Maximum erased nodes retained for reuse; zero disables retention
+    Container(size_type max_size, size_type node_pool_capacity)
+        : max_size_(max_size), node_pool_capacity_(node_pool_capacity)
     {
         if (max_size_ == 0) {
             throw std::invalid_argument("Container capacity must be greater than 0");
@@ -244,7 +253,7 @@ public:
             seq_index.relocate(seq_index.begin(), result.first);
         } else if (seq_index.size() > max_size_) {
             if constexpr (kCanReuseNodes) {
-                free_nodes_.emplace_back(seq_index.extract(std::prev(seq_index.end())));
+                retain_node(seq_index.extract(std::prev(seq_index.end())));
             } else {
                 seq_index.pop_back();
             }
@@ -386,7 +395,7 @@ public:
 
         ++it;
         if constexpr (kCanReuseNodes) {
-            free_nodes_.emplace_back(seq_index.extract(seq_it));
+            retain_node(seq_index.extract(seq_it));
         } else {
             seq_index.erase(seq_it);
         }
@@ -425,13 +434,28 @@ public:
     /// @brief Release nodes retained for reuse
     void shrink_to_fit() { free_nodes_.clear(); }
 
+    /// @brief Get the maximum number of nodes retained for reuse
+    [[nodiscard]] size_type node_pool_capacity() const noexcept { return node_pool_capacity_; }
+
+    /// @brief Get the current number of nodes retained for reuse
+    [[nodiscard]] size_type node_pool_size() const noexcept { return free_nodes_.size(); }
+
+    /// @brief Set the retained-node limit; zero disables node retention
+    void set_node_pool_capacity(size_type new_capacity) {
+        node_pool_capacity_ = new_capacity;
+        if (free_nodes_.size() > node_pool_capacity_) {
+            free_nodes_.resize(node_pool_capacity_);
+        }
+    }
+
     /// @brief Remove all elements, retaining reusable nodes when possible
     void clear() {
         if constexpr (kCanReuseNodes) {
             auto& seq_index = container_.template get<0>();
-            free_nodes_.reserve(free_nodes_.size() + container_.size());
+            const auto available = node_pool_capacity_ - free_nodes_.size();
+            free_nodes_.reserve(free_nodes_.size() + std::min(available, container_.size()));
             while (!seq_index.empty()) {
-                free_nodes_.emplace_back(seq_index.extract(std::prev(seq_index.end())));
+                retain_node(seq_index.extract(std::prev(seq_index.end())));
             }
         } else {
             container_.clear();
@@ -518,6 +542,12 @@ private:
 
     static constexpr bool kCanReuseNodes = std::is_assignable_v<Value&, Value>;
 
+    void retain_node(typename BoostContainer::node_type node) {
+        if (free_nodes_.size() < node_pool_capacity_) {
+            free_nodes_.emplace_back(std::move(node));
+        }
+    }
+
     /// @pre The container is not empty
     [[nodiscard]] auto find_last_accessed_no_update() const {
         return std::prev(container_.template get<0>().end());
@@ -525,6 +555,7 @@ private:
 
     BoostContainer container_;
     size_type max_size_;
+    size_type node_pool_capacity_;
     std::vector<typename BoostContainer::node_type> free_nodes_;
 
     template <typename V, typename I, typename A, typename C>

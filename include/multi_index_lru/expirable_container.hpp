@@ -85,6 +85,15 @@ public:
         }
     }
 
+    /// @brief Construct with specified cache, TTL, and retained-node capacities
+    ExpirableContainer(size_type max_size, duration_type ttl, size_type node_pool_capacity)
+        : container_(max_size, node_pool_capacity), ttl_(ttl)
+    {
+        if (ttl.count() <= 0) {
+            throw std::invalid_argument("TTL must be positive");
+        }
+    }
+
     /// @brief Emplace a new element
     /// @param args Arguments forwarded to value constructor
     /// @return Pair of (wrapped iterator, bool indicating new insertion)
@@ -270,6 +279,15 @@ public:
 
     /// @brief Release nodes retained for reuse
     void shrink_to_fit() { container_.shrink_to_fit(); }
+
+    /// @brief Get the maximum number of nodes retained for reuse
+    [[nodiscard]] size_type node_pool_capacity() const noexcept { return container_.node_pool_capacity(); }
+
+    /// @brief Get the current number of nodes retained for reuse
+    [[nodiscard]] size_type node_pool_size() const noexcept { return container_.node_pool_size(); }
+
+    /// @brief Set the retained-node limit; zero disables node retention
+    void set_node_pool_capacity(size_type new_capacity) { container_.set_node_pool_capacity(new_capacity); }
 
     /// @brief Get end iterator for specified index
     /// @tparam Tag Index tag type

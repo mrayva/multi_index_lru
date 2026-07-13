@@ -10,7 +10,7 @@ This library provides an LRU cache that supports multiple indices for efficient 
 - **Multiple indices**: Look up items by different keys (ID, name, email, etc.)
 - **Composite keys**: Index by combinations of fields (e.g., tenant_id + user_id)
 - **LRU eviction**: Automatically evicts least recently used items when capacity is exceeded
-- **Node reuse**: Recycles evicted/erased nodes for assignable value types to reduce allocator traffic
+- **Configurable node reuse**: Recycles evicted/erased nodes for assignable value types, with an optional retention bound
 - **Access tracking**: `find()` operations automatically refresh the item's position in the LRU order
 - **TTL expiration**: Items automatically expire after a configurable time-to-live
 - **Zerialize support**: Cache serialized binary data (MsgPack, CBOR, JSON, Flex, ZERA) with extracted indices
@@ -267,6 +267,7 @@ class ExpirableContainer;
 #### Constructor
 
 - `ExpirableContainer(size_type max_size, duration_type ttl)` - Create with capacity and TTL (`max_size > 0`, `ttl > 0`, throws `std::invalid_argument` otherwise)
+- `ExpirableContainer(size_type max_size, duration_type ttl, size_type node_pool_capacity)` - Set an explicit retained-node limit; use zero to disable retention
 
 #### TTL-specific Methods
 
@@ -275,6 +276,7 @@ class ExpirableContainer;
 - `void set_ttl(duration_type new_ttl)` - Change TTL for future accesses (`new_ttl > 0`, throws `std::invalid_argument` otherwise)
 - `Clock` can be replaced with a compatible clock for deterministic tests
 - `void shrink_to_fit()` - Release nodes retained for reuse
+- `node_pool_capacity()`, `node_pool_size()`, `set_node_pool_capacity(size_type)` - Inspect or bound retained nodes
 
 #### Lookup Methods
 
@@ -519,7 +521,8 @@ class Container;
 
 #### Constructor
 
-- `explicit Container(size_type max_size)` - Create container with given capacity (`max_size > 0`, throws `std::invalid_argument` otherwise)
+- `explicit Container(size_type max_size)` - Create container with given capacity and legacy unbounded node retention (`max_size > 0`, throws `std::invalid_argument` otherwise)
+- `Container(size_type max_size, size_type node_pool_capacity)` - Set an explicit retained-node limit; use zero to disable retention
 
 #### Insertion
 
@@ -549,6 +552,9 @@ class Container;
 - `bool empty() const` - Check if empty
 - `size_type capacity() const` - Maximum capacity
 - `void set_capacity(size_type new_capacity)` - Change capacity (evicts if needed, `new_capacity > 0`, throws `std::invalid_argument` otherwise)
+- `size_type node_pool_capacity() const` - Maximum number of erased nodes retained for reuse
+- `size_type node_pool_size() const` - Current number of retained nodes
+- `void set_node_pool_capacity(size_type)` - Change the retained-node limit and immediately release excess nodes
 
 #### Iteration
 
