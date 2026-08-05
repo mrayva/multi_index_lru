@@ -20,4 +20,6 @@ Modifications from the original:
 - Added ExpirableContainer with TTL-based expiration
 - Added zerialize integration for serialized binary data caching
 - Added owning-byte SBE/sbepp integration
-- Added reusable extracted-node pooling and an injectable expiration clock
+- Made extracted-node pool retention configurable (bounded capacity, `shrink_to_fit()`)
+  and added an injectable expiration clock; the underlying node-reuse mechanism itself
+  originates from userver

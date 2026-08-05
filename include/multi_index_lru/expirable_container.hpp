@@ -131,17 +131,18 @@ public:
     template <typename Tag, typename Key = void>
     auto find(const auto& key) {
         const auto now = clock_type::now();
-        auto it = container_.template find<Tag, Key>(key);
-        
+        auto it = container_.template find_no_update<Tag, Key>(key);
+
         if (it != container_.template end<Tag>()) {
             if (now > it->last_accessed + ttl_) {
                 container_.erase(it);
                 return this->template end<Tag>();
             } else {
+                container_.touch(it);
                 it->last_accessed = now;
             }
         }
-        
+
         return detail::TimestampedIteratorWrapper{it};
     }
 
@@ -177,16 +178,17 @@ public:
     template <typename Tag, typename Key = void>
     auto equal_range(const auto& key) {
         const auto now = clock_type::now();
-        auto range = container_.template equal_range<Tag, Key>(key);
-        
+        auto range = container_.template equal_range_no_update<Tag, Key>(key);
+
         auto it = range.first;
         bool changed = false;
-        
+
         while (it != range.second) {
             if (now > it->last_accessed + ttl_) {
                 it = container_.erase(it);
                 changed = true;
             } else {
+                container_.touch(it);
                 it->last_accessed = now;
                 ++it;
             }

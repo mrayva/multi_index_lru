@@ -341,6 +341,32 @@ TEST_F(ProductsTest, DefaultNodePoolPreservesUnboundedRetention) {
     EXPECT_EQ(cache.node_pool_capacity(), 1);
 }
 
+// Shrinking capacity evicts the excess elements directly and discards any
+// already-retained free nodes rather than feeding them back into the pool.
+// This matches upstream userver's set_capacity(), which evicts via a plain
+// extract-and-discard once the container is already over its new limit
+// instead of growing the pool during a shrink. Pinned here as a regression
+// test since no other test exercises node_pool_size() across a shrink.
+TEST_F(ProductsTest, ShrinkingCapacityDiscardsRetainedNodePool) {
+    ProductCache cache(4, ProductCache::unlimited_node_pool);
+
+    cache.emplace(Product{"A1", "One", 1.0});
+    cache.emplace(Product{"A2", "Two", 2.0});
+    cache.erase<SkuTag>(std::string{"A2"});
+    EXPECT_EQ(cache.node_pool_size(), 1);
+
+    cache.emplace(Product{"A3", "Three", 3.0});
+    cache.emplace(Product{"A4", "Four", 4.0});
+    cache.emplace(Product{"A5", "Five", 5.0});
+    EXPECT_EQ(cache.size(), 4);
+
+    // Shrinking below the current size clears the pool up front and evicts
+    // the overflow without retaining those nodes either.
+    cache.set_capacity(2);
+    EXPECT_EQ(cache.size(), 2);
+    EXPECT_EQ(cache.node_pool_size(), 0);
+}
+
 TEST(ContainerTest, SupportsNonAssignableValues) {
     struct IdTag {};
     struct Value {

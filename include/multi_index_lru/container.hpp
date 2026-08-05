@@ -43,11 +43,8 @@ class ExpirableContainer;
 namespace detail {
 
 /// Check if type is boost::mpl::na (placeholder type)
-template <typename T, typename = void>
-inline constexpr bool is_mpl_na = false;
-
 template <typename T>
-inline constexpr bool is_mpl_na<T, std::void_t<decltype(std::declval<T>().~na())>> = true;
+concept is_mpl_na = requires(T& t) { t.~na(); };
 
 /// Helper to prepend sequenced index to existing indices
 template <typename... Indices>
@@ -271,6 +268,22 @@ public:
     /// @return true if newly inserted, false if existing element was refreshed
     bool insert(Value&& value) { return emplace(std::move(value)); }
 
+    /// @brief Move an already-located iterator to the front of the LRU order
+    /// @tparam Iterator Iterator type from any index of this container
+    /// @param it Iterator to refresh; end() is accepted and ignored
+    ///
+    /// Lets callers that already hold an iterator (e.g. after a conditional
+    /// lookup) refresh recency without repeating the key search that find()
+    /// performs internally.
+    template <typename Iterator>
+    void touch(Iterator it) {
+        auto& seq_index = container_.template get<0>();
+        auto seq_it = container_.template project<0>(it);
+        if (seq_it != seq_index.end()) {
+            seq_index.relocate(seq_index.begin(), seq_it);
+        }
+    }
+
     /// @brief Find element by key using specified index
     /// @tparam Tag Index tag type
     /// @tparam Key Key type (can often be deduced)
@@ -280,15 +293,8 @@ public:
     /// Finding an element moves it to the front (most recently used).
     template <typename Tag, typename Key = void>
     auto find(const auto& key) {
-        auto& primary_index = container_.template get<Tag>();
-        auto it = primary_index.find(key);
-
-        if (it != primary_index.end()) {
-            auto& seq_index = container_.template get<0>();
-            auto seq_it = container_.template project<0>(it);
-            seq_index.relocate(seq_index.begin(), seq_it);
-        }
-
+        auto it = this->template find_no_update<Tag, Key>(key);
+        touch(it);
         return it;
     }
 
@@ -318,14 +324,12 @@ public:
     /// All elements in range are moved to front (most recently used).
     template <typename Tag, typename Key = void>
     auto equal_range(const auto& key) {
-        auto& primary_index = container_.template get<Tag>();
-        auto [begin, end] = primary_index.equal_range(key);
-        
-        auto& seq_index = container_.template get<0>();
+        auto [begin, end] = this->template equal_range_no_update<Tag, Key>(key);
+
         for (auto it = begin; it != end; ++it) {
-            seq_index.relocate(seq_index.begin(), container_.template project<0>(it));
+            touch(it);
         }
-        
+
         return std::pair{begin, end};
     }
 

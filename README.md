@@ -25,7 +25,7 @@ This library provides an LRU cache that supports multiple indices for efficient 
 - C++20 compatible compiler (CI covers GCC 11/13 and Clang 14/18)
 - Boost 1.74+ (CI covers 1.74, 1.83, 1.91, and scheduled MultiIndex `develop`)
 - CMake 3.20+ (for building tests/examples)
-- [zerialize](https://github.com/colinator/zerialize) (optional, for binary format caching)
+- [zerialize](https://github.com/mrayva/zerialize) (optional, for binary format caching)
 - [sbepp 1.8+](https://github.com/OleksandrKvl/sbepp) (optional, for the concrete SBE example; CI pins 1.8.0 and uses matching `sbeppc` and library revisions)
 
 ## Installation
@@ -293,7 +293,7 @@ class ExpirableContainer;
 
 ## Zerialize Integration
 
-The library provides adapters for caching serialized binary data from [zerialize](https://github.com/colinator/zerialize), supporting all 5 formats:
+The library provides adapters for caching serialized binary data from [zerialize](https://github.com/mrayva/zerialize), supporting all 5 formats:
 
 | Format | Deserializer | Zero-Copy | Best For |
 |--------|--------------|-----------|----------|
@@ -540,6 +540,7 @@ class Container;
 - `template<typename Tag> auto find_no_update(const auto& key)` - Find by key without refreshing LRU
 - `template<typename Tag> auto equal_range_no_update(const auto& key)` - Range query without refreshing LRU
 - `template<typename Tag> bool contains_no_update(const auto& key)` - Existence check without refreshing LRU
+- `template<typename Iterator> void touch(Iterator it)` - Refresh LRU position for an iterator you already hold, without repeating the key search
 
 #### Removal
 
@@ -691,6 +692,10 @@ cpack --config build-release/CPackConfig.cmake
 The container wraps a `boost::multi_index_container` and automatically prepends a `sequenced` index to track access order. When elements are accessed via `find()` or `contains()`, they are moved to the front of the sequence. When the container exceeds capacity during insertion, the element at the back (least recently used) is evicted. For assignable value types, extracted nodes are retained and reused; call `shrink_to_fit()` to release that memory.
 
 For zerialize data, the `ZerializeEntry` stores both the original serialized bytes and extracted keys. Keys are extracted once at insertion time, enabling O(1) or O(log n) lookups without repeated deserialization. Full deserialization only happens on demand via `deserialize<Format>()`.
+
+## Thread Safety
+
+`Container` and `ExpirableContainer` are **not thread-safe**. Every read (including `find()`, `contains()`, and `equal_range()`) mutates LRU order and, for the expirable container, access timestamps, so even lookups require external synchronization (e.g. a mutex) if the cache is shared across threads. There is no internal locking.
 
 ## Credits
 
