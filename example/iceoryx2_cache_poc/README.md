@@ -319,8 +319,18 @@ becomes more than a POC:
   nothing about throughput with many concurrent clients.
 - **Failure handling.** No reconnect/retry logic beyond what `nats_asio`
   does internally, no handling of the daemon process dying mid-request
-  beyond what iceoryx2 does by default, no malformed-message hardening
-  beyond `wire::Reader` throwing on truncation.
+  beyond what iceoryx2 does by default. A malformed/truncated request (or an
+  unexpected NATS-side exception) is now caught at the request-handling
+  boundary and turned into an `Error` response instead of crashing the
+  daemon — see `handle_request_local()` in `cache_service.hpp` and
+  `handle_request()`/`nats_bridge.hpp` in the NATS-backed server — but there's
+  still no rate limiting or backpressure if a client hammers the daemon with
+  bad requests. Signal handling needed no fix: iceoryx2's `node.wait()`
+  already returns an unhappy result on SIGINT/SIGTERM, so the existing
+  `while (node.wait(...))` loop already exits gracefully and lets `main()`
+  return normally, running `NatsBridge`'s destructor (clean NATS thread
+  shutdown) via ordinary RAII — confirmed by sending SIGTERM to a running
+  daemon and observing `[server] exit` followed by the process disappearing.
 - **Build footprint.** Two Rust-adjacent toolchains (Rust itself for
   iceoryx2-cxx, plus nats_asio's own sizeable vcpkg dependency tree) for a
   project that otherwise only needs Boost + a C++20 compiler; worth weighing

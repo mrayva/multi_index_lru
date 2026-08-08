@@ -37,8 +37,12 @@ constexpr std::uint64_t kInitialSliceLenHint = 256;
 constexpr auto kNameBucket = "mil_by_name";
 constexpr auto kIdBucket = "mil_by_id";
 
-std::vector<std::uint8_t> handle_request(poc::NameCache& name_cache, poc::IdCache& id_cache, poc::NatsBridge& nats,
-                                          const std::uint8_t* data, std::size_t size) {
+// A malformed/truncated request or an unexpected NATS-side exception must
+// never escape this function: it's called from the server's single request
+// loop, and an unhandled exception there would take the whole daemon down
+// for every other client over one bad message or one NATS hiccup.
+std::vector<std::uint8_t> handle_request_impl(poc::NameCache& name_cache, poc::IdCache& id_cache,
+                                               poc::NatsBridge& nats, const std::uint8_t* data, std::size_t size) {
     poc::wire::Reader r(data, size);
     const auto op = static_cast<poc::wire::Op>(r.u8());
     const auto kind = static_cast<poc::wire::KeyKind>(r.u8());
@@ -133,6 +137,19 @@ std::vector<std::uint8_t> handle_request(poc::NameCache& name_cache, poc::IdCach
     id_cache.erase<poc::IdTag>(key);
     std::cout << "[server] ERASE id=" << key << " -> NATS ok, cache updated\n";
     return poc::encode_status(poc::wire::Status::Ok);
+}
+
+std::vector<std::uint8_t> handle_request(poc::NameCache& name_cache, poc::IdCache& id_cache, poc::NatsBridge& nats,
+                                          const std::uint8_t* data, std::size_t size) {
+    try {
+        return handle_request_impl(name_cache, id_cache, nats, data, size);
+    } catch (const std::exception& e) {
+        std::cout << "[server] request failed (" << size << " bytes in): " << e.what() << "\n";
+        return poc::encode_status(poc::wire::Status::Error);
+    } catch (...) {
+        std::cout << "[server] request failed (" << size << " bytes in): unknown exception\n";
+        return poc::encode_status(poc::wire::Status::Error);
+    }
 }
 
 }  // namespace

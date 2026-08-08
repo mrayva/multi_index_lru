@@ -81,17 +81,27 @@ public:
         auto conn = conn_;
         auto timeout = timeout_;
 
+        // asio::detached means an exception escaping this coroutine calls
+        // std::terminate() -- catch everything and fold it into the same
+        // Error result the caller already handles, rather than risk taking
+        // the whole process down over one bad NATS response.
         asio::co_spawn(
             ioc_,
             [conn, bucket, key, timeout, prom]() -> asio::awaitable<void> {
-                auto [entry, status] = co_await conn->kv_get(bucket, key, timeout);
-                if (status.ok()) {
-                    prom->set_value(NatsGetResult{
-                        NatsResult::Ok, std::vector<std::uint8_t>(entry.value.begin(), entry.value.end()), {}});
-                } else if (status.code() == nats_asio::error_code::key_not_found) {
-                    prom->set_value(NatsGetResult{NatsResult::NotFound, {}, {}});
-                } else {
-                    prom->set_value(NatsGetResult{NatsResult::Error, {}, status.error()});
+                try {
+                    auto [entry, status] = co_await conn->kv_get(bucket, key, timeout);
+                    if (status.ok()) {
+                        prom->set_value(NatsGetResult{
+                            NatsResult::Ok, std::vector<std::uint8_t>(entry.value.begin(), entry.value.end()), {}});
+                    } else if (status.code() == nats_asio::error_code::key_not_found) {
+                        prom->set_value(NatsGetResult{NatsResult::NotFound, {}, {}});
+                    } else {
+                        prom->set_value(NatsGetResult{NatsResult::Error, {}, status.error()});
+                    }
+                } catch (const std::exception& e) {
+                    prom->set_value(NatsGetResult{NatsResult::Error, {}, std::string("exception: ") + e.what()});
+                } catch (...) {
+                    prom->set_value(NatsGetResult{NatsResult::Error, {}, "unknown exception"});
                 }
                 co_return;
             },
@@ -111,10 +121,16 @@ public:
         asio::co_spawn(
             ioc_,
             [conn, bucket, key, value, timeout, prom]() -> asio::awaitable<void> {
-                std::span<const char> span(reinterpret_cast<const char*>(value.data()), value.size());
-                auto [revision, status] = co_await conn->kv_put(bucket, key, span, timeout);
-                (void)revision;
-                prom->set_value({status.ok(), status.ok() ? std::string{} : status.error()});
+                try {
+                    std::span<const char> span(reinterpret_cast<const char*>(value.data()), value.size());
+                    auto [revision, status] = co_await conn->kv_put(bucket, key, span, timeout);
+                    (void)revision;
+                    prom->set_value({status.ok(), status.ok() ? std::string{} : status.error()});
+                } catch (const std::exception& e) {
+                    prom->set_value({false, std::string("exception: ") + e.what()});
+                } catch (...) {
+                    prom->set_value({false, "unknown exception"});
+                }
                 co_return;
             },
             asio::detached);
@@ -132,9 +148,15 @@ public:
         asio::co_spawn(
             ioc_,
             [conn, bucket, key, timeout, prom]() -> asio::awaitable<void> {
-                auto [revision, status] = co_await conn->kv_delete(bucket, key, timeout);
-                (void)revision;
-                prom->set_value({status.ok(), status.ok() ? std::string{} : status.error()});
+                try {
+                    auto [revision, status] = co_await conn->kv_delete(bucket, key, timeout);
+                    (void)revision;
+                    prom->set_value({status.ok(), status.ok() ? std::string{} : status.error()});
+                } catch (const std::exception& e) {
+                    prom->set_value({false, std::string("exception: ") + e.what()});
+                } catch (...) {
+                    prom->set_value({false, "unknown exception"});
+                }
                 co_return;
             },
             asio::detached);

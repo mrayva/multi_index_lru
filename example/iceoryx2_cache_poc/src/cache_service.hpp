@@ -129,44 +129,56 @@ inline std::vector<std::uint8_t> encode_found(const std::vector<std::uint8_t>& r
 /// write-through step around the same caches).
 inline std::vector<std::uint8_t> handle_request_local(
     NameCache& name_cache, IdCache& id_cache, const std::uint8_t* data, std::size_t size) {
-    wire::Reader r(data, size);
-    const auto op = static_cast<wire::Op>(r.u8());
-    const auto kind = static_cast<wire::KeyKind>(r.u8());
+    // A malformed/truncated request (wire::Reader throws std::out_of_range on
+    // that) must never escape this function: this is called from the
+    // server's single request loop, and an unhandled exception there would
+    // take the whole daemon down for every other client over one bad
+    // message.
+    try {
+        wire::Reader r(data, size);
+        const auto op = static_cast<wire::Op>(r.u8());
+        const auto kind = static_cast<wire::KeyKind>(r.u8());
 
-    switch (op) {
-        case wire::Op::Get: {
-            if (kind == wire::KeyKind::Name) {
-                auto it = name_cache.find<NameTag>(r.str());
-                return (it != name_cache.end<NameTag>()) ? encode_found(it->record)
-                                                           : encode_status(wire::Status::NotFound);
+        switch (op) {
+            case wire::Op::Get: {
+                if (kind == wire::KeyKind::Name) {
+                    auto it = name_cache.find<NameTag>(r.str());
+                    return (it != name_cache.end<NameTag>()) ? encode_found(it->record)
+                                                               : encode_status(wire::Status::NotFound);
+                }
+                auto it = id_cache.find<IdTag>(r.i64());
+                return (it != id_cache.end<IdTag>()) ? encode_found(it->record)
+                                                       : encode_status(wire::Status::NotFound);
             }
-            auto it = id_cache.find<IdTag>(r.i64());
-            return (it != id_cache.end<IdTag>()) ? encode_found(it->record) : encode_status(wire::Status::NotFound);
-        }
-        case wire::Op::Erase: {
-            const bool erased =
-                (kind == wire::KeyKind::Name) ? name_cache.erase<NameTag>(r.str()) : id_cache.erase<IdTag>(r.i64());
-            return encode_status(erased ? wire::Status::Ok : wire::Status::NotFound);
-        }
-        case wire::Op::Put: {
-            if (kind == wire::KeyKind::Name) {
-                auto name = r.str();
-                auto record = r.bytes(r.u32());
-                // Upsert: a plain emplace() only inserts-if-absent and won't
-                // overwrite an existing value on a duplicate key, so drop
-                // whatever's there first.
-                name_cache.erase<NameTag>(name);
-                name_cache.emplace(NameEntry{std::move(name), std::move(record)});
-            } else {
-                auto id = r.i64();
-                auto record = r.bytes(r.u32());
-                id_cache.erase<IdTag>(id);
-                id_cache.emplace(IdEntry{id, std::move(record)});
+            case wire::Op::Erase: {
+                const bool erased = (kind == wire::KeyKind::Name) ? name_cache.erase<NameTag>(r.str())
+                                                                    : id_cache.erase<IdTag>(r.i64());
+                return encode_status(erased ? wire::Status::Ok : wire::Status::NotFound);
             }
-            return encode_status(wire::Status::Ok);
+            case wire::Op::Put: {
+                if (kind == wire::KeyKind::Name) {
+                    auto name = r.str();
+                    auto record = r.bytes(r.u32());
+                    // Upsert: a plain emplace() only inserts-if-absent and
+                    // won't overwrite an existing value on a duplicate key,
+                    // so drop whatever's there first.
+                    name_cache.erase<NameTag>(name);
+                    name_cache.emplace(NameEntry{std::move(name), std::move(record)});
+                } else {
+                    auto id = r.i64();
+                    auto record = r.bytes(r.u32());
+                    id_cache.erase<IdTag>(id);
+                    id_cache.emplace(IdEntry{id, std::move(record)});
+                }
+                return encode_status(wire::Status::Ok);
+            }
         }
+        return encode_status(wire::Status::NotFound);
+    } catch (const std::exception&) {
+        return encode_status(wire::Status::Error);
+    } catch (...) {
+        return encode_status(wire::Status::Error);
     }
-    return encode_status(wire::Status::NotFound);
 }
 
 }  // namespace poc
