@@ -21,6 +21,7 @@ cmake_minimum_required(VERSION 3.22)
 project(multi_index_lru_iceoryx2_poc LANGUAGES CXX)
 
 option(POC_ENABLE_NATS_READTHROUGH "Also build the NATS-backed read-through/write-through server and client" OFF)
+option(POC_BUILD_TESTS "Build the ctest-integrated wire.hpp unit tests" ON)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -58,4 +59,30 @@ if(POC_ENABLE_NATS_READTHROUGH)
     target_link_libraries(cache_poc_client_readthrough
         PRIVATE multi_index_lru_headers iceoryx2-cxx::static-lib-cxx nats_asio::nats_asio Threads::Threads
     )
+endif()
+
+# wire.hpp has no dependency on iceoryx2/nats_asio/Boost/multi_index_lru --
+# it's a standalone little-endian encoder/decoder -- so its test target only
+# links against GTest, even though (like everything else in this directory)
+# actually configuring this project still requires iceoryx2-cxx to be found
+# above.
+if(POC_BUILD_TESTS)
+    include(FetchContent)
+    FetchContent_Declare(
+        googletest
+        GIT_REPOSITORY https://github.com/google/googletest.git
+        GIT_TAG v1.17.0
+        GIT_SHALLOW TRUE
+    )
+    set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
+    set(INSTALL_GTEST OFF CACHE BOOL "" FORCE)
+    FetchContent_MakeAvailable(googletest)
+
+    enable_testing()
+
+    add_executable(cache_poc_wire_test test/wire_test.cpp)
+    target_link_libraries(cache_poc_wire_test PRIVATE GTest::gtest GTest::gtest_main)
+
+    include(GoogleTest)
+    gtest_discover_tests(cache_poc_wire_test)
 endif()

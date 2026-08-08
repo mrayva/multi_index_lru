@@ -154,6 +154,33 @@ Expected demo-script output:
 This was run for real (client and server as separate OS processes,
 communicating only via iceoryx2 shared memory) to produce the output above.
 
+## Unit tests for wire.hpp
+
+`test/wire_test.cpp` is a `ctest`-integrated GoogleTest suite covering the
+`wire::Writer`/`wire::Reader` binary protocol in isolation: byte-level
+encoding of each primitive, round-trips (including negative/extreme `i64`
+values, empty strings, and binary-safe strings with embedded NUL bytes),
+truncation raising `std::out_of_range` at every field type (including the
+exact "huge length prefix, no data behind it" shape used to verify the
+servers survive a malformed request), an off-by-one boundary check, and a
+pinned regression test on the `Op`/`KeyKind`/`Status` enum values themselves
+-- since those are the actual wire format, a silent renumbering would break
+compatibility between a client and server built at different times.
+
+`wire.hpp` has no dependency on iceoryx2, `nats_asio`, Boost, or
+`multi_index_lru` -- it's a standalone header -- so `cache_poc_wire_test`
+only links against GTest. Configuring this directory at all still requires
+`iceoryx2-cxx` (see below), since the other targets in the same
+`CMakeLists.txt` aren't optional; `POC_BUILD_TESTS` (default `ON`) only
+controls whether the test target itself is added.
+
+```bash
+cmake -S example/iceoryx2_cache_poc -B build-poc \
+      -DCMAKE_PREFIX_PATH=/path/to/iceoryx2/install
+cmake --build build-poc
+ctest --test-dir build-poc --output-on-failure
+```
+
 ## Read-through / write-through over NATS
 
 `server_readthrough.cpp` speaks the identical wire protocol as `server.cpp`
