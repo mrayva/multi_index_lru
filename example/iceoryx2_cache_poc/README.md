@@ -154,25 +154,45 @@ Expected demo-script output:
 This was run for real (client and server as separate OS processes,
 communicating only via iceoryx2 shared memory) to produce the output above.
 
-## Unit tests for wire.hpp
+## Unit tests
 
-`test/wire_test.cpp` is a `ctest`-integrated GoogleTest suite covering the
-`wire::Writer`/`wire::Reader` binary protocol in isolation: byte-level
-encoding of each primitive, round-trips (including negative/extreme `i64`
-values, empty strings, and binary-safe strings with embedded NUL bytes),
-truncation raising `std::out_of_range` at every field type (including the
-exact "huge length prefix, no data behind it" shape used to verify the
-servers survive a malformed request), an off-by-one boundary check, and a
-pinned regression test on the `Op`/`KeyKind`/`Status` enum values themselves
--- since those are the actual wire format, a silent renumbering would break
-compatibility between a client and server built at different times.
+Two `ctest`-integrated GoogleTest suites cover the parts of this POC that
+don't need iceoryx2, NATS, or a second process to exercise:
 
-`wire.hpp` has no dependency on iceoryx2, `nats_asio`, Boost, or
-`multi_index_lru` -- it's a standalone header -- so `cache_poc_wire_test`
-only links against GTest. Configuring this directory at all still requires
-`iceoryx2-cxx` (see below), since the other targets in the same
-`CMakeLists.txt` aren't optional; `POC_BUILD_TESTS` (default `ON`) only
-controls whether the test target itself is added.
+- `test/wire_test.cpp` covers the `wire::Writer`/`wire::Reader` binary
+  protocol in isolation: byte-level encoding of each primitive, round-trips
+  (including negative/extreme `i64` values, empty strings, and binary-safe
+  strings with embedded NUL bytes), truncation raising `std::out_of_range`
+  at every field type, an off-by-one boundary check, and a pinned regression
+  test on the `Op`/`KeyKind`/`Status` enum values themselves -- since those
+  are the actual wire format, a silent renumbering would break compatibility
+  between a client and server built at different times. `wire.hpp` has no
+  dependency on iceoryx2, `nats_asio`, Boost, or `multi_index_lru` -- it's a
+  standalone header -- so `cache_poc_wire_test` only links against GTest.
+
+- `test/handle_request_local_test.cpp` covers `handle_request_local()`'s
+  decode-operate-encode contract directly against a real `NameCache`/
+  `IdCache` pair (no iceoryx2, no process boundary): get/put/erase for both
+  key kinds, put-is-an-upsert (a second `Put` overwrites rather than
+  duplicating, and the cache size stays at 1), the two caches being
+  genuinely independent (a `Name` key that happens to be the digits `"42"`
+  doesn't leak into the `Id` cache's key `42`), and the exception-hardening
+  contract as a *repeatable* test -- an empty request, a truncated string
+  length prefix (the same shape used to verify the real servers survive a
+  malformed message live), and a truncated `Put` record all come back as
+  `Status::Error` via `EXPECT_NO_THROW` rather than propagating, and a
+  truncated `Put` is confirmed to leave the cache empty rather than
+  half-applied. `multi_index_lru::Container`'s own behavior (LRU eviction,
+  node pooling, etc.) is exercised in the main repo's
+  `test/container_test.cpp`, not duplicated here -- these tests are scoped
+  to the request-handling logic that's specific to this POC's server. This
+  target links `multi_index_lru_headers` (so it needs Boost, like the rest
+  of this directory) but nothing from iceoryx2 or `nats_asio`.
+
+Configuring this directory at all still requires `iceoryx2-cxx` (see below),
+since the other targets in the same `CMakeLists.txt` aren't optional;
+`POC_BUILD_TESTS` (default `ON`) only controls whether the test targets
+themselves are added.
 
 ```bash
 cmake -S example/iceoryx2_cache_poc -B build-poc \

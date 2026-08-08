@@ -63,9 +63,11 @@ endif()
 
 # wire.hpp has no dependency on iceoryx2/nats_asio/Boost/multi_index_lru --
 # it's a standalone little-endian encoder/decoder -- so its test target only
-# links against GTest, even though (like everything else in this directory)
-# actually configuring this project still requires iceoryx2-cxx to be found
-# above.
+# links against GTest. handle_request_local() (cache_service.hpp) needs
+# multi_index_lru + Boost for NameCache/IdCache but still nothing from
+# iceoryx2 or nats_asio, so it links multi_index_lru_headers instead.
+# Actually configuring this project still requires iceoryx2-cxx to be found
+# above regardless, since the other targets in this file aren't optional.
 if(POC_BUILD_TESTS)
     include(FetchContent)
     FetchContent_Declare(
@@ -83,6 +85,12 @@ if(POC_BUILD_TESTS)
     add_executable(cache_poc_wire_test test/wire_test.cpp)
     target_link_libraries(cache_poc_wire_test PRIVATE GTest::gtest GTest::gtest_main)
 
+    add_executable(cache_poc_handle_request_local_test test/handle_request_local_test.cpp)
+    target_link_libraries(cache_poc_handle_request_local_test
+        PRIVATE multi_index_lru_headers GTest::gtest GTest::gtest_main
+    )
+
     include(GoogleTest)
     gtest_discover_tests(cache_poc_wire_test)
+    gtest_discover_tests(cache_poc_handle_request_local_test)
 endif()
