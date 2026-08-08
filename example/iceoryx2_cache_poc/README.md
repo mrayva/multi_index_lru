@@ -324,36 +324,69 @@ And the daemon's own console log for that same run, showing the mechanism
 directly:
 
 ```
-[server] GET name="seeded_directly" -> local miss, NATS hit (populating cache)
+[server] GET name="seeded_directly" -> local miss, dispatched to NATS
+[server] GET name="seeded_directly" -> ok (NATS)
 [server] GET name="seeded_directly" -> local hit
-[server] PUT name="via_daemon" -> NATS ok, cache updated
-[server] GET id=777 -> local miss, NATS hit (populating cache)
+[server] PUT name="via_daemon" -> dispatched to NATS
+[server] PUT name="via_daemon" -> ok (NATS)
+[server] GET id=777 -> local miss, dispatched to NATS
+[server] GET id=777 -> ok (NATS)
 [server] GET id=777 -> local hit
-[server] ERASE id=777 -> NATS ok, cache updated
+[server] ERASE id=777 -> dispatched to NATS
+[server] ERASE id=777 -> ok (NATS)
 ```
 
-### The concurrency bridge (and its cost)
+### The concurrency model
 
 `nats_asio` is built entirely on `asio::awaitable` coroutines driven by an
 `asio::io_context`; the iceoryx2 request loop is a plain synchronous
 `while (node.wait(...))` poll loop with no event loop of its own.
-`nats_bridge.hpp` bridges the two the simplest way that keeps correctness
-obvious: it runs the `io_context` on one dedicated background thread, and
-every NATS call from the main thread spawns a coroutine on that thread and
-**blocks the caller** (via `std::promise`/`std::future`) until it completes.
+`nats_bridge.hpp` bridges the two **without blocking the request loop**: it
+runs the `io_context` on one dedicated background thread, and
+`get_async()`/`put_async()`/`erase_async()` fire a coroutine on that thread
+and return immediately -- the callback (`on_done`) runs on the NATS thread
+once the operation completes.
 
-This keeps both containers single-owner/single-writer — only the main thread
-ever touches `NameCache`/`IdCache`, so `multi_index_lru`'s "no internal
-locking" contract holds exactly as documented — and is simple enough to trust
-by inspection. The cost: a NATS round trip (a miss, or any write) stalls
-*every other pending client request* to the daemon for its duration. Fine
-for a POC proving the pattern works; not a load-bearing design for real
-concurrent traffic. A non-blocking version would hold the iceoryx2
-`ActiveRequest` open and keep servicing other requests while a NATS fetch
-runs in the background, replying whenever it completes — meaningfully more
-code (a pending-request table, and depends on whether iceoryx2's
-`ActiveRequest` can be held/responded to outside the receive loop), and
-deliberately out of scope here.
+`server_readthrough.cpp` uses this to keep the main loop free while a NATS
+round trip is in flight: on a local miss (GET) or any write (PUT/ERASE), it
+kicks off the async NATS call, moves the iceoryx2 `ActiveRequest` into the
+callback's capture, and returns -- the main loop goes straight back to
+`server.receive()` for the *next* request instead of waiting. When the NATS
+callback fires (on the NATS thread), it doesn't touch the cache or iceoryx2
+directly; it pushes an `ActiveRequest` + a small "apply this to the cache and
+build the response" closure onto `CompletionQueue`, a mutex-guarded queue.
+Only the main thread ever drains that queue -- doing the actual cache
+mutation and sending the response -- so `multi_index_lru`'s "single owner, no
+internal locking" contract and iceoryx2's "one thread touches the
+`Server`/`ActiveRequest` API" both hold, exactly as before, just deferred by
+one hop through the queue instead of enforced by blocking.
+
+This was verified, not just designed: 8 keys were seeded directly into NATS
+(bypassing the daemon, so each was guaranteed to be a local miss), then 7 of
+them were requested via 7 separate `cache_poc_client` processes launched
+nearly simultaneously. A single such request takes ~57ms wall time
+(dominated by the client process's own startup/service-discovery, not NATS
+latency); all 7 concurrent requests together also completed in ~58ms, and the
+daemon's log showed all 7 `-> local miss, dispatched to NATS` lines before
+any of their `-> ok (NATS)` completions, with completions arriving out of
+request order -- both confirm the requests were genuinely handled
+concurrently, not serialized behind one another the way the old
+blocking-bridge design would have.
+
+**The tradeoff this introduces**: dropping the blocking bridge also drops the
+free thundering-herd protection it incidentally provided (concurrent misses
+on the same key used to naturally serialize through the single blocking
+call). Now, two GETs for the same never-cached key arriving before either's
+NATS fetch completes will both dispatch their own NATS round trip. Worse,
+a GET-miss racing a PUT for the *same* key can return a stale value to the
+GET caller even though the cache itself ends up correct: if client B's PUT
+completes and updates the cache before client A's earlier GET-miss fetch
+(which was already in flight with the pre-PUT value) completes, `apply()`'s
+`emplace()` on A's stale result is a no-op against the now-present key (a
+plain `Container::emplace()` won't overwrite an existing value), so the
+*cache* keeps B's fresher value -- but A's *response* still carries the stale
+value it fetched. Fixing this needs per-key request coalescing/ordering
+(a "singleflight" pattern), which is deliberately out of scope here.
 
 ## What this doesn't answer yet
 
@@ -365,11 +398,11 @@ becomes more than a POC:
   the write path only covers `Container`'s plain get/put/erase, not TTL
   refresh or `cleanup_expired()`. NATS KV itself supports a max-age per
   bucket, which isn't used here either.
-- **Upsert races.** The erase-then-emplace upsert (base server) and the
-  NATS-first-then-cache write-through (NATS server) are correct because each
-  server is single-threaded and processes one request at a time — either
-  would need real transactional handling if the server ever became
-  multi-threaded.
+- **Upsert races.** `server.cpp`'s erase-then-emplace upsert is correct
+  because it's single-threaded and processes one request at a time from
+  start to finish. `server_readthrough.cpp` no longer has that guarantee for
+  operations on the *same key* in flight concurrently -- see "the stale GET
+  response race" under "the concurrency model" above.
 - **No invalidation broadcast.** Every daemon keeps its own local cache with
   no cross-daemon coordination; if you ran two `cache_poc_server_readthrough`
   processes against the same NATS buckets, a PUT on one wouldn't invalidate
@@ -377,9 +410,13 @@ becomes more than a POC:
   as the natural fix and isn't used here.
 - **Negative caching.** A NATS miss is not cached, so a key that's genuinely
   absent from both layers gets a full NATS round trip on every GET.
-- **Latency under real load / concurrency.** See "the concurrency bridge"
-  above — this POC does one request at a time with no contention, and proves
-  nothing about throughput with many concurrent clients.
+- **Throughput under sustained load.** "The concurrency model" above verified
+  that several concurrent requests each requiring their own NATS round trip
+  complete concurrently rather than serialized, at small scale (7 requests).
+  That's a correctness/architecture check, not a load test -- it says
+  nothing about behavior under sustained high concurrency (how many
+  in-flight NATS operations `nats_asio`/the NATS server can actually sustain,
+  memory growth of `CompletionQueue` under backlog, etc.).
 - **Failure handling.** No reconnect/retry logic beyond what `nats_asio`
   does internally, no handling of the daemon process dying mid-request
   beyond what iceoryx2 does by default. A malformed/truncated request (or an

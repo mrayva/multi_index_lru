@@ -1,20 +1,27 @@
-/// Blocking bridge from a synchronous call site to mrayva/nats_asio's
+/// Bridge from synchronous/callback call sites to mrayva/nats_asio's
 /// ASIO-coroutine-based NATS client.
 ///
 /// nats_asio runs entirely as `asio::awaitable<...>` coroutines driven by an
-/// `asio::io_context`; the iceoryx2 request loop in server_readthrough.cpp is
-/// a plain synchronous poll loop with no event loop of its own. This class
-/// runs the io_context on a dedicated background thread and turns each KV
-/// operation into a blocking call: `get()`/`put()`/`erase()` spawn a
-/// coroutine on that thread and block the *caller's* thread (via
-/// std::promise/std::future) until it completes.
+/// `asio::io_context`. This class runs that io_context on a dedicated
+/// background thread and offers two ways to consume it:
 ///
-/// That keeps server_readthrough.cpp's caches single-owner/single-writer
-/// (only its main thread ever touches them, so multi_index_lru's "not
-/// thread-safe, no internal locking" contract is respected) at the cost of
-/// stalling every other pending client request for the duration of a NATS
-/// round trip. See README.md "What this doesn't answer yet" for the
-/// non-blocking alternative this POC deliberately doesn't attempt.
+/// - `get_async()`/`put_async()`/`erase_async()`: fire the NATS operation and
+///   return immediately; `on_done` is invoked on the NATS thread once it
+///   completes. This is what server_readthrough.cpp uses, so a slow NATS
+///   round trip for one client never blocks any other client's request --
+///   see CompletionQueue in server_readthrough.cpp for how the response
+///   actually gets sent once `on_done` fires.
+/// - `get()`/`put()`/`erase()`: thin wrappers around the `_async` versions
+///   that block the *caller's* thread (via std::promise/std::future) until
+///   the callback fires. client_readthrough.cpp uses these for its own
+///   one-shot, sequential NATS calls, where blocking is simplest and there's
+///   no other client to stall.
+///
+/// Either way, only the NATS thread ever touches the nats_asio connection,
+/// and callers are responsible for not touching a multi_index_lru::Container
+/// from inside `on_done` directly -- see server_readthrough.cpp's
+/// CompletionQueue, which defers the actual cache mutation to its own main
+/// thread so the "single owner, no internal locking" contract holds.
 #pragma once
 
 #include <nats_asio/nats_asio.hpp>
@@ -26,6 +33,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <functional>
 #include <future>
 #include <memory>
 #include <span>
@@ -75,9 +83,17 @@ public:
     NatsBridge(const NatsBridge&) = delete;
     NatsBridge& operator=(const NatsBridge&) = delete;
 
-    NatsGetResult get(const std::string& bucket, const std::string& key) {
-        auto prom = std::make_shared<std::promise<NatsGetResult>>();
-        auto fut = prom->get_future();
+    // --- non-blocking: on_done runs on the NATS thread ----------------------
+    //
+    // Templated (rather than std::function<...>) specifically so on_done can
+    // be move-only: server_readthrough.cpp's callbacks capture an iceoryx2
+    // ActiveRequest, which is move-only by design (see its deleted copy
+    // constructor in active_request.hpp), and std::function requires its
+    // target to be copy-constructible.
+
+    // on_done: void(NatsGetResult)
+    template <typename Callback>
+    void get_async(const std::string& bucket, const std::string& key, Callback on_done) {
         auto conn = conn_;
         auto timeout = timeout_;
 
@@ -87,26 +103,81 @@ public:
         // the whole process down over one bad NATS response.
         asio::co_spawn(
             ioc_,
-            [conn, bucket, key, timeout, prom]() -> asio::awaitable<void> {
+            [conn, bucket, key, timeout, on_done = std::move(on_done)]() mutable -> asio::awaitable<void> {
                 try {
                     auto [entry, status] = co_await conn->kv_get(bucket, key, timeout);
                     if (status.ok()) {
-                        prom->set_value(NatsGetResult{
+                        on_done(NatsGetResult{
                             NatsResult::Ok, std::vector<std::uint8_t>(entry.value.begin(), entry.value.end()), {}});
                     } else if (status.code() == nats_asio::error_code::key_not_found) {
-                        prom->set_value(NatsGetResult{NatsResult::NotFound, {}, {}});
+                        on_done(NatsGetResult{NatsResult::NotFound, {}, {}});
                     } else {
-                        prom->set_value(NatsGetResult{NatsResult::Error, {}, status.error()});
+                        on_done(NatsGetResult{NatsResult::Error, {}, status.error()});
                     }
                 } catch (const std::exception& e) {
-                    prom->set_value(NatsGetResult{NatsResult::Error, {}, std::string("exception: ") + e.what()});
+                    on_done(NatsGetResult{NatsResult::Error, {}, std::string("exception: ") + e.what()});
                 } catch (...) {
-                    prom->set_value(NatsGetResult{NatsResult::Error, {}, "unknown exception"});
+                    on_done(NatsGetResult{NatsResult::Error, {}, "unknown exception"});
                 }
                 co_return;
             },
             asio::detached);
+    }
 
+    // on_done: void(bool ok, std::string error)
+    template <typename Callback>
+    void put_async(const std::string& bucket, const std::string& key, std::vector<std::uint8_t> value,
+                    Callback on_done) {
+        auto conn = conn_;
+        auto timeout = timeout_;
+
+        asio::co_spawn(
+            ioc_,
+            [conn, bucket, key, value, timeout, on_done = std::move(on_done)]() mutable -> asio::awaitable<void> {
+                try {
+                    std::span<const char> span(reinterpret_cast<const char*>(value.data()), value.size());
+                    auto [revision, status] = co_await conn->kv_put(bucket, key, span, timeout);
+                    (void)revision;
+                    on_done(status.ok(), status.ok() ? std::string{} : status.error());
+                } catch (const std::exception& e) {
+                    on_done(false, std::string("exception: ") + e.what());
+                } catch (...) {
+                    on_done(false, "unknown exception");
+                }
+                co_return;
+            },
+            asio::detached);
+    }
+
+    // on_done: void(bool ok, std::string error)
+    template <typename Callback>
+    void erase_async(const std::string& bucket, const std::string& key, Callback on_done) {
+        auto conn = conn_;
+        auto timeout = timeout_;
+
+        asio::co_spawn(
+            ioc_,
+            [conn, bucket, key, timeout, on_done = std::move(on_done)]() mutable -> asio::awaitable<void> {
+                try {
+                    auto [revision, status] = co_await conn->kv_delete(bucket, key, timeout);
+                    (void)revision;
+                    on_done(status.ok(), status.ok() ? std::string{} : status.error());
+                } catch (const std::exception& e) {
+                    on_done(false, std::string("exception: ") + e.what());
+                } catch (...) {
+                    on_done(false, "unknown exception");
+                }
+                co_return;
+            },
+            asio::detached);
+    }
+
+    // --- blocking: for simple sequential callers (client_readthrough.cpp) --
+
+    NatsGetResult get(const std::string& bucket, const std::string& key) {
+        auto prom = std::make_shared<std::promise<NatsGetResult>>();
+        auto fut = prom->get_future();
+        get_async(bucket, key, [prom](NatsGetResult result) { prom->set_value(std::move(result)); });
         return fut.get();
     }
 
@@ -115,26 +186,8 @@ public:
                                       const std::vector<std::uint8_t>& value) {
         auto prom = std::make_shared<std::promise<std::pair<bool, std::string>>>();
         auto fut = prom->get_future();
-        auto conn = conn_;
-        auto timeout = timeout_;
-
-        asio::co_spawn(
-            ioc_,
-            [conn, bucket, key, value, timeout, prom]() -> asio::awaitable<void> {
-                try {
-                    std::span<const char> span(reinterpret_cast<const char*>(value.data()), value.size());
-                    auto [revision, status] = co_await conn->kv_put(bucket, key, span, timeout);
-                    (void)revision;
-                    prom->set_value({status.ok(), status.ok() ? std::string{} : status.error()});
-                } catch (const std::exception& e) {
-                    prom->set_value({false, std::string("exception: ") + e.what()});
-                } catch (...) {
-                    prom->set_value({false, "unknown exception"});
-                }
-                co_return;
-            },
-            asio::detached);
-
+        put_async(bucket, key, value,
+                  [prom](bool ok, std::string err) { prom->set_value({ok, std::move(err)}); });
         return fut.get();
     }
 
@@ -142,25 +195,7 @@ public:
     std::pair<bool, std::string> erase(const std::string& bucket, const std::string& key) {
         auto prom = std::make_shared<std::promise<std::pair<bool, std::string>>>();
         auto fut = prom->get_future();
-        auto conn = conn_;
-        auto timeout = timeout_;
-
-        asio::co_spawn(
-            ioc_,
-            [conn, bucket, key, timeout, prom]() -> asio::awaitable<void> {
-                try {
-                    auto [revision, status] = co_await conn->kv_delete(bucket, key, timeout);
-                    (void)revision;
-                    prom->set_value({status.ok(), status.ok() ? std::string{} : status.error()});
-                } catch (const std::exception& e) {
-                    prom->set_value({false, std::string("exception: ") + e.what()});
-                } catch (...) {
-                    prom->set_value({false, "unknown exception"});
-                }
-                co_return;
-            },
-            asio::detached);
-
+        erase_async(bucket, key, [prom](bool ok, std::string err) { prom->set_value({ok, std::move(err)}); });
         return fut.get();
     }
 
