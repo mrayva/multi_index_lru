@@ -10,14 +10,19 @@ this into a cache-aside / read-through + write-through layer in front of
 [NATS](https://nats.io) JetStream KV, using
 [mrayva/nats_asio](https://github.com/mrayva/nats_asio).
 
-This is **not** wired into the top-level `CMakeLists.txt` and is not built by
-CI. The base demo depends on `iceoryx2-cxx` (Rust toolchain to build); the
-NATS-backed demo additionally depends on `nats_asio` and its own much
-heavier dependency graph (asio, fmt, concurrentqueue, gtl, magic-enum,
-nlohmann-json, openssl, simdjson, spdlog, stringzilla, zstd). Both are
-dependencies the rest of this header-only, Boost-only project deliberately
-does not take on. Treat this directory as a standalone experiment, not a
-supported part of the library.
+This is **not** wired into the top-level `CMakeLists.txt`, and the iceoryx2-
+and NATS-backed servers/clients are not built by CI. The base demo depends
+on `iceoryx2-cxx` (Rust toolchain to build); the NATS-backed demo
+additionally depends on `nats_asio` and its own much heavier dependency
+graph (asio, fmt, concurrentqueue, gtl, magic-enum, nlohmann-json, openssl,
+simdjson, spdlog, stringzilla, zstd). Both are dependencies the rest of this
+header-only, Boost-only project deliberately does not take on. Treat this
+directory as a standalone experiment, not a supported part of the library --
+the one exception is `test/wire_test.cpp` and
+`test/handle_request_local_test.cpp`, which have no dependency on either
+toolchain and *are* run by the main CI workflow (`poc-unit-tests` in
+`.github/workflows/ci.yml`) on every push, since they only need Boost and a
+C++20 compiler (see "Unit tests" below).
 
 ## What it demonstrates
 
@@ -189,10 +194,21 @@ don't need iceoryx2, NATS, or a second process to exercise:
   target links `multi_index_lru_headers` (so it needs Boost, like the rest
   of this directory) but nothing from iceoryx2 or `nats_asio`.
 
-Configuring this directory at all still requires `iceoryx2-cxx` (see below),
-since the other targets in the same `CMakeLists.txt` aren't optional;
-`POC_BUILD_TESTS` (default `ON`) only controls whether the test targets
-themselves are added.
+`POC_BUILD_ICEORYX2_TARGETS` (default `ON`) gates `iceoryx2-cxx` itself and
+every target that links it. Turned off, this directory configures and
+builds with nothing but Boost and a C++20 compiler -- no Rust toolchain
+needed -- which is exactly what the main repo's CI does to run these two
+suites on every push (see `poc-unit-tests` in `.github/workflows/ci.yml`):
+
+```bash
+cmake -S example/iceoryx2_cache_poc -B build-poc-tests \
+      -DPOC_BUILD_ICEORYX2_TARGETS=OFF -DPOC_BUILD_TESTS=ON
+cmake --build build-poc-tests
+ctest --test-dir build-poc-tests --output-on-failure
+```
+
+To build everything, including the iceoryx2-backed servers/clients, alongside
+the tests:
 
 ```bash
 cmake -S example/iceoryx2_cache_poc -B build-poc \
