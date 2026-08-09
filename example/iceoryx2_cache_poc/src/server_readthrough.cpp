@@ -48,6 +48,17 @@
 /// own writes, so a PUT here doesn't immediately evict the value it just
 /// wrote.
 ///
+/// Prewarm: NATS delivers the *current* value of every existing key in a
+/// bucket immediately on subscribing to it (kv_watch's "initial burst"),
+/// not just future changes -- for --prewarm-window-ms/MIL_PREWARM_WINDOW_MS
+/// after startup (default 2s), apply_pending_invalidations()
+/// (server_dispatch.hpp) uses that burst to populate the cache directly
+/// from each event's own value instead of merely evicting, so a freshly
+/// (re)started daemon doesn't pay a separate NATS round trip for every key
+/// its first wave of GETs happens to want. Scoped to startup only --
+/// once the window closes, behavior is exactly the eviction-only one
+/// described above, unchanged.
+///
 /// The actual request-dispatch logic lives in server_dispatch.hpp, pulled
 /// out of this file so test/dispatch_request_test.cpp can drive it directly.
 ///
@@ -74,6 +85,10 @@
 ///   --allow-writes / MIL_ALLOW_WRITES                 (default false -- Put/Erase are rejected with
 ///                                                       Status::ReadOnly unless set; see "Read-only
 ///                                                       by default" above)
+///   --prewarm-window-ms / MIL_PREWARM_WINDOW_MS       (default 2000 -- how long after startup
+///                                                       kv_watch events populate the cache directly
+///                                                       from their own value instead of merely
+///                                                       evicting; see "Prewarm" above)
 #include "server_dispatch.hpp"
 #include "config.hpp"
 
@@ -118,6 +133,8 @@ int main(int argc, char** argv) {
     const std::size_t max_queue_depth_per_key =
         poc::config::resolve_size(args, "--max-queue-depth-per-key", "MIL_MAX_QUEUE_DEPTH_PER_KEY", 64);
     const bool allow_writes = poc::config::resolve_bool(args, "--allow-writes", "MIL_ALLOW_WRITES", false);
+    const auto prewarm_window =
+        poc::config::resolve_millis(args, "--prewarm-window-ms", "MIL_PREWARM_WINDOW_MS", 2000);
 
     // Declared before `nats` on purpose: local variables are destroyed in
     // reverse declaration order, and NatsBridge's own coroutines (get_async/
@@ -142,14 +159,30 @@ int main(int argc, char** argv) {
     // Cross-daemon coherence: watch every key in both buckets. `entry.bucket`
     // tells the shared callback which cache the change applies to. Runs on
     // the NATS thread -- just hands off to InvalidationQueue, no cache or
-    // iceoryx2 access here.
+    // iceoryx2 access here. `entry.value`/`entry.op` are forwarded through
+    // too, unused outside the startup prewarm window below (see
+    // apply_pending_invalidations()) but harmless (and cheap) to always
+    // carry -- keeps the decision of whether they matter entirely on the
+    // main thread, not duplicated here.
     auto on_kv_change = [&invalidations, name_bucket](const nats_asio::kv_entry& entry) {
-        invalidations.push(entry.bucket == name_bucket, entry.key, entry.revision);
+        invalidations.push(entry.bucket == name_bucket, entry.key, entry.revision,
+                            std::vector<std::uint8_t>(entry.value.begin(), entry.value.end()),
+                            entry.op == nats_asio::kv_entry::operation::put);
     };
     nats.watch(name_bucket, on_kv_change);
     nats.watch(id_bucket, on_kv_change);
     std::cout << "[server] watching buckets \"" << name_bucket << "\" / \"" << id_bucket
-              << "\" for external changes\n";
+              << "\" for external changes, prewarming from their current contents for the next "
+              << prewarm_window.count() << "ms\n";
+
+    // Prewarm: for prewarm_window after the watch subscriptions above are
+    // established, apply_pending_invalidations() populates the cache
+    // directly from each watch event's own value (including kv_watch's
+    // initial burst -- NATS delivering the *current* value of every
+    // existing key immediately on subscribe) instead of merely evicting --
+    // see its doc comment for the full rationale and why this is scoped to
+    // startup only.
+    const auto prewarm_deadline = std::chrono::steady_clock::now() + prewarm_window;
 
     auto node = NodeBuilder().create<ServiceType::Ipc>().value();
 
@@ -196,7 +229,7 @@ int main(int argc, char** argv) {
             key_queue.complete(completion.queue_key);
         }
 
-        poc::apply_pending_invalidations(name_cache, id_cache, revisions, invalidations);
+        poc::apply_pending_invalidations(name_cache, id_cache, revisions, invalidations, prewarm_deadline);
         poc::cleanup_expired_periodically(name_cache, id_cache, last_cleanup, kCleanupInterval);
 
         while (true) {

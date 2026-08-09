@@ -67,7 +67,9 @@ protected:
         // spuriously self-invalidate -- see OwnWriteDoesNotSelfInvalidate
         // below for the direct version of that check.
         auto on_kv_change = [](const nats_asio::kv_entry& entry) {
-            invalidations_.push(entry.bucket == kNameBucket, entry.key, entry.revision);
+            invalidations_.push(entry.bucket == kNameBucket, entry.key, entry.revision,
+                                 std::vector<std::uint8_t>(entry.value.begin(), entry.value.end()),
+                                 entry.op == nats_asio::kv_entry::operation::put);
         };
         nats_->watch(kNameBucket, on_kv_change);
         nats_->watch(kIdBucket, on_kv_change);
@@ -126,7 +128,7 @@ protected:
             }
             key_queue_.complete(completion.queue_key);
         }
-        apply_pending_invalidations(*name_cache_, *id_cache_, revisions_, invalidations_);
+        apply_pending_invalidations(*name_cache_, *id_cache_, revisions_, invalidations_, prewarm_deadline_);
         while (true) {
             auto active_request_opt = server_->receive().value();
             if (!active_request_opt.has_value()) {
@@ -180,6 +182,12 @@ protected:
     // true by default so every existing Put/Erase test in this file is
     // unaffected -- ReadOnlyModeTest below is the one that flips it.
     bool allow_writes_ = true;
+    // Already in the past by default, so apply_pending_invalidations() is a
+    // no-op prewarm-wise and every existing test in this file (none of
+    // which care about prewarming) gets the plain eviction behavior they
+    // were written against. PrewarmTest below sets this to a future
+    // deadline to exercise the prewarm path instead.
+    std::chrono::steady_clock::time_point prewarm_deadline_ = std::chrono::steady_clock::now() - std::chrono::hours(1);
     // Per-test, unlike invalidations_ -- each test's caches are freshly
     // reset in SetUp(), so there's nothing to gain from remembering
     // revisions across tests, and keeping it per-test avoids one test's
@@ -637,6 +645,108 @@ TEST_F(DispatchRequestTest, OwnWriteDoesNotSelfInvalidate) {
     EXPECT_EQ(str(it->record), "self-write-value");
 
     nats_->erase(kIdBucket, "777");
+}
+
+// --- Prewarm: kv_watch's initial burst populating the cache at startup -----
+// (in these tests, prewarm_deadline_ set to a future time stands in for
+// "still within the startup window" -- apply_pending_invalidations() can't
+// tell a real initial-burst event apart from a live one arriving before its
+// deadline closes, by design, so exercising it this way is faithful to the
+// real code path.)
+
+TEST_F(DispatchRequestTest, WithinPrewarmWindowExternalPutPopulatesCacheDirectly) {
+    prewarm_deadline_ = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    nats_->erase(kNameBucket, "prewarm_put_test");
+    ASSERT_TRUE(nats_->put(kNameBucket, "prewarm_put_test", bytes("prewarmed-value")).first);
+
+    // No GET is ever sent for this key -- if it ends up in the cache, it can
+    // only have gotten there via the prewarm path. Waits for the *specific*
+    // expected end state, not just "any entry appeared": this key's name
+    // could have a leftover tombstone in NATS from an earlier run of this
+    // same test against the same long-lived nats-server, whose watch echo
+    // could still be in flight and interleave with this test's own erase()/
+    // put() above -- waiting for less than the exact final state risks
+    // observing a stale intermediate one instead.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (std::chrono::steady_clock::now() < deadline) {
+        pump_server();
+        auto it = name_cache_->find<NameTag>("prewarm_put_test");
+        if (it != name_cache_->end<NameTag>() && it->found && str(it->record) == "prewarmed-value") {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    auto it = name_cache_->find<NameTag>("prewarm_put_test");
+    ASSERT_NE(it, name_cache_->end<NameTag>())
+        << "the watch event for this put should have populated the cache directly during the prewarm window";
+    EXPECT_TRUE(it->found);
+    EXPECT_EQ(str(it->record), "prewarmed-value");
+
+    nats_->erase(kNameBucket, "prewarm_put_test");
+}
+
+TEST_F(DispatchRequestTest, WithinPrewarmWindowExternalDeleteNegativelyPopulatesCache) {
+    // Put first and let its own (non-prewarm, since prewarm_deadline_ is
+    // still in the past here) watch echo fully drain, so the only event the
+    // prewarm window below observes is the delete -- otherwise the put's
+    // own echo could land inside the polling loop too and satisfy "an entry
+    // exists" before the delete's negative one does.
+    ASSERT_TRUE(nats_->put(kNameBucket, "prewarm_del_test", bytes("x")).first);
+    for (int i = 0; i < 20; ++i) {
+        pump_server();
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    prewarm_deadline_ = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    ASSERT_TRUE(nats_->erase(kNameBucket, "prewarm_del_test").first);
+
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (std::chrono::steady_clock::now() < deadline) {
+        pump_server();
+        auto it = name_cache_->find<NameTag>("prewarm_del_test");
+        if (it != name_cache_->end<NameTag>() && !it->found) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    auto it = name_cache_->find<NameTag>("prewarm_del_test");
+    ASSERT_NE(it, name_cache_->end<NameTag>())
+        << "the watch event for this delete should have negatively populated the cache during the prewarm window";
+    EXPECT_FALSE(it->found);
+
+    // And a GET for it must resolve as a local negative hit -- no NATS round trip.
+    auto pending = send_request(encode_get(wire::KeyKind::Name, "prewarm_del_test", 0));
+    pump_server();
+    auto response = pending.receive().value();
+    ASSERT_TRUE(response.has_value()) << "should have resolved from the prewarmed negative-cache entry";
+    wire::Reader r(response->payload().data(), response->payload().number_of_bytes());
+    EXPECT_EQ(static_cast<wire::Status>(r.u8()), wire::Status::NotFound);
+}
+
+TEST_F(DispatchRequestTest, AfterPrewarmWindowExternalWriteStillOnlyEvicts) {
+    // A short-lived window that will definitely have closed by the time the
+    // event below is processed -- confirms prewarming really is scoped to
+    // the window, not left on permanently.
+    prewarm_deadline_ = std::chrono::steady_clock::now() + std::chrono::milliseconds(50);
+    nats_->erase(kNameBucket, "post_prewarm_test");
+    name_cache_->emplace(NameEntry{"post_prewarm_test", bytes("stale-local-value")});
+    ASSERT_TRUE(nats_->put(kNameBucket, "post_prewarm_test", bytes("new-external-value")).first);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));  // let the prewarm window close
+
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (std::chrono::steady_clock::now() < deadline &&
+           name_cache_->find<NameTag>("post_prewarm_test") != name_cache_->end<NameTag>()) {
+        pump_server();
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    EXPECT_EQ(name_cache_->find<NameTag>("post_prewarm_test"), name_cache_->end<NameTag>())
+        << "outside the prewarm window, an external write should still just evict, not populate directly";
+
+    nats_->erase(kNameBucket, "post_prewarm_test");
 }
 
 }  // namespace

@@ -16,6 +16,7 @@
 
 #include "iox2/iceoryx2.hpp"
 
+#include <chrono>
 #include <deque>
 #include <functional>
 #include <iostream>
@@ -248,18 +249,30 @@ private:
 // below). Built on the NATS thread (inside NatsBridge::watch()'s callback,
 // wired up in server_readthrough.cpp's main()); only ever applied on the
 // main thread.
+//
+// `value`/`is_put` carry the watch event's own payload -- during the
+// startup prewarm window (see apply_pending_invalidations()) that's used to
+// populate the cache directly instead of merely evicting, since kv_watch's
+// initial burst (NATS delivering the *current* value of every existing key
+// immediately on subscribe) already hands over the data; no reason to throw
+// it away and pay a separate kv_get for it. Outside the prewarm window
+// they're unused -- ordinary invalidation still just evicts, unchanged.
 struct PendingInvalidation {
-    bool is_name_cache;  // true -> NameCache, false -> IdCache
-    std::string key;     // NameCache key verbatim, or IdCache key as its decimal string form
+    bool is_name_cache;             // true -> NameCache, false -> IdCache
+    std::string key;                // NameCache key verbatim, or IdCache key as its decimal string form
     std::uint64_t revision;
+    std::vector<std::uint8_t> value;  // valid iff is_put
+    bool is_put;                      // true for a put, false for a del/purge
 };
 
 // Thread-safe hand-off for PendingInvalidation, same shape as CompletionQueue.
 class InvalidationQueue {
 public:
-    void push(bool is_name_cache, std::string key, std::uint64_t revision) {
+    void push(bool is_name_cache, std::string key, std::uint64_t revision, std::vector<std::uint8_t> value,
+              bool is_put) {
         std::lock_guard<std::mutex> lock(mutex_);
-        items_.push_back(PendingInvalidation{is_name_cache, std::move(key), revision});
+        items_.push_back(
+            PendingInvalidation{is_name_cache, std::move(key), revision, std::move(value), is_put});
     }
 
     std::vector<PendingInvalidation> drain() {
@@ -280,17 +293,53 @@ private:
 
 // Applies every currently-queued invalidation: for each one that's genuinely
 // new information (per `revisions`, not an echo of this daemon's own recent
-// write), erases the corresponding entry from the local cache so the next
-// GET for that key is a real miss and reads the fresh value through from
-// NATS. Meant to be called once per server_readthrough.cpp main-loop
-// iteration, alongside draining CompletionQueue.
+// write), either prewarms or invalidates the corresponding local entry --
+// see `prewarm_deadline` below. Meant to be called once per
+// server_readthrough.cpp main-loop iteration, alongside draining
+// CompletionQueue.
+//
+// `prewarm_deadline`: while `steady_clock::now()` is still before it (see
+// --prewarm-window-ms/MIL_PREWARM_WINDOW_MS, computed once in
+// server_readthrough.cpp's main() right after the watch subscriptions are
+// established), every event -- burst or, if any slip in before the window
+// closes, genuinely live -- populates the cache directly from the event's
+// own value (or, for a del/purge, negative-caches the absence) instead of
+// evicting. This is deliberately scoped to *startup only*: once the
+// deadline passes, behavior reverts to plain eviction exactly as before,
+// unchanged -- ongoing operation doesn't turn kv_watch into a general
+// refresh mechanism, only the cold-start burst benefits from it. A
+// deadline already in the past (the default in tests that don't care about
+// prewarming) means this is a no-op and every event is handled the old way.
 inline void apply_pending_invalidations(NameCache& name_cache, IdCache& id_cache, RevisionTracker& revisions,
-                                         InvalidationQueue& invalidations) {
+                                         InvalidationQueue& invalidations,
+                                         std::chrono::steady_clock::time_point prewarm_deadline) {
+    const bool prewarming = std::chrono::steady_clock::now() < prewarm_deadline;
     for (auto& invalidation : invalidations.drain()) {
         const auto qkey = invalidation.is_name_cache ? name_queue_key(invalidation.key)
                                                        : id_queue_key(std::stoll(invalidation.key));
         if (!revisions.observe(qkey, invalidation.revision)) {
             continue;  // echo of our own recent write (or an already-processed event) -- nothing to do
+        }
+        if (prewarming) {
+            if (invalidation.is_name_cache) {
+                name_cache.erase<NameTag>(invalidation.key);
+                if (invalidation.is_put) {
+                    name_cache.emplace(NameEntry{invalidation.key, invalidation.value});
+                    std::cout << "[server] prewarmed name=\"" << invalidation.key << "\" from NATS\n";
+                } else {
+                    name_cache.emplace(NameEntry{invalidation.key, {}, false});
+                }
+            } else {
+                const auto id = std::stoll(invalidation.key);
+                id_cache.erase<IdTag>(id);
+                if (invalidation.is_put) {
+                    id_cache.emplace(IdEntry{id, invalidation.value});
+                    std::cout << "[server] prewarmed id=" << id << " from NATS\n";
+                } else {
+                    id_cache.emplace(IdEntry{id, {}, false});
+                }
+            }
+            continue;
         }
         if (invalidation.is_name_cache) {
             if (name_cache.erase<NameTag>(invalidation.key)) {

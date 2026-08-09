@@ -221,6 +221,7 @@ accepted for flags with a value: `--flag value` or `--flag=value`.
 | `--max-queue-depth-per-key` | `MIL_MAX_QUEUE_DEPTH_PER_KEY` | `64` | `server_readthrough.cpp` (`KeyOperationQueue` backpressure, see "Backpressure") |
 | `--max-getall-results` | `MIL_MAX_GETALL_RESULTS` | `100` | `server.cpp` (caps a single GetAll response, see "Non-unique key lookup (GetAll)") |
 | `--allow-writes` | `MIL_ALLOW_WRITES` | `false` | `server_readthrough.cpp` (Put/Erase rejected unless set, see "Read-only by default") |
+| `--prewarm-window-ms` | `MIL_PREWARM_WINDOW_MS` | `2000` | `server_readthrough.cpp` (populates from kv_watch's initial burst instead of just evicting, see "Prewarm") |
 | `--nats-host` | `MIL_NATS_HOST` | `127.0.0.1` | `server_readthrough.cpp`, `client_readthrough.cpp` |
 | `--nats-port` | `MIL_NATS_PORT` | `4222` | `server_readthrough.cpp`, `client_readthrough.cpp` |
 | `--name-bucket` | `MIL_NAME_BUCKET` | `poc::kNameBucket` (`mil_by_name`) | `server_readthrough.cpp`, `client_readthrough.cpp` |
@@ -960,6 +961,47 @@ flipped the startup log to `writes enabled (--allow-writes)`, and the same
 `GetStillWorksNormallyWhenWritesAreDisabled` cover the same three things at
 the unit level -- including, for the two rejection tests, confirming NATS
 itself was never touched, not just that the response said so.
+
+## Prewarm
+
+A freshly (re)started daemon's local caches start empty, so its first wave
+of `GET`s each pay a full NATS round trip even for data that's been sitting
+in NATS the whole time -- purely a cold-start cost, not a reflection of
+anything actually being new. NATS JetStream KV's `kv_watch` was already
+delivering exactly the information needed to avoid that: subscribing
+delivers the *current* value of every existing key in a bucket immediately
+(kv_watch's "initial burst"), not just future changes -- "Cross-daemon
+coherence" above was already using that burst, just to *evict* (since
+nothing was cached yet, a no-op) rather than to populate.
+
+For `--prewarm-window-ms`/`MIL_PREWARM_WINDOW_MS` after the watch
+subscriptions are established (default 2s), `apply_pending_invalidations()`
+(`server_dispatch.hpp`) populates the cache directly from each event's own
+value instead of merely evicting: a `put` event writes the record straight
+in (same as a `GET`'s read-through populate, minus the round trip that
+would otherwise be needed to fetch it), and a `del`/`purge` event
+negative-caches the absence (see "Negative caching" above) -- both skip the
+NATS round trip a real client's first `GET` for that key would otherwise
+pay. Once the window closes, behavior reverts to plain eviction exactly as
+described in "Cross-daemon coherence" -- this is deliberately scoped to
+startup only, not a general-purpose refresh mechanism: kv_watch still only
+*evicts* during ongoing operation, so the local cache continues to reflect
+only the keys this daemon's own clients actually asked for, not the
+bucket's entire write traffic.
+
+Verified live: seeded two keys into NATS, started
+`cache_poc_server_readthrough --prewarm-window-ms=3000` fresh, and the log
+immediately showed `prewarmed name="..." from NATS` for both (among ~200
+other prewarmed entries already in the shared test bucket) -- before any
+client had sent a single request. A `GET` for one of those keys then logged
+`local hit`, not `local miss, dispatched to NATS`: the very first request
+for it, from a brand-new daemon, was already a cache hit. A write to that
+same key *after* the window closed logged `invalidated`, not `prewarmed`,
+confirming the window-scoping. `dispatch_request_test.cpp`'s
+`WithinPrewarmWindowExternalPutPopulatesCacheDirectly`,
+`WithinPrewarmWindowExternalDeleteNegativelyPopulatesCache`, and
+`AfterPrewarmWindowExternalWriteStillOnlyEvicts` cover the same three
+things at the unit level.
 
 ## What this doesn't answer yet
 
