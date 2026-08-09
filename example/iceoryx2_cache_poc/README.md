@@ -237,8 +237,11 @@ itself); not part of the `poc-unit-tests` CI job for that reason.
   `mil_bridge_test` bucket: blocking and async get/put/erase, overwrite,
   binary-safe values, a nonexistent-bucket error (distinct from a
   genuine key miss), several `get_async` calls fired without waiting between
-  them all completing correctly (the actual point of the async API), and the
-  constructor throwing on a real connection failure (an unreachable port).
+  them all completing correctly (the actual point of the async API), the
+  constructor throwing on a real connection failure (an unreachable port),
+  and the circuit breaker (see "the circuit breaker" below) opening after
+  consecutive real failures, fast-failing while open, closing again after a
+  successful post-cooldown probe, and `NotFound` not counting as a failure.
 
 - `test/dispatch_request_test.cpp` exercises `dispatch_request()`
   (`server_dispatch.hpp`, the logic `server_readthrough.cpp` runs in its
@@ -440,6 +443,32 @@ plain `Container::emplace()` won't overwrite an existing value), so the
 value it fetched. Fixing this needs per-key request coalescing/ordering
 (a "singleflight" pattern), which is deliberately out of scope here.
 
+### The circuit breaker
+
+Without it, every miss/write during a NATS outage independently waits out
+the full `op_timeout` (3s by default) before failing -- correct, but slow
+and wasteful for every client hitting the daemon during that outage, and
+each in-flight timed-out coroutine ties up resources for the duration.
+
+`NatsBridge` tracks consecutive failures (a real error -- timeout,
+disconnected, etc. -- not a `NotFound`, which is NATS answering correctly,
+just with no data). After `failure_threshold` consecutive failures (default
+3) the circuit opens: every `get_async`/`put_async`/`erase_async` call fails
+instantly with `Error`, without attempting a NATS round trip at all, for
+`open_duration` (default 2s). The next call after that cooldown is let
+through as a probe -- success closes the circuit and resets the failure
+count, failure reopens it for another `open_duration`. Both are constructor
+parameters, so `test/nats_bridge_test.cpp`'s `NatsBridgeCircuitBreakerTest`
+suite uses short values (a couple hundred ms) to stay fast; verified live:
+opens after `failure_threshold` real failures against a nonexistent bucket,
+the very next call while open completes in under 50ms (vs. the 200ms
+`op_timeout` a real attempt would take), and it closes again once a probe
+after the cooldown succeeds.
+
+`server_readthrough.cpp`/`server_dispatch.hpp` need no changes for this --
+they already treat any NATS `Error` uniformly, so a circuit-open response
+looks exactly like any other NATS failure to `dispatch_request()`.
+
 ## What this doesn't answer yet
 
 This proves the pattern works end-to-end and is easy to wire up, not that
@@ -469,8 +498,7 @@ becomes more than a POC:
   nothing about behavior under sustained high concurrency (how many
   in-flight NATS operations `nats_asio`/the NATS server can actually sustain,
   memory growth of `CompletionQueue` under backlog, etc.).
-- **Failure handling.** No reconnect/retry logic beyond what `nats_asio`
-  does internally, no handling of the daemon process dying mid-request
+- **Failure handling.** No handling of the daemon process dying mid-request
   beyond what iceoryx2 does by default. A malformed/truncated request (or an
   unexpected NATS-side exception) is now caught at the request-handling
   boundary and turned into an `Error` response instead of crashing the
@@ -483,6 +511,11 @@ becomes more than a POC:
   return normally, running `NatsBridge`'s destructor (clean NATS thread
   shutdown) via ordinary RAII — confirmed by sending SIGTERM to a running
   daemon and observing `[server] exit` followed by the process disappearing.
+  `NatsBridge` now has a per-instance circuit breaker (see below) for
+  *sustained* NATS unavailability; it still relies entirely on `nats_asio`'s
+  own internal reconnect logic to actually recover the underlying
+  connection — there's no additional retry/backoff layered on top of that
+  from this POC's own code.
 - **Build footprint.** Two Rust-adjacent toolchains (Rust itself for
   iceoryx2-cxx, plus nats_asio's own sizeable vcpkg dependency tree) for a
   project that otherwise only needs Boost + a C++20 compiler; worth weighing

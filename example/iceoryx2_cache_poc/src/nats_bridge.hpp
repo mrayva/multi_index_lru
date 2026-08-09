@@ -22,6 +22,17 @@
 /// from inside `on_done` directly -- see server_readthrough.cpp's
 /// CompletionQueue, which defers the actual cache mutation to its own main
 /// thread so the "single owner, no internal locking" contract holds.
+///
+/// A per-instance circuit breaker guards against a sustained NATS outage:
+/// without it, every miss/write during an outage independently waits out the
+/// full op_timeout (3s by default) before failing -- fine for one request,
+/// wasteful and slow for every client hitting the daemon during that outage.
+/// After `failure_threshold` consecutive failures the circuit opens and
+/// every call fails instantly (no NATS round trip attempted at all) until
+/// `open_duration` has passed, at which point the next call is let through
+/// as a probe: success closes the circuit, failure reopens it. A NotFound
+/// is a real answer from a healthy NATS, not a failure, and doesn't count
+/// against the breaker.
 #pragma once
 
 #include <nats_asio/nats_asio.hpp>
@@ -31,6 +42,7 @@
 #include <asio/executor_work_guard.hpp>
 #include <asio/io_context.hpp>
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <functional>
@@ -56,8 +68,12 @@ struct NatsGetResult {
 class NatsBridge {
 public:
     NatsBridge(const std::string& host, std::uint16_t port,
-               std::chrono::milliseconds op_timeout = std::chrono::milliseconds(3000))
-        : timeout_(op_timeout), work_guard_(asio::make_work_guard(ioc_)) {
+               std::chrono::milliseconds op_timeout = std::chrono::milliseconds(3000), int failure_threshold = 3,
+               std::chrono::milliseconds open_duration = std::chrono::milliseconds(2000))
+        : timeout_(op_timeout),
+          failure_threshold_(failure_threshold),
+          open_duration_(open_duration),
+          work_guard_(asio::make_work_guard(ioc_)) {
         io_thread_ = std::thread([this] { ioc_.run(); });
 
         conn_ = nats_asio::connect(ioc_, host, port);
@@ -94,6 +110,11 @@ public:
     // on_done: void(NatsGetResult)
     template <typename Callback>
     void get_async(const std::string& bucket, const std::string& key, Callback on_done) {
+        if (is_circuit_open()) {
+            on_done(NatsGetResult{NatsResult::Error, {}, "circuit breaker open: NATS considered unavailable"});
+            return;
+        }
+
         auto conn = conn_;
         auto timeout = timeout_;
 
@@ -103,20 +124,25 @@ public:
         // the whole process down over one bad NATS response.
         asio::co_spawn(
             ioc_,
-            [conn, bucket, key, timeout, on_done = std::move(on_done)]() mutable -> asio::awaitable<void> {
+            [this, conn, bucket, key, timeout, on_done = std::move(on_done)]() mutable -> asio::awaitable<void> {
                 try {
                     auto [entry, status] = co_await conn->kv_get(bucket, key, timeout);
                     if (status.ok()) {
+                        record_success();
                         on_done(NatsGetResult{
                             NatsResult::Ok, std::vector<std::uint8_t>(entry.value.begin(), entry.value.end()), {}});
                     } else if (status.code() == nats_asio::error_code::key_not_found) {
+                        record_success();
                         on_done(NatsGetResult{NatsResult::NotFound, {}, {}});
                     } else {
+                        record_failure();
                         on_done(NatsGetResult{NatsResult::Error, {}, status.error()});
                     }
                 } catch (const std::exception& e) {
+                    record_failure();
                     on_done(NatsGetResult{NatsResult::Error, {}, std::string("exception: ") + e.what()});
                 } catch (...) {
+                    record_failure();
                     on_done(NatsGetResult{NatsResult::Error, {}, "unknown exception"});
                 }
                 co_return;
@@ -128,20 +154,32 @@ public:
     template <typename Callback>
     void put_async(const std::string& bucket, const std::string& key, std::vector<std::uint8_t> value,
                     Callback on_done) {
+        if (is_circuit_open()) {
+            on_done(false, "circuit breaker open: NATS considered unavailable");
+            return;
+        }
+
         auto conn = conn_;
         auto timeout = timeout_;
 
         asio::co_spawn(
             ioc_,
-            [conn, bucket, key, value, timeout, on_done = std::move(on_done)]() mutable -> asio::awaitable<void> {
+            [this, conn, bucket, key, value, timeout, on_done = std::move(on_done)]() mutable -> asio::awaitable<void> {
                 try {
                     std::span<const char> span(reinterpret_cast<const char*>(value.data()), value.size());
                     auto [revision, status] = co_await conn->kv_put(bucket, key, span, timeout);
                     (void)revision;
+                    if (status.ok()) {
+                        record_success();
+                    } else {
+                        record_failure();
+                    }
                     on_done(status.ok(), status.ok() ? std::string{} : status.error());
                 } catch (const std::exception& e) {
+                    record_failure();
                     on_done(false, std::string("exception: ") + e.what());
                 } catch (...) {
+                    record_failure();
                     on_done(false, "unknown exception");
                 }
                 co_return;
@@ -152,19 +190,31 @@ public:
     // on_done: void(bool ok, std::string error)
     template <typename Callback>
     void erase_async(const std::string& bucket, const std::string& key, Callback on_done) {
+        if (is_circuit_open()) {
+            on_done(false, "circuit breaker open: NATS considered unavailable");
+            return;
+        }
+
         auto conn = conn_;
         auto timeout = timeout_;
 
         asio::co_spawn(
             ioc_,
-            [conn, bucket, key, timeout, on_done = std::move(on_done)]() mutable -> asio::awaitable<void> {
+            [this, conn, bucket, key, timeout, on_done = std::move(on_done)]() mutable -> asio::awaitable<void> {
                 try {
                     auto [revision, status] = co_await conn->kv_delete(bucket, key, timeout);
                     (void)revision;
+                    if (status.ok()) {
+                        record_success();
+                    } else {
+                        record_failure();
+                    }
                     on_done(status.ok(), status.ok() ? std::string{} : status.error());
                 } catch (const std::exception& e) {
+                    record_failure();
                     on_done(false, std::string("exception: ") + e.what());
                 } catch (...) {
+                    record_failure();
                     on_done(false, "unknown exception");
                 }
                 co_return;
@@ -199,12 +249,38 @@ public:
         return fut.get();
     }
 
+    // --- circuit breaker introspection (mainly for tests) -------------------
+
+    [[nodiscard]] bool is_circuit_open() const {
+        const auto opened_at = circuit_opened_at_.load();
+        if (opened_at == std::chrono::steady_clock::time_point::min()) {
+            return false;
+        }
+        return std::chrono::steady_clock::now() - opened_at < open_duration_;
+    }
+
 private:
+    // NotFound is a real answer from a healthy NATS, not a failure.
+    void record_success() {
+        consecutive_failures_.store(0);
+        circuit_opened_at_.store(std::chrono::steady_clock::time_point::min());
+    }
+
+    void record_failure() {
+        if (consecutive_failures_.fetch_add(1) + 1 >= failure_threshold_) {
+            circuit_opened_at_.store(std::chrono::steady_clock::now());
+        }
+    }
+
     asio::io_context ioc_;
     std::chrono::milliseconds timeout_;
+    int failure_threshold_;
+    std::chrono::milliseconds open_duration_;
     asio::executor_work_guard<asio::io_context::executor_type> work_guard_;
     std::thread io_thread_;
     nats_asio::iconnection_sptr conn_;
+    std::atomic<int> consecutive_failures_{0};
+    std::atomic<std::chrono::steady_clock::time_point> circuit_opened_at_{std::chrono::steady_clock::time_point::min()};
 };
 
 }  // namespace poc
