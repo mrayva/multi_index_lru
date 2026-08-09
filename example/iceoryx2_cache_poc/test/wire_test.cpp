@@ -215,6 +215,7 @@ TEST(WireEnums, StatusValuesArePinned) {
     EXPECT_EQ(static_cast<std::uint8_t>(Status::Ok), 0);
     EXPECT_EQ(static_cast<std::uint8_t>(Status::NotFound), 1);
     EXPECT_EQ(static_cast<std::uint8_t>(Status::Error), 2);
+    EXPECT_EQ(static_cast<std::uint8_t>(Status::ReadOnly), 3);
 }
 
 }  // namespace

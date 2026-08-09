@@ -307,11 +307,19 @@ inline void apply_pending_invalidations(NameCache& name_cache, IdCache& id_cache
     }
 }
 
-// Parses one request and either responds immediately (local cache hit, or a
-// malformed request) or hands `active_request` to `completions` -- to be
-// responded to once the async NATS operation it kicks off completes. Every
-// path goes through `key_queue` so operations on the same key never overlap
-// in flight -- see KeyOperationQueue above.
+// Parses one request and either responds immediately (local cache hit, a
+// rejected write, or a malformed request) or hands `active_request` to
+// `completions` -- to be responded to once the async NATS operation it
+// kicks off completes. Every path goes through `key_queue` so operations on
+// the same key never overlap in flight -- see KeyOperationQueue above.
+//
+// `allow_writes` gates Put/Erase (see --allow-writes/MIL_ALLOW_WRITES in
+// server_readthrough.cpp and README.md "Read-only by default"): when false,
+// both are rejected with Status::ReadOnly before touching key_queue or NATS
+// at all -- a write that's always going to be refused shouldn't cost a
+// queue slot or count against another key's backpressure budget. Get (and,
+// if it's ever wired up here, GetAll) are never gated; this only concerns
+// writes.
 //
 // Any exception here (malformed/truncated request -- see wire::Reader) is
 // caught and turned into an immediate Error response; the same hardening
@@ -321,11 +329,17 @@ inline void apply_pending_invalidations(NameCache& name_cache, IdCache& id_cache
 // always respond with the still-intact `active_request` parameter directly.
 inline void dispatch_request(NameCache& name_cache, IdCache& id_cache, NatsBridge& nats, const std::string& name_bucket,
                               const std::string& id_bucket, CompletionQueue& completions, KeyOperationQueue& key_queue,
-                              ActiveRequestType active_request, const std::uint8_t* data, std::size_t size) {
+                              bool allow_writes, ActiveRequestType active_request, const std::uint8_t* data,
+                              std::size_t size) {
     try {
         wire::Reader r(data, size);
         const auto op = static_cast<wire::Op>(r.u8());
         const auto kind = static_cast<wire::KeyKind>(r.u8());
+
+        if (!allow_writes && (op == wire::Op::Put || op == wire::Op::Erase)) {
+            respond(active_request, encode_status(wire::Status::ReadOnly));
+            return;
+        }
 
         if (op == wire::Op::Get) {
             if (kind == wire::KeyKind::Name) {

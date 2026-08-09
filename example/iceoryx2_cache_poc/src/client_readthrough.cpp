@@ -62,6 +62,7 @@ const char* status_name(poc::wire::Status status) {
         case poc::wire::Status::Ok: return "ok";
         case poc::wire::Status::NotFound: return "not found";
         case poc::wire::Status::Error: return "error";
+        case poc::wire::Status::ReadOnly: return "read-only (server started without --allow-writes)";
     }
     return "?";
 }

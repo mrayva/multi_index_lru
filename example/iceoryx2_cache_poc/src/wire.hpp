@@ -17,7 +17,12 @@ namespace poc::wire {
 // the only Op that pairs with KeyKind::Category.
 enum class Op : std::uint8_t { Get = 0, Put = 1, Erase = 2, GetAll = 3 };
 enum class KeyKind : std::uint8_t { Name = 0, Id = 1, Category = 2 };
-enum class Status : std::uint8_t { Ok = 0, NotFound = 1, Error = 2 };
+// ReadOnly: a Put/Erase reached a server_readthrough.cpp instance that's
+// running without --allow-writes/MIL_ALLOW_WRITES -- distinct from Error so
+// a caller can tell "this daemon deliberately doesn't accept writes" apart
+// from "something actually went wrong." See README.md "Read-only by
+// default".
+enum class Status : std::uint8_t { Ok = 0, NotFound = 1, Error = 2, ReadOnly = 3 };
 
 class Writer {
 public:

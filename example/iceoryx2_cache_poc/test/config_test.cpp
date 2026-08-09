@@ -101,5 +101,40 @@ TEST_F(ConfigTest, ResolveMillisParsesFlagAndEnv) {
     EXPECT_EQ(resolve_millis(empty_args, "--timeout-ms", "MIL_TEST_CONFIG_XYZ", 3000), std::chrono::milliseconds(3000));
 }
 
+TEST_F(ConfigTest, ResolveBoolPrefersFlagOverEnvOverDefault) {
+    setenv("MIL_TEST_CONFIG_XYZ", "false", 1);
+    std::vector<std::string> args{"--allow-writes", "true"};
+    EXPECT_TRUE(resolve_bool(args, "--allow-writes", "MIL_TEST_CONFIG_XYZ", false))
+        << "a CLI flag must win over a conflicting env var";
+}
+
+TEST_F(ConfigTest, ResolveBoolFallsBackToEnvWhenNoFlag) {
+    setenv("MIL_TEST_CONFIG_XYZ", "1", 1);
+    std::vector<std::string> empty_args{};
+    EXPECT_TRUE(resolve_bool(empty_args, "--allow-writes", "MIL_TEST_CONFIG_XYZ", false));
+}
+
+TEST_F(ConfigTest, ResolveBoolFallsBackToDefaultWhenNeitherGiven) {
+    std::vector<std::string> empty_args{};
+    EXPECT_FALSE(resolve_bool(empty_args, "--allow-writes", "MIL_TEST_CONFIG_XYZ", false));
+    EXPECT_TRUE(resolve_bool(empty_args, "--allow-writes", "MIL_TEST_CONFIG_XYZ", true));
+}
+
+TEST_F(ConfigTest, ResolveBoolAcceptsEachRecognizedSpellingCaseInsensitively) {
+    for (const char* truthy : {"1", "true", "TRUE", "True", "yes", "YES"}) {
+        std::vector<std::string> args{"--flag", truthy};
+        EXPECT_TRUE(resolve_bool(args, "--flag", "MIL_TEST_CONFIG_XYZ", false)) << "input was \"" << truthy << "\"";
+    }
+    for (const char* falsy : {"0", "false", "FALSE", "False", "no", "NO"}) {
+        std::vector<std::string> args{"--flag", falsy};
+        EXPECT_FALSE(resolve_bool(args, "--flag", "MIL_TEST_CONFIG_XYZ", true)) << "input was \"" << falsy << "\"";
+    }
+}
+
+TEST_F(ConfigTest, ResolveBoolThrowsOnUnrecognizedValue) {
+    std::vector<std::string> args{"--allow-writes", "maybe"};
+    EXPECT_THROW(resolve_bool(args, "--allow-writes", "MIL_TEST_CONFIG_XYZ", false), std::runtime_error);
+}
+
 }  // namespace
 }  // namespace poc::config

@@ -78,8 +78,10 @@ Response:
 - `GetAll+Ok` (at least one match): `[status:u8=Ok][count:u32][truncated:u8]
   [record_len:u32][record bytes] x count`
 - everything else (a miss, `Erase`, `Put`, or an error): `[status:u8]` alone
-  — `status` is `Ok`, `NotFound`, or `Error` (`Error` is only ever produced
-  by the NATS-backed server, e.g. on a NATS timeout).
+  — `status` is `Ok`, `NotFound`, `Error` (only ever produced by the
+  NATS-backed server, e.g. on a NATS timeout), or `ReadOnly` (a `Put`/`Erase`
+  reached `server_readthrough.cpp` running without `--allow-writes` --
+  see "Read-only by default" below).
 
 `Put` is an upsert against whichever cache `key_kind` selects: the server
 erases any existing entry under that key first (a plain `Container::emplace()`
@@ -218,6 +220,7 @@ accepted for flags with a value: `--flag value` or `--flag=value`.
 | `--max-active-requests-per-client` | `MIL_MAX_ACTIVE_REQUESTS_PER_CLIENT` | `32` | `server.cpp`, `server_readthrough.cpp` (iceoryx2-cxx's own default is 4, see "Load testing") |
 | `--max-queue-depth-per-key` | `MIL_MAX_QUEUE_DEPTH_PER_KEY` | `64` | `server_readthrough.cpp` (`KeyOperationQueue` backpressure, see "Backpressure") |
 | `--max-getall-results` | `MIL_MAX_GETALL_RESULTS` | `100` | `server.cpp` (caps a single GetAll response, see "Non-unique key lookup (GetAll)") |
+| `--allow-writes` | `MIL_ALLOW_WRITES` | `false` | `server_readthrough.cpp` (Put/Erase rejected unless set, see "Read-only by default") |
 | `--nats-host` | `MIL_NATS_HOST` | `127.0.0.1` | `server_readthrough.cpp`, `client_readthrough.cpp` |
 | `--nats-port` | `MIL_NATS_PORT` | `4222` | `server_readthrough.cpp`, `client_readthrough.cpp` |
 | `--name-bucket` | `MIL_NAME_BUCKET` | `poc::kNameBucket` (`mil_by_name`) | `server_readthrough.cpp`, `client_readthrough.cpp` |
@@ -476,10 +479,12 @@ ctest --test-dir build-poc --output-on-failure
   written into the local cache before replying (classic cache-aside /
   read-through), so the next GET for that key is a local hit. A NATS miss
   too is a normal `NotFound`.
-- **PUT** / **ERASE**: write-through. NATS is updated first (`kv_put` /
-  `kv_delete`); the local cache is only touched once that succeeds, so the
-  cache never holds something NATS doesn't durably have. A NATS failure is
-  reported back as `Error` and the local cache is left untouched.
+- **PUT** / **ERASE**: write-through, *if* `--allow-writes` is set (off by
+  default -- see "Read-only by default" below). When allowed, NATS is
+  updated first (`kv_put` / `kv_delete`); the local cache is only touched
+  once that succeeds, so the cache never holds something NATS doesn't
+  durably have. A NATS failure is reported back as `Error` and the local
+  cache is left untouched.
 
 Each of the two caches gets its own NATS KV bucket:
 
@@ -526,8 +531,9 @@ cmake -S example/iceoryx2_cache_poc -B build-poc \
       -DCMAKE_PREFIX_PATH="/path/to/iceoryx2/install;/path/to/nats_asio/install;/path/to/nats_asio/build/vcpkg_installed/x64-linux"
 cmake --build build-poc
 
-# terminal 1
-./build-poc/cache_poc_server_readthrough
+# terminal 1 -- --allow-writes since client_readthrough's demo below exercises
+# PUT/ERASE; omit it to run read-only (the default -- see "Read-only by default")
+./build-poc/cache_poc_server_readthrough --allow-writes
 
 # terminal 2 — seeds NATS directly (bypassing the daemon) then proves
 # read-through, write-through, and erase-propagation all work
@@ -802,8 +808,8 @@ built specifically to answer "What this doesn't answer yet"'s old
 guess. Not a `ctest` target -- point it at a real running daemon:
 
 ```bash
-# terminal 1
-./cache_poc_server_readthrough
+# terminal 1 -- --allow-writes since the --op put scenarios below need it
+./cache_poc_server_readthrough --allow-writes
 
 # terminal 2
 ./cache_poc_load_test --op get --key-pool-size 200 --concurrency 100 --total-requests 5000
@@ -902,8 +908,9 @@ key is completely unaffected: this is a per-key limit enforced inside
 `KeyOperationQueue` itself, not a global one, so a saturated hot key never
 throttles traffic to any other key.
 
-Verified live: started `cache_poc_server_readthrough --max-queue-depth-per-key=5`,
-then ran `cache_poc_load_test --op put --key-pool-size 1 --concurrency 32
+Verified live: started `cache_poc_server_readthrough --allow-writes --max-queue-depth-per-key=5`
+(the `--allow-writes` needed for `--op put` to reach the daemon at all --
+see "Read-only by default" below), then ran `cache_poc_load_test --op put --key-pool-size 1 --concurrency 32
 --total-requests 100` against it -- exactly 6 PUTs succeeded (1 in flight +
 5 queued) and the other 94 came back `Error`, matching 94 `rejected (queue
 full for this key)` lines in the daemon's own log. A `GET` for a completely
@@ -912,6 +919,47 @@ returned normally -- confirming the per-key scoping. `dispatch_request_test.cpp`
 `KeyQueueBackpressureRejectsRequestsBeyondPerKeyDepthLimit` covers the same
 two things at the unit level (exactly the requests past the depth limit are
 rejected, a different key is unaffected) on every `ctest` invocation.
+
+## Read-only by default
+
+`server_readthrough.cpp` assumes, unless told otherwise, that it isn't the
+thing writing to NATS KV -- some other producer (a service, `nats kv put`,
+a different system entirely) owns that, and this daemon's job is just to
+read through it and stay coherent with it (see "Cross-daemon coherence"
+above). `Put`/`Erase` are rejected with the new `Status::ReadOnly` -- not
+`Status::Error`, so a caller can tell "this daemon deliberately doesn't
+accept writes" apart from "something actually went wrong" -- unless started
+with `--allow-writes`/`MIL_ALLOW_WRITES` (see "Configuration" above).
+Rejection happens before `key_queue`/NATS are touched at all: a write
+that's always going to be refused shouldn't cost a queue slot or count
+against another key's backpressure budget (see "Backpressure" above). `Get`
+(and `server.cpp`'s writes, separately) are never gated -- this only
+concerns `server_readthrough.cpp`'s own `Put`/`Erase`.
+
+This isn't only a permission check. `RevisionTracker`'s self-echo
+suppression (see "Cross-daemon coherence" above) exists to recognize a
+`kv_watch` event as an echo of *this daemon's own* recent write rather than
+a genuinely new external one. With writes disabled, that distinction stops
+mattering: every event this daemon ever sees on its watch subscription is
+necessarily someone else's change, since it never writes anything itself.
+`RevisionTracker` is still there and still runs when `--allow-writes` is
+set -- read-only mode doesn't remove it, it just means a deployment that
+stays read-only never has to reason about it.
+
+Verified live: started `cache_poc_server_readthrough` with no flags,
+confirmed the startup log itself says `writes disabled (read-only by
+default)`. A `GET` for a key seeded directly into NATS worked normally; a
+`PUT` came back `read-only (server started without --allow-writes)` and a
+follow-up direct NATS read confirmed nothing was written; an `ERASE` against
+a pre-existing key was rejected the same way and the key was confirmed
+still present in NATS afterward. Restarting with `--allow-writes=true`
+flipped the startup log to `writes enabled (--allow-writes)`, and the same
+`PUT` then succeeded and was confirmed to actually land in NATS.
+`dispatch_request_test.cpp`'s `PutIsRejectedWithReadOnlyStatusWhenWritesAreDisabled`,
+`EraseIsRejectedWithReadOnlyStatusWhenWritesAreDisabled`, and
+`GetStillWorksNormallyWhenWritesAreDisabled` cover the same three things at
+the unit level -- including, for the two rejection tests, confirming NATS
+itself was never touched, not just that the response said so.
 
 ## What this doesn't answer yet
 

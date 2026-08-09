@@ -21,6 +21,18 @@
 /// only sent -- once that NATS write completes, so the cache never holds
 /// something NATS doesn't durably have.
 ///
+/// Read-only by default: this daemon expects NATS KV to be populated by
+/// something else (a producer service, `nats kv put`, another system
+/// entirely) and normally just reads through it -- so PUT/ERASE are
+/// rejected with Status::ReadOnly unless started with
+/// --allow-writes/MIL_ALLOW_WRITES. This isn't just a permission check:
+/// with writes disabled, every kv_watch event this daemon sees is
+/// necessarily someone else's change (see "Cross-daemon coherence" below),
+/// which is exactly the invariant RevisionTracker's self-echo suppression
+/// exists to protect when writes *are* allowed. Enabling --allow-writes
+/// doesn't turn that suppression off -- it's still there -- but a read-only
+/// deployment doesn't need to reason about it at all.
+///
 /// Nothing here blocks the main iceoryx2 request loop on a NATS round trip:
 /// while one client's GET/PUT/ERASE is waiting on NATS, the loop keeps
 /// receiving and dispatching every other client's requests. See
@@ -59,6 +71,9 @@
 ///                                                       this deep in KeyOperationQueue rejects any
 ///                                                       further request for it with Error instead of
 ///                                                       queuing indefinitely; see README.md "Backpressure")
+///   --allow-writes / MIL_ALLOW_WRITES                 (default false -- Put/Erase are rejected with
+///                                                       Status::ReadOnly unless set; see "Read-only
+///                                                       by default" above)
 #include "server_dispatch.hpp"
 #include "config.hpp"
 
@@ -102,6 +117,7 @@ int main(int argc, char** argv) {
         args, "--max-active-requests-per-client", "MIL_MAX_ACTIVE_REQUESTS_PER_CLIENT", 32);
     const std::size_t max_queue_depth_per_key =
         poc::config::resolve_size(args, "--max-queue-depth-per-key", "MIL_MAX_QUEUE_DEPTH_PER_KEY", 64);
+    const bool allow_writes = poc::config::resolve_bool(args, "--allow-writes", "MIL_ALLOW_WRITES", false);
 
     // Declared before `nats` on purpose: local variables are destroyed in
     // reverse declaration order, and NatsBridge's own coroutines (get_async/
@@ -151,7 +167,9 @@ int main(int argc, char** argv) {
                       .value();
 
     std::cout << "[server] read-through cache daemon ready (non-blocking), service \"" << service_name
-              << "\", buckets \"" << name_bucket << "\" / \"" << id_bucket << "\". Ctrl+C to stop.\n";
+              << "\", buckets \"" << name_bucket << "\" / \"" << id_bucket << "\", writes "
+              << (allow_writes ? "enabled (--allow-writes)" : "disabled (read-only by default)")
+              << ". Ctrl+C to stop.\n";
 
     while (node.wait(kCycleTime).has_value()) {
         // Respond to whatever NATS operations finished since the last cycle
@@ -191,7 +209,8 @@ int main(int argc, char** argv) {
             std::vector<std::uint8_t> request_bytes(payload.data(), payload.data() + payload.number_of_bytes());
 
             poc::dispatch_request(name_cache, id_cache, nats, name_bucket, id_bucket, completions, key_queue,
-                                   std::move(active_request_opt.value()), request_bytes.data(), request_bytes.size());
+                                   allow_writes, std::move(active_request_opt.value()), request_bytes.data(),
+                                   request_bytes.size());
         }
     }
 

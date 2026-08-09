@@ -8,6 +8,7 @@
 /// manual-command syntax from what's left.
 #pragma once
 
+#include <cctype>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -99,6 +100,35 @@ inline std::chrono::milliseconds resolve_millis(std::vector<std::string>& args, 
         return std::chrono::milliseconds(std::stol(*v));
     }
     return std::chrono::milliseconds(default_ms);
+}
+
+// Accepts "1"/"true"/"yes" (case-insensitive) as true and "0"/"false"/"no"
+// as false; throws on anything else, same as the other resolve_*() throwing
+// on an unparseable value (std::stoi et al.) rather than silently falling
+// back to the default.
+inline bool resolve_bool(std::vector<std::string>& args, const std::string& flag, const char* env_name,
+                          bool default_value) {
+    auto parse = [&flag](const std::string& raw) {
+        std::string v;
+        v.reserve(raw.size());
+        for (char c : raw) {
+            v.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+        }
+        if (v == "1" || v == "true" || v == "yes") {
+            return true;
+        }
+        if (v == "0" || v == "false" || v == "no") {
+            return false;
+        }
+        throw std::runtime_error("invalid boolean value for " + flag + ": \"" + raw + "\"");
+    };
+    if (auto v = take_flag(args, flag)) {
+        return parse(*v);
+    }
+    if (auto v = getenv_str(env_name)) {
+        return parse(*v);
+    }
+    return default_value;
 }
 
 }  // namespace poc::config

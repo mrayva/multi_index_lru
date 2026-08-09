@@ -135,7 +135,8 @@ protected:
             const auto& payload = active_request_opt->payload();
             std::vector<std::uint8_t> request_bytes(payload.data(), payload.data() + payload.number_of_bytes());
             dispatch_request(*name_cache_, *id_cache_, *nats_, kNameBucket, kIdBucket, completions_, key_queue_,
-                              std::move(active_request_opt.value()), request_bytes.data(), request_bytes.size());
+                              allow_writes_, std::move(active_request_opt.value()), request_bytes.data(),
+                              request_bytes.size());
         }
     }
 
@@ -176,6 +177,9 @@ protected:
     std::optional<IdCache> id_cache_;
     CompletionQueue completions_;
     KeyOperationQueue key_queue_{kKeyQueueDepth};
+    // true by default so every existing Put/Erase test in this file is
+    // unaffected -- ReadOnlyModeTest below is the one that flips it.
+    bool allow_writes_ = true;
     // Per-test, unlike invalidations_ -- each test's caches are freshly
     // reset in SetUp(), so there's nothing to gain from remembering
     // revisions across tests, and keeping it per-test avoids one test's
@@ -306,6 +310,57 @@ TEST_F(DispatchRequestTest, InFlightMissDoesNotBlockAConcurrentLocalHit) {
     EXPECT_EQ(static_cast<wire::Status>(miss_r.u8()), wire::Status::Ok);
 
     nats_->erase(kNameBucket, "blocking_check");
+}
+
+// --- Read-only by default: --allow-writes/MIL_ALLOW_WRITES -----------------
+
+TEST_F(DispatchRequestTest, PutIsRejectedWithReadOnlyStatusWhenWritesAreDisabled) {
+    allow_writes_ = false;
+    nats_->erase(kNameBucket, "readonly_put_test");
+
+    auto pending = send_request(encode_put(wire::KeyKind::Name, "readonly_put_test", 0, bytes("x")));
+    pump_server();  // rejection is synchronous -- must resolve within a single pump, no NATS round trip
+
+    auto response = pending.receive().value();
+    ASSERT_TRUE(response.has_value()) << "a rejected write must resolve immediately, not dispatch to NATS";
+    wire::Reader r(response->payload().data(), response->payload().number_of_bytes());
+    EXPECT_EQ(static_cast<wire::Status>(r.u8()), wire::Status::ReadOnly);
+    EXPECT_EQ(completions_.size(), 0u) << "a rejected write must never touch the completion queue";
+
+    // And NATS must be genuinely untouched -- not just the response saying so.
+    EXPECT_EQ(nats_->get(kNameBucket, "readonly_put_test").result, NatsResult::NotFound);
+}
+
+TEST_F(DispatchRequestTest, EraseIsRejectedWithReadOnlyStatusWhenWritesAreDisabled) {
+    ASSERT_TRUE(nats_->put(kNameBucket, "readonly_erase_test", bytes("x")).first);
+    allow_writes_ = false;
+
+    auto pending = send_request(encode_erase(wire::KeyKind::Name, "readonly_erase_test", 0));
+    pump_server();
+
+    auto response = pending.receive().value();
+    ASSERT_TRUE(response.has_value());
+    wire::Reader r(response->payload().data(), response->payload().number_of_bytes());
+    EXPECT_EQ(static_cast<wire::Status>(r.u8()), wire::Status::ReadOnly);
+    EXPECT_EQ(completions_.size(), 0u);
+
+    // Untouched in NATS -- the key set up above must still be there.
+    EXPECT_EQ(nats_->get(kNameBucket, "readonly_erase_test").result, NatsResult::Ok);
+
+    nats_->erase(kNameBucket, "readonly_erase_test");
+}
+
+TEST_F(DispatchRequestTest, GetStillWorksNormallyWhenWritesAreDisabled) {
+    allow_writes_ = false;
+    nats_->erase(kNameBucket, "readonly_get_test");
+    ASSERT_TRUE(nats_->put(kNameBucket, "readonly_get_test", bytes("still-readable")).first);
+
+    auto response_bytes = round_trip(encode_get(wire::KeyKind::Name, "readonly_get_test", 0));
+    wire::Reader r(response_bytes.data(), response_bytes.size());
+    ASSERT_EQ(static_cast<wire::Status>(r.u8()), wire::Status::Ok);
+    EXPECT_EQ(str(r.remaining()), "still-readable");
+
+    nats_->erase(kNameBucket, "readonly_get_test");
 }
 
 // --- Negative caching -------------------------------------------------------
