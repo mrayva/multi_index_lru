@@ -1,26 +1,34 @@
 // Tests handle_request_local()'s contract directly: encoded wire request in,
 // encoded wire response out, against a real NameCache/IdCache pair -- no
-// iceoryx2, no NATS, no process boundary. multi_index_lru::Container's own
-// behavior (LRU eviction, node pooling, etc.) is exercised in the main
-// repo's test/container_test.cpp; these tests are scoped to the
-// decode-operate-encode logic that's specific to this POC's server.
+// iceoryx2, no NATS, no process boundary. multi_index_lru::ExpirableContainer's
+// own behavior (LRU eviction, node pooling, TTL expiration, etc.) is
+// exercised generically in the main repo's test/container_test.cpp and
+// test/expirable_test.cpp; these tests are scoped to the decode-operate-encode
+// logic that's specific to this POC's server, plus (HandleRequestLocalTtlTest
+// below) confirming a real TTL actually reaches the constructor.
 #include "../src/cache_service.hpp"
 
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <optional>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace poc {
 namespace {
 
 constexpr std::size_t kCapacity = 100;
+// Long enough that no test in this file (none of which sleep) could ever
+// come close to hitting it -- see HandleRequestLocalTtlTest below for the
+// tests that actually exercise expiration, with their own short TTL.
+constexpr auto kTtl = std::chrono::minutes(10);
 
 class HandleRequestLocalTest : public ::testing::Test {
 protected:
-    NameCache name_cache{kCapacity};
-    IdCache id_cache{kCapacity};
+    NameCache name_cache{kCapacity, kTtl};
+    IdCache id_cache{kCapacity, kTtl};
 
     std::vector<std::uint8_t> handle(const std::vector<std::uint8_t>& request) {
         return handle_request_local(name_cache, id_cache, request.data(), request.size());
@@ -178,6 +186,50 @@ TEST_F(HandleRequestLocalTest, UnknownOpByteReturnsNotFoundInsteadOfCrashing) {
         auto response = handle(request);
         EXPECT_EQ(decode_status(response), wire::Status::NotFound);
     });
+}
+
+// --- TTL: wiring, not re-testing ExpirableContainer's own logic -------------
+// (that's covered generically by test/expirable_test.cpp in the main repo).
+// These just confirm the POC actually constructs NameCache/IdCache with a
+// real TTL and that a GET/PUT through handle_request_local() observes it.
+
+constexpr auto kShortTtl = std::chrono::milliseconds(30);
+
+class HandleRequestLocalTtlTest : public ::testing::Test {
+protected:
+    NameCache name_cache{kCapacity, kShortTtl};
+    IdCache id_cache{kCapacity, kShortTtl};
+
+    std::vector<std::uint8_t> handle(const std::vector<std::uint8_t>& request) {
+        return handle_request_local(name_cache, id_cache, request.data(), request.size());
+    }
+};
+
+TEST_F(HandleRequestLocalTtlTest, GetOfExpiredNameEntryReturnsNotFound) {
+    handle(encode_put(wire::KeyKind::Name, "alice", 0, text("A")));
+    std::this_thread::sleep_for(kShortTtl * 3);
+
+    EXPECT_EQ(decode_status(handle(encode_get(wire::KeyKind::Name, "alice", 0))), wire::Status::NotFound);
+}
+
+TEST_F(HandleRequestLocalTtlTest, GetOfExpiredIdEntryReturnsNotFound) {
+    handle(encode_put(wire::KeyKind::Id, "", 42, text("A")));
+    std::this_thread::sleep_for(kShortTtl * 3);
+
+    EXPECT_EQ(decode_status(handle(encode_get(wire::KeyKind::Id, "", 42))), wire::Status::NotFound);
+}
+
+TEST_F(HandleRequestLocalTtlTest, GetBeforeExpiryRefreshesTtlSoEntrySurvivesPastOriginalDeadline) {
+    handle(encode_put(wire::KeyKind::Name, "alice", 0, text("A")));
+
+    // Two GETs, each well inside the TTL window, each sliding it forward --
+    // total elapsed time exceeds the original TTL, but the entry must still
+    // be alive because every access refreshed it.
+    std::this_thread::sleep_for(kShortTtl / 2);
+    EXPECT_EQ(decode_status(handle(encode_get(wire::KeyKind::Name, "alice", 0))), wire::Status::Ok);
+    std::this_thread::sleep_for(kShortTtl / 2);
+    EXPECT_EQ(decode_status(handle(encode_get(wire::KeyKind::Name, "alice", 0))), wire::Status::Ok)
+        << "an access before expiry must refresh the TTL, not just check it";
 }
 
 }  // namespace

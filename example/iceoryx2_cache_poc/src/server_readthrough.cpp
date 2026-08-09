@@ -42,6 +42,7 @@
 /// Configurable via CLI flag or env var (flag wins if both are given):
 ///   --service-name / MIL_SERVICE_NAME               (default poc::kServiceName)
 ///   --cache-capacity / MIL_CACHE_CAPACITY            (default 1000, applies to both caches)
+///   --ttl-ms / MIL_TTL_MS                            (default 300000 = 5min, applies to both caches)
 ///   --nats-host / MIL_NATS_HOST                      (default 127.0.0.1)
 ///   --nats-port / MIL_NATS_PORT                      (default 4222)
 ///   --name-bucket / MIL_NAME_BUCKET                  (default poc::kNameBucket)
@@ -54,6 +55,7 @@
 
 #include "iox2/iceoryx2.hpp"
 
+#include <chrono>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -61,6 +63,10 @@
 namespace {
 constexpr iox2::bb::Duration kCycleTime = iox2::bb::Duration::from_millis(5);
 constexpr std::uint64_t kInitialSliceLenHint = 256;
+// How often the main loop reclaims capacity slots held by expired-but-
+// unaccessed entries -- see cleanup_expired_periodically() in
+// cache_service.hpp.
+constexpr auto kCleanupInterval = std::chrono::seconds(1);
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -72,6 +78,7 @@ int main(int argc, char** argv) {
     std::vector<std::string> args(argv + 1, argv + argc);
     const std::string service_name = poc::config::resolve_str(args, "--service-name", "MIL_SERVICE_NAME", poc::kServiceName);
     const std::size_t capacity = poc::config::resolve_size(args, "--cache-capacity", "MIL_CACHE_CAPACITY", 1000);
+    const auto ttl = poc::config::resolve_millis(args, "--ttl-ms", "MIL_TTL_MS", 300000);
     const std::string nats_host = poc::config::resolve_str(args, "--nats-host", "MIL_NATS_HOST", "127.0.0.1");
     const std::uint16_t nats_port = poc::config::resolve_u16(args, "--nats-port", "MIL_NATS_PORT", 4222);
     const std::string name_bucket = poc::config::resolve_str(args, "--name-bucket", "MIL_NAME_BUCKET", poc::kNameBucket);
@@ -90,12 +97,13 @@ int main(int argc, char** argv) {
     // NATS thread) always runs before anything it might still be using is
     // torn down, even if a NATS operation is still in flight when main()'s
     // loop exits (e.g. on SIGTERM).
-    poc::NameCache name_cache(capacity);
-    poc::IdCache id_cache(capacity);
+    poc::NameCache name_cache(capacity, ttl);
+    poc::IdCache id_cache(capacity, ttl);
     poc::CompletionQueue completions;
     poc::KeyOperationQueue key_queue;
     poc::RevisionTracker revisions;
     poc::InvalidationQueue invalidations;
+    auto last_cleanup = std::chrono::steady_clock::now();
 
     std::cout << "[server] connecting to NATS at " << nats_host << ":" << nats_port << " ...\n";
     poc::NatsBridge nats(nats_host, nats_port, nats_timeout, cb_failure_threshold, cb_open_duration);
@@ -155,6 +163,7 @@ int main(int argc, char** argv) {
         }
 
         poc::apply_pending_invalidations(name_cache, id_cache, revisions, invalidations);
+        poc::cleanup_expired_periodically(name_cache, id_cache, last_cleanup, kCleanupInterval);
 
         while (true) {
             auto active_request_opt = server.receive().value();

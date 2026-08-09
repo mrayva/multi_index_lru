@@ -92,8 +92,12 @@ protected:
     }
 
     void SetUp() override {
-        name_cache_.emplace(100);
-        id_cache_.emplace(100);
+        // A TTL long enough that none of these tests (none of which run
+        // anywhere close to a minute) could ever expire an entry
+        // incidentally -- TTL expiration itself is covered by
+        // handle_request_local_test.cpp's HandleRequestLocalTtlTest.
+        name_cache_.emplace(100, std::chrono::minutes(1));
+        id_cache_.emplace(100, std::chrono::minutes(1));
     }
 
     // One iteration of what server_readthrough.cpp's main loop does: drain

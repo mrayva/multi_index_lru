@@ -26,13 +26,16 @@ C++20 compiler (see "Unit tests" below).
 
 ## What it demonstrates
 
-- `cache_service.hpp` defines **two independent** `multi_index_lru::Container`
-  instances — `NameCache` (hashed on a `std::string`) and `IdCache` (hashed
-  on an `int64_t`) — each holding an opaque byte blob per entry (a stand-in
-  for a real [zerialize](../zerialize_cache.cpp)-produced flexbuffer/msgpack
-  record). They're unrelated caches, not two indices over the same entries:
-  this exists to demo/test both a string-keyed and an integral-keyed
-  `Container` side by side under one service.
+- `cache_service.hpp` defines **two independent**
+  `multi_index_lru::ExpirableContainer` instances — `NameCache` (hashed on a
+  `std::string`) and `IdCache` (hashed on an `int64_t`) — each holding an
+  opaque byte blob per entry (a stand-in for a real
+  [zerialize](../zerialize_cache.cpp)-produced flexbuffer/msgpack record)
+  that expires after a configurable TTL on top of the usual LRU-capacity
+  eviction (`--ttl-ms`/`MIL_TTL_MS`, see "Configuration" below). They're
+  unrelated caches, not two indices over the same entries: this exists to
+  demo/test both a string-keyed and an integral-keyed `ExpirableContainer`
+  side by side under one service.
 - `wire.hpp` is a tiny little-endian binary encoder/decoder for the
   request/response messages (POC-scope only: assumes a little-endian host).
 - `server.cpp` is the sole owner of both containers (respecting the "not
@@ -52,8 +55,8 @@ C++20 compiler (see "Unit tests" below).
   see "Configuration" below for the full flag/env-var list.
 
 Everything else — LRU eviction, TTL, composite keys, node pooling — still
-lives entirely in `multi_index_lru::Container` on the server side; iceoryx2
-only carries bytes across the process boundary.
+lives entirely in `multi_index_lru::ExpirableContainer` on the server side;
+iceoryx2 only carries bytes across the process boundary.
 
 ### Wire protocol
 
@@ -176,6 +179,7 @@ accepted for flags with a value: `--flag value` or `--flag=value`.
 |---|---|---|---|
 | `--service-name` | `MIL_SERVICE_NAME` | `poc::kServiceName` | all four -- client and server must agree |
 | `--cache-capacity` | `MIL_CACHE_CAPACITY` | `1000` | `server.cpp`, `server_readthrough.cpp` (applies to both caches) |
+| `--ttl-ms` | `MIL_TTL_MS` | `300000` (5min) | `server.cpp`, `server_readthrough.cpp` (applies to both caches) |
 | `--nats-host` | `MIL_NATS_HOST` | `127.0.0.1` | `server_readthrough.cpp`, `client_readthrough.cpp` |
 | `--nats-port` | `MIL_NATS_PORT` | `4222` | `server_readthrough.cpp`, `client_readthrough.cpp` |
 | `--name-bucket` | `MIL_NAME_BUCKET` | `poc::kNameBucket` (`mil_by_name`) | `server_readthrough.cpp`, `client_readthrough.cpp` |
@@ -214,6 +218,42 @@ MIL_SERVICE_NAME=my-cache MIL_NATS_HOST=nats.internal MIL_NAME_BUCKET=my_name_bu
 ```
 
 `test/config_test.cpp` covers `config.hpp` itself -- see "Unit tests" below.
+
+## TTL / expiration
+
+Both `NameCache` and `IdCache` are `multi_index_lru::ExpirableContainer`, not
+plain `Container`: on top of the LRU-capacity eviction both always had, every
+entry now also expires `--ttl-ms`/`MIL_TTL_MS` after it was last written or
+read (default 5 minutes, applies to both caches). `find()` slides the
+expiration forward on every hit -- exactly like it already refreshes LRU
+recency -- so a key under active use never expires out from under it; only a
+key nobody has touched in `ttl-ms` actually goes away. A `GET` for an expired
+key is a plain `NotFound` (from `server.cpp`) or a local miss that reads
+through to NATS again (from `server_readthrough.cpp`) -- to that key's next
+caller, it looks exactly like the entry was never cached, not like an error.
+
+Expiration is normally lazy (checked the next time something touches that
+key), which by itself would leave an entry that's written once and never
+read again sitting in the cache, occupying an LRU-capacity slot, until
+eviction pressure from other inserts got around to it. Both servers' main
+loops also call `cleanup_expired()` on each cache once a second
+(`cleanup_expired_periodically()`, `cache_service.hpp`) to reclaim those
+slots proactively instead of waiting on that pressure.
+
+Verified live: started `cache_poc_server --ttl-ms=500`, `PUT` a key, `GET` it
+immediately (hit), waited 1.2s (past the 500ms TTL), `GET` it again --
+`not found`. The server's own log over that run additionally showed the
+2 seeded name-keyed + 2 seeded id-keyed entries (present at startup, never
+touched again) drop to zero *before* the first `PUT` arrived -- proactive
+`cleanup_expired()` reclaiming them on its own, not something waiting for a
+`GET` to trip over them. `test/handle_request_local_test.cpp`'s
+`HandleRequestLocalTtlTest` covers this at the unit level with a short TTL,
+including that an access *before* expiry resets the clock rather than just
+checking it (`GetBeforeExpiryRefreshesTtlSoEntrySurvivesPastOriginalDeadline`).
+`ExpirableContainer`'s own TTL/eviction logic has its own generic coverage in
+the main repo's `test/expirable_test.cpp` -- these POC tests are scoped to
+confirming the wiring (a real, non-default TTL reaches the constructor and is
+observable through `handle_request_local()`), not re-testing the library.
 
 ## Unit tests
 
@@ -630,10 +670,10 @@ This proves the pattern works end-to-end and is easy to wire up, not that
 it's the right architecture for a given workload. Open questions before this
 becomes more than a POC:
 
-- **TTL / expiration.** `ExpirableContainer` isn't wired into either server;
-  the write path only covers `Container`'s plain get/put/erase, not TTL
-  refresh or `cleanup_expired()`. NATS KV itself supports a max-age per
-  bucket, which isn't used here either.
+- **NATS KV's own max-age is unused.** "TTL / expiration" above covers the
+  local caches; NATS KV buckets also support a per-bucket max-age for the
+  durable data itself, independent of either daemon's local TTL, which isn't
+  configured here.
 - **Upsert races.** `server.cpp`'s erase-then-emplace upsert is correct
   because it's single-threaded and processes one request at a time from
   start to finish. `server_readthrough.cpp`'s equivalent is now protected by

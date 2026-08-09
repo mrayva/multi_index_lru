@@ -18,11 +18,13 @@
 /// Configurable via CLI flag or env var (flag wins if both are given):
 ///   --service-name / MIL_SERVICE_NAME    (default poc::kServiceName)
 ///   --cache-capacity / MIL_CACHE_CAPACITY (default 1000, applies to both caches)
+///   --ttl-ms / MIL_TTL_MS                 (default 300000 = 5min, applies to both caches)
 #include "cache_service.hpp"
 #include "config.hpp"
 
 #include "iox2/iceoryx2.hpp"
 
+#include <chrono>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -31,6 +33,10 @@ namespace {
 
 constexpr iox2::bb::Duration kCycleTime = iox2::bb::Duration::from_millis(100);
 constexpr std::uint64_t kInitialSliceLenHint = 256;
+// How often the main loop reclaims capacity slots held by expired-but-
+// unaccessed entries -- see cleanup_expired_periodically() in
+// cache_service.hpp.
+constexpr auto kCleanupInterval = std::chrono::seconds(1);
 
 std::vector<std::uint8_t> to_bytes(const std::string& s) {
     return std::vector<std::uint8_t>(s.begin(), s.end());
@@ -47,15 +53,17 @@ int main(int argc, char** argv) {
     std::vector<std::string> args(argv + 1, argv + argc);
     const std::string service_name = poc::config::resolve_str(args, "--service-name", "MIL_SERVICE_NAME", poc::kServiceName);
     const std::size_t capacity = poc::config::resolve_size(args, "--cache-capacity", "MIL_CACHE_CAPACITY", 1000);
+    const auto ttl = poc::config::resolve_millis(args, "--ttl-ms", "MIL_TTL_MS", 300000);
 
     // --- seed the caches this process owns --------------------------------
-    poc::NameCache name_cache(capacity);
+    poc::NameCache name_cache(capacity, ttl);
     name_cache.emplace(poc::NameEntry{"alice", to_bytes(R"({"name":"Alice"})")});
     name_cache.emplace(poc::NameEntry{"bob", to_bytes(R"({"name":"Bob"})")});
 
-    poc::IdCache id_cache(capacity);
+    poc::IdCache id_cache(capacity, ttl);
     id_cache.emplace(poc::IdEntry{1, to_bytes(R"({"id":1,"name":"Alice"})")});
     id_cache.emplace(poc::IdEntry{2, to_bytes(R"({"id":2,"name":"Bob"})")});
+    auto last_cleanup = std::chrono::steady_clock::now();
 
     // --- set up the iceoryx2 side ----------------------------------------
     auto node = NodeBuilder().create<ServiceType::Ipc>().value();
@@ -76,6 +84,8 @@ int main(int argc, char** argv) {
               << "Ctrl+C to stop.\n";
 
     while (node.wait(kCycleTime).has_value()) {
+        poc::cleanup_expired_periodically(name_cache, id_cache, last_cleanup, kCleanupInterval);
+
         while (true) {
             auto active_request = server.receive().value();
             if (!active_request.has_value()) {

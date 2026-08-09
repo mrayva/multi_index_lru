@@ -1,14 +1,16 @@
 /// Shared service/type definitions for the iceoryx2 request-response POC.
 ///
-/// Two independent multi_index_lru::Container instances, each single-keyed --
-/// NameCache by a string, IdCache by an int64_t -- served over one iceoryx2
-/// request-response service. They're intentionally unrelated caches (not two
-/// indices over the same entries): this exists to demo/test both a string-
-/// keyed and an integral-keyed multi_index_lru::Container side by side, each
-/// holding an opaque byte blob per entry (stand-in for a real
-/// zerialize-produced flexbuffer/msgpack record -- see
-/// example/zerialize_cache.cpp for how that serialization step actually
-/// works).
+/// Two independent multi_index_lru::ExpirableContainer instances, each
+/// single-keyed -- NameCache by a string, IdCache by an int64_t -- served
+/// over one iceoryx2 request-response service. They're intentionally
+/// unrelated caches (not two indices over the same entries): this exists to
+/// demo/test both a string-keyed and an integral-keyed
+/// multi_index_lru::ExpirableContainer side by side, each holding an opaque
+/// byte blob per entry (stand-in for a real zerialize-produced
+/// flexbuffer/msgpack record -- see example/zerialize_cache.cpp for how
+/// that serialization step actually works) that expires after a
+/// configurable TTL on top of the usual LRU-capacity eviction (see
+/// --ttl-ms/MIL_TTL_MS in server.cpp/server_readthrough.cpp).
 ///
 /// server.cpp answers requests purely from these in-memory caches. See
 /// server_readthrough.cpp for the variant that falls through to a NATS
@@ -17,11 +19,12 @@
 
 #include "wire.hpp"
 
-#include <multi_index_lru/container.hpp>
+#include <multi_index_lru/expirable_container.hpp>
 
 #include <boost/multi_index/hashed_index.hpp>
 #include <boost/multi_index/member.hpp>
 
+#include <chrono>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -41,19 +44,45 @@ struct IdEntry {
 struct NameTag {};
 struct IdTag {};
 
-using NameCache = multi_index_lru::Container<
+// ExpirableContainer, not plain Container: entries carry a TTL (see
+// --ttl-ms/MIL_TTL_MS in server.cpp/server_readthrough.cpp) on top of the
+// LRU-capacity eviction both caches already had. find() slides the
+// expiration forward on every hit, same as it already refreshes LRU
+// recency, so a key under active use never expires out from under it.
+using NameCache = multi_index_lru::ExpirableContainer<
     NameEntry,
     boost::multi_index::indexed_by<
         boost::multi_index::hashed_unique<
             boost::multi_index::tag<NameTag>,
             boost::multi_index::member<NameEntry, std::string, &NameEntry::key>>>>;
 
-using IdCache = multi_index_lru::Container<
+using IdCache = multi_index_lru::ExpirableContainer<
     IdEntry,
     boost::multi_index::indexed_by<
         boost::multi_index::hashed_unique<
             boost::multi_index::tag<IdTag>,
             boost::multi_index::member<IdEntry, std::int64_t, &IdEntry::key>>>>;
+
+// An ExpirableContainer only evicts an expired entry when something touches
+// it (find()/erase()) or when cleanup_expired() is called explicitly -- an
+// entry that's written once and never read again would otherwise sit in the
+// cache, occupying an LRU-capacity slot, until eviction pressure from other
+// inserts got around to it. Both servers' main loops call this once per
+// `interval` (not every single iteration -- cleanup_expired()'s cost is
+// proportional to how many *consecutive* least-recently-used entries are
+// actually expired, which is cheap, but there's no reason to pay it more
+// than a few times a second).
+inline void cleanup_expired_periodically(NameCache& name_cache, IdCache& id_cache,
+                                          std::chrono::steady_clock::time_point& last_cleanup,
+                                          std::chrono::steady_clock::duration interval) {
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last_cleanup < interval) {
+        return;
+    }
+    name_cache.cleanup_expired();
+    id_cache.cleanup_expired();
+    last_cleanup = now;
+}
 
 // Every client and server must agree on this name to find each other.
 inline constexpr auto kServiceName = "multi_index_lru/cache/rpc";
