@@ -45,9 +45,9 @@ C++20 compiler (see "Unit tests" below).
   `client_readthrough.cpp`: the same wire protocol and caches, but backed by
   NATS JetStream KV — see "Read-through / write-through over NATS" below.
   `server_dispatch.hpp` holds the actual non-blocking request-dispatch logic
-  (`dispatch_request()`, `CompletionQueue`) so it's includable from
-  `test/dispatch_request_test.cpp`, not just `server_readthrough.cpp`'s
-  `main()`.
+  (`dispatch_request()`, `CompletionQueue`, `KeyOperationQueue`) so it's
+  includable from `test/dispatch_request_test.cpp`, not just
+  `server_readthrough.cpp`'s `main()`.
 - `config.hpp` is the CLI-flag/env-var resolution all four binaries share —
   see "Configuration" below for the full flag/env-var list.
 
@@ -315,12 +315,18 @@ itself); not part of the `poc-unit-tests` CI job for that reason.
   touching `CompletionQueue`; a local miss reading through NATS and
   populating the cache; `Put`/`Erase` write-through, confirmed against NATS
   directly (not just the local cache); a malformed request responding with
-  `Status::Error` within a single pump (not deferred); and -- the one that
-  actually pins down the concurrency-model claim -- an in-flight NATS-bound
-  miss provably not blocking a concurrent local hit, by pumping the server
-  exactly once after dispatching the miss and asserting it has *no* response
-  yet, then completing an unrelated request in full before letting the miss
-  finish.
+  `Status::Error` within a single pump (not deferred); an in-flight
+  NATS-bound miss provably not blocking a concurrent local hit, by pumping
+  the server exactly once after dispatching the miss and asserting it has
+  *no* response yet, then completing an unrelated request in full before
+  letting the miss finish; and `KeyOperationQueue`'s two guarantees directly:
+  a GET-miss racing a concurrent PUT for the *same* key serializes correctly
+  (confirmed via a direct NATS read that the PUT hasn't touched NATS while
+  the GET is still in flight, then that the GET legitimately sees the
+  pre-PUT value while the cache and NATS both end up with the PUT's value,
+  not a stale overwrite), and two concurrent GET-misses on the same key
+  coalesce into one NATS fetch (the second resolves as a local hit in the
+  very same completion that resolved the first).
 
 ```bash
 cmake -S example/iceoryx2_cache_poc -B build-poc \
@@ -490,20 +496,49 @@ request order -- both confirm the requests were genuinely handled
 concurrently, not serialized behind one another the way the old
 blocking-bridge design would have.
 
-**The tradeoff this introduces**: dropping the blocking bridge also drops the
-free thundering-herd protection it incidentally provided (concurrent misses
-on the same key used to naturally serialize through the single blocking
-call). Now, two GETs for the same never-cached key arriving before either's
-NATS fetch completes will both dispatch their own NATS round trip. Worse,
-a GET-miss racing a PUT for the *same* key can return a stale value to the
-GET caller even though the cache itself ends up correct: if client B's PUT
-completes and updates the cache before client A's earlier GET-miss fetch
-(which was already in flight with the pre-PUT value) completes, `apply()`'s
-`emplace()` on A's stale result is a no-op against the now-present key (a
-plain `Container::emplace()` won't overwrite an existing value), so the
-*cache* keeps B's fresher value -- but A's *response* still carries the stale
-value it fetched. Fixing this needs per-key request coalescing/ordering
-(a "singleflight" pattern), which is deliberately out of scope here.
+**The tradeoff this introduced, and how it's closed**: dropping the blocking
+bridge also dropped the thundering-herd protection it incidentally
+provided, and opened a real race -- a GET-miss racing a concurrent PUT for
+the *same* key could return a stale value to the GET caller even though the
+cache itself ended up correct: if client B's PUT completed and updated the
+cache before client A's earlier GET-miss fetch (already in flight with the
+pre-PUT value) completed, `apply()`'s `emplace()` on A's stale result was a
+no-op against the now-present key (a plain `Container::emplace()` won't
+overwrite an existing value), so the *cache* kept B's fresher value -- but
+A's *response* still carried the stale value it fetched.
+
+`KeyOperationQueue` (`server_dispatch.hpp`) closes both gaps with one
+mechanism: at most one operation is ever "in flight" for a given
+(cache, key) at a time. `dispatch_request()` funnels every Get/Put/Erase
+through `key_queue.enqueue(composite_key, ...)`; if nothing's in flight for
+that key it runs immediately (same as before), otherwise it queues behind
+whatever is. The in-flight holder releases the slot -- via
+`key_queue.complete(composite_key)` -- only once its cache mutation (if any)
+and response are both done, which for a deferred (NATS) operation happens in
+`server_readthrough.cpp`'s `main()` right after draining its completion.
+That gives per-key linearizability: operations on the same key always
+finish in the order they were dispatched, so a later write can never be
+clobbered by an earlier read's now-stale completion. As a side effect,
+concurrent GET-misses on the same never-cached key now coalesce too -- the
+second one queues behind the first instead of firing its own redundant NATS
+fetch, and finds a local hit once the first's completion has populated the
+cache -- restoring the thundering-herd protection the blocking-bridge design
+gave for free.
+
+Different keys are completely unaffected -- `KeyOperationQueue` only
+serializes *same*-key operations, so the concurrency demonstrated above
+(7 concurrent requests for 7 distinct keys, ~58ms total) still holds
+unchanged; re-verified after adding the queue with the same live multi-process
+test. And this was verified for the race itself, not just designed: a test
+dispatches a GET-miss for a key, confirms via a direct NATS read that a
+concurrently-dispatched PUT for the *same* key has not yet touched NATS
+(proving it queued rather than racing ahead), then lets both resolve and
+confirms the GET legitimately received the pre-PUT value (correct, since it
+ran first) while the cache and NATS both end up holding the PUT's value, not
+a stale overwrite. A second test confirms two concurrent GET-misses on the
+same key coalesce: the second resolves as a local hit in the very same
+completion that resolved the first, with no second NATS round trip visible
+in the daemon's log.
 
 ### The circuit breaker
 
@@ -543,9 +578,13 @@ becomes more than a POC:
   bucket, which isn't used here either.
 - **Upsert races.** `server.cpp`'s erase-then-emplace upsert is correct
   because it's single-threaded and processes one request at a time from
-  start to finish. `server_readthrough.cpp` no longer has that guarantee for
-  operations on the *same key* in flight concurrently -- see "the stale GET
-  response race" under "the concurrency model" above.
+  start to finish. `server_readthrough.cpp`'s equivalent is now protected by
+  `KeyOperationQueue` for same-key operations (see "the concurrency model"
+  above) -- but `KeyOperationQueue`'s composite keys (`"N:" + name` /
+  `"I:" + id`) could theoretically collide if a `Name` key were literally the
+  string `"I:5"` while an `Id` key `5` was also in flight; harmless
+  over-serialization in that vanishingly unlikely case, not a correctness
+  bug, but worth knowing about.
 - **No invalidation broadcast.** Every daemon keeps its own local cache with
   no cross-daemon coordination; if you ran two `cache_poc_server_readthrough`
   processes against the same NATS buckets, a PUT on one wouldn't invalidate
@@ -559,7 +598,9 @@ becomes more than a POC:
   That's a correctness/architecture check, not a load test -- it says
   nothing about behavior under sustained high concurrency (how many
   in-flight NATS operations `nats_asio`/the NATS server can actually sustain,
-  memory growth of `CompletionQueue` under backlog, etc.).
+  memory growth of `CompletionQueue`/`KeyOperationQueue` under backlog --
+  especially a long queue of operations piled up behind one slow/stuck
+  operation for a single hot key -- etc.).
 - **Failure handling.** No handling of the daemon process dying mid-request
   beyond what iceoryx2 does by default. A malformed/truncated request (or an
   unexpected NATS-side exception) is now caught at the request-handling

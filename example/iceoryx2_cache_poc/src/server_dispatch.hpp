@@ -6,7 +6,9 @@
 /// (in-process) client/server pair, which test/dispatch_request_test.cpp does.
 ///
 /// See server_readthrough.cpp's file comment and README.md's "the concurrency
-/// model" for the design this implements.
+/// model" for the design this implements, including KeyOperationQueue below,
+/// which serializes operations on the same key so a GET can never race a
+/// concurrent PUT/ERASE for that key and return an inconsistent result.
 #pragma once
 
 #include "cache_service.hpp"
@@ -17,8 +19,10 @@
 #include <deque>
 #include <functional>
 #include <iostream>
+#include <memory>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace poc {
@@ -38,6 +42,13 @@ using ActiveRequestType =
     iox2::ActiveRequest<iox2::ServiceType::Ipc, iox2::bb::Slice<std::uint8_t>, void, iox2::bb::Slice<std::uint8_t>,
                          void>;
 
+// ActiveRequestType is move-only by design. It now needs to be captured by
+// closures stored in both CompletionQueue and KeyOperationQueue below, both
+// of which need those closures to be copy-constructible (std::function's
+// requirement) -- a shared_ptr is the simplest way to get that without
+// hand-rolling a move-only type-erased callable.
+using ActiveRequestPtr = std::shared_ptr<ActiveRequestType>;
+
 // Runs on the main thread once a deferred request's NATS operation has
 // completed: applies whatever cache mutation is needed (a Get populating the
 // cache on a NATS hit, or a Put/Erase applying now that NATS confirmed it)
@@ -45,11 +56,12 @@ using ActiveRequestType =
 using ApplyFn = std::function<std::vector<std::uint8_t>(NameCache&, IdCache&)>;
 
 struct PendingCompletion {
-    ActiveRequestType active_request;
+    ActiveRequestPtr active_request;
     ApplyFn apply;
     std::string description;  // for logging only, e.g. "GET name=\"alice\"" -- built on whichever
                                // thread calls push(), but only ever printed on the main thread's
                                // drain loop, so it doesn't need to touch std::cout itself.
+    std::string queue_key;    // KeyOperationQueue key this completion must release when applied.
 };
 
 // Shared between the main iceoryx2 thread and NatsBridge's background NATS
@@ -61,9 +73,10 @@ struct PendingCompletion {
 // one thread.
 class CompletionQueue {
 public:
-    void push(ActiveRequestType active_request, ApplyFn apply, std::string description) {
+    void push(ActiveRequestPtr active_request, ApplyFn apply, std::string description, std::string queue_key) {
         std::lock_guard<std::mutex> lock(mutex_);
-        items_.push_back(PendingCompletion{std::move(active_request), std::move(apply), std::move(description)});
+        items_.push_back(PendingCompletion{std::move(active_request), std::move(apply), std::move(description),
+                                            std::move(queue_key)});
     }
 
     std::vector<PendingCompletion> drain() {
@@ -95,17 +108,81 @@ inline void respond(ActiveRequestType& active_request, const std::vector<std::ui
     send(std::move(initialized)).value();
 }
 
+// Serializes operations on the same (cache, key) so at most one is ever "in
+// flight" at a time -- without this, a GET-miss racing a concurrent PUT for
+// the same key can return a stale value to the GET caller even though the
+// cache itself converges correctly (the stale value's cache write is a safe
+// no-op against the now-present key, but the *response* bytes were already
+// built from the stale fetch before the race was noticed). See README.md
+// "the stale GET response race" for the full scenario this closes.
+//
+// A side effect: concurrent GET-misses on the same never-cached key now also
+// naturally coalesce -- the second GET queues behind the first instead of
+// firing its own redundant NATS round trip, and finds a local hit once the
+// first GET's completion has populated the cache. That's the thundering-herd
+// protection the old blocking-bridge design gave for free and the move to
+// non-blocking dispatch had otherwise dropped.
+//
+// enqueue() and complete() are only ever called from the main iceoryx2
+// thread (dispatch_request()'s call site and CompletionQueue's drain loop in
+// server_readthrough.cpp's main()), never from the NATS thread, so no
+// locking is needed here.
+class KeyOperationQueue {
+public:
+    // If no operation is currently in flight for `key`, runs `op` immediately
+    // (synchronously, before returning). If one already is, queues `op` to
+    // run automatically once the current holder calls complete(key).
+    void enqueue(const std::string& key, std::function<void()> op) {
+        auto& q = queues_[key];
+        q.push_back(std::move(op));
+        if (q.size() == 1) {
+            // Run from a copy, not a reference into the deque: op's own body
+            // may call complete(key) synchronously (the local-hit path
+            // does), which would pop/erase this very deque entry while it's
+            // still executing if we invoked it in place.
+            std::function<void()> to_run = q.front();
+            to_run();
+        }
+    }
+
+    // Must be called exactly once, when the operation currently at the front
+    // of `key`'s queue has fully finished (cache mutated if needed, response
+    // sent). Starts the next queued operation for `key`, if any.
+    void complete(const std::string& key) {
+        auto it = queues_.find(key);
+        if (it == queues_.end()) {
+            return;
+        }
+        it->second.pop_front();
+        if (it->second.empty()) {
+            queues_.erase(it);
+            return;
+        }
+        std::function<void()> to_run = it->second.front();
+        to_run();
+    }
+
+private:
+    std::unordered_map<std::string, std::deque<std::function<void()>>> queues_;
+};
+
+inline std::string name_queue_key(const std::string& name) { return "N:" + name; }
+inline std::string id_queue_key(std::int64_t id) { return "I:" + std::to_string(id); }
+
 // Parses one request and either responds immediately (local cache hit, or a
 // malformed request) or hands `active_request` to `completions` -- to be
-// responded to once the async NATS operation it kicks off completes.
+// responded to once the async NATS operation it kicks off completes. Every
+// path goes through `key_queue` so operations on the same key never overlap
+// in flight -- see KeyOperationQueue above.
 //
 // Any exception here (malformed/truncated request -- see wire::Reader) is
 // caught and turned into an immediate Error response; the same hardening
-// server.cpp's handle_request_local() has, but active_request is always
-// still valid at that point since parsing (and any exception from it)
-// happens before active_request is ever moved into a deferred callback.
+// server.cpp's handle_request_local() has. Parsing (and any exception it can
+// throw) always happens before `active_request` is converted to a
+// KeyOperationQueue-compatible ActiveRequestPtr, so the catch block can
+// always respond with the still-intact `active_request` parameter directly.
 inline void dispatch_request(NameCache& name_cache, IdCache& id_cache, NatsBridge& nats, const std::string& name_bucket,
-                              const std::string& id_bucket, CompletionQueue& completions,
+                              const std::string& id_bucket, CompletionQueue& completions, KeyOperationQueue& key_queue,
                               ActiveRequestType active_request, const std::uint8_t* data, std::size_t size) {
     try {
         wire::Reader r(data, size);
@@ -115,54 +192,64 @@ inline void dispatch_request(NameCache& name_cache, IdCache& id_cache, NatsBridg
         if (op == wire::Op::Get) {
             if (kind == wire::KeyKind::Name) {
                 auto key = r.str();
-                if (auto it = name_cache.find<NameTag>(key); it != name_cache.end<NameTag>()) {
-                    std::cout << "[server] GET name=\"" << key << "\" -> local hit\n";
-                    respond(active_request, encode_found(it->record));
-                    return;
-                }
-                std::cout << "[server] GET name=\"" << key << "\" -> local miss, dispatched to NATS\n";
-                nats.get_async(name_bucket, key,
-                                [&completions, active_request = std::move(active_request),
-                                 key](NatsGetResult result) mutable {
-                                    ApplyFn apply = [key, result](NameCache& name_cache,
-                                                                   IdCache&) -> std::vector<std::uint8_t> {
-                                        if (result.result == NatsResult::Ok) {
-                                            name_cache.emplace(NameEntry{key, result.value});
-                                            return encode_found(result.value);
-                                        }
-                                        if (result.result == NatsResult::NotFound) {
-                                            return encode_status(wire::Status::NotFound);
-                                        }
-                                        return encode_status(wire::Status::Error);
-                                    };
-                                    completions.push(std::move(active_request), std::move(apply),
-                                                      "GET name=\"" + key + "\"");
-                                });
+                auto qkey = name_queue_key(key);
+                auto request = std::make_shared<ActiveRequestType>(std::move(active_request));
+                key_queue.enqueue(qkey, [&name_cache, &nats, &completions, &key_queue, name_bucket, request, key,
+                                          qkey]() mutable {
+                    if (auto it = name_cache.find<NameTag>(key); it != name_cache.end<NameTag>()) {
+                        std::cout << "[server] GET name=\"" << key << "\" -> local hit\n";
+                        respond(*request, encode_found(it->record));
+                        key_queue.complete(qkey);
+                        return;
+                    }
+                    std::cout << "[server] GET name=\"" << key << "\" -> local miss, dispatched to NATS\n";
+                    nats.get_async(name_bucket, key, [&completions, request, key, qkey](NatsGetResult result) mutable {
+                        ApplyFn apply = [key, result](NameCache& name_cache, IdCache&) -> std::vector<std::uint8_t> {
+                            if (result.result == NatsResult::Ok) {
+                                name_cache.emplace(NameEntry{key, result.value});
+                                return encode_found(result.value);
+                            }
+                            if (result.result == NatsResult::NotFound) {
+                                return encode_status(wire::Status::NotFound);
+                            }
+                            return encode_status(wire::Status::Error);
+                        };
+                        completions.push(std::move(request), std::move(apply), "GET name=\"" + key + "\"", qkey);
+                    });
+                });
                 return;
             }
 
             auto key = r.i64();
-            if (auto it = id_cache.find<IdTag>(key); it != id_cache.end<IdTag>()) {
-                std::cout << "[server] GET id=" << key << " -> local hit\n";
-                respond(active_request, encode_found(it->record));
-                return;
-            }
-            std::cout << "[server] GET id=" << key << " -> local miss, dispatched to NATS\n";
-            nats.get_async(
-                id_bucket, std::to_string(key),
-                [&completions, active_request = std::move(active_request), key](NatsGetResult result) mutable {
-                    ApplyFn apply = [key, result](NameCache&, IdCache& id_cache) -> std::vector<std::uint8_t> {
-                        if (result.result == NatsResult::Ok) {
-                            id_cache.emplace(IdEntry{key, result.value});
-                            return encode_found(result.value);
-                        }
-                        if (result.result == NatsResult::NotFound) {
-                            return encode_status(wire::Status::NotFound);
-                        }
-                        return encode_status(wire::Status::Error);
-                    };
-                    completions.push(std::move(active_request), std::move(apply), "GET id=" + std::to_string(key));
-                });
+            auto qkey = id_queue_key(key);
+            auto request = std::make_shared<ActiveRequestType>(std::move(active_request));
+            key_queue.enqueue(qkey,
+                               [&id_cache, &nats, &completions, &key_queue, id_bucket, request, key, qkey]() mutable {
+                                   if (auto it = id_cache.find<IdTag>(key); it != id_cache.end<IdTag>()) {
+                                       std::cout << "[server] GET id=" << key << " -> local hit\n";
+                                       respond(*request, encode_found(it->record));
+                                       key_queue.complete(qkey);
+                                       return;
+                                   }
+                                   std::cout << "[server] GET id=" << key << " -> local miss, dispatched to NATS\n";
+                                   nats.get_async(id_bucket, std::to_string(key),
+                                                  [&completions, request, key, qkey](NatsGetResult result) mutable {
+                                                      ApplyFn apply = [key, result](NameCache&,
+                                                                                     IdCache& id_cache)
+                                                          -> std::vector<std::uint8_t> {
+                                                          if (result.result == NatsResult::Ok) {
+                                                              id_cache.emplace(IdEntry{key, result.value});
+                                                              return encode_found(result.value);
+                                                          }
+                                                          if (result.result == NatsResult::NotFound) {
+                                                              return encode_status(wire::Status::NotFound);
+                                                          }
+                                                          return encode_status(wire::Status::Error);
+                                                      };
+                                                      completions.push(std::move(request), std::move(apply),
+                                                                        "GET id=" + std::to_string(key), qkey);
+                                                  });
+                               });
             return;
         }
 
@@ -170,80 +257,94 @@ inline void dispatch_request(NameCache& name_cache, IdCache& id_cache, NatsBridg
             if (kind == wire::KeyKind::Name) {
                 auto key = r.str();
                 auto record = r.bytes(r.u32());
-                std::cout << "[server] PUT name=\"" << key << "\" -> dispatched to NATS\n";
-                nats.put_async(name_bucket, key, record,
-                                [&completions, active_request = std::move(active_request), key,
-                                 record](bool ok, std::string /*err*/) mutable {
-                                    ApplyFn apply = [key, record, ok](NameCache& name_cache,
-                                                                       IdCache&) -> std::vector<std::uint8_t> {
-                                        if (!ok) {
-                                            return encode_status(wire::Status::Error);
-                                        }
-                                        name_cache.erase<NameTag>(key);
-                                        name_cache.emplace(NameEntry{key, record});
-                                        return encode_status(wire::Status::Ok);
-                                    };
-                                    completions.push(std::move(active_request), std::move(apply),
-                                                      "PUT name=\"" + key + "\"");
-                                });
+                auto qkey = name_queue_key(key);
+                auto request = std::make_shared<ActiveRequestType>(std::move(active_request));
+                key_queue.enqueue(qkey, [&nats, &completions, name_bucket, request, key, record, qkey]() mutable {
+                    std::cout << "[server] PUT name=\"" << key << "\" -> dispatched to NATS\n";
+                    nats.put_async(name_bucket, key, record,
+                                    [&completions, request, key, record, qkey](bool ok, std::string /*err*/) mutable {
+                                        ApplyFn apply = [key, record, ok](NameCache& name_cache,
+                                                                           IdCache&) -> std::vector<std::uint8_t> {
+                                            if (!ok) {
+                                                return encode_status(wire::Status::Error);
+                                            }
+                                            name_cache.erase<NameTag>(key);
+                                            name_cache.emplace(NameEntry{key, record});
+                                            return encode_status(wire::Status::Ok);
+                                        };
+                                        completions.push(std::move(request), std::move(apply),
+                                                          "PUT name=\"" + key + "\"", qkey);
+                                    });
+                });
                 return;
             }
 
             auto key = r.i64();
             auto record = r.bytes(r.u32());
-            std::cout << "[server] PUT id=" << key << " -> dispatched to NATS\n";
-            nats.put_async(id_bucket, std::to_string(key), record,
-                            [&completions, active_request = std::move(active_request), key,
-                             record](bool ok, std::string /*err*/) mutable {
-                                ApplyFn apply = [key, record, ok](NameCache&, IdCache& id_cache) -> std::vector<std::uint8_t> {
-                                    if (!ok) {
-                                        return encode_status(wire::Status::Error);
-                                    }
-                                    id_cache.erase<IdTag>(key);
-                                    id_cache.emplace(IdEntry{key, record});
-                                    return encode_status(wire::Status::Ok);
-                                };
-                                completions.push(std::move(active_request), std::move(apply),
-                                                  "PUT id=" + std::to_string(key));
-                            });
+            auto qkey = id_queue_key(key);
+            auto request = std::make_shared<ActiveRequestType>(std::move(active_request));
+            key_queue.enqueue(qkey, [&nats, &completions, id_bucket, request, key, record, qkey]() mutable {
+                std::cout << "[server] PUT id=" << key << " -> dispatched to NATS\n";
+                nats.put_async(id_bucket, std::to_string(key), record,
+                                [&completions, request, key, record, qkey](bool ok, std::string /*err*/) mutable {
+                                    ApplyFn apply = [key, record, ok](NameCache&,
+                                                                       IdCache& id_cache) -> std::vector<std::uint8_t> {
+                                        if (!ok) {
+                                            return encode_status(wire::Status::Error);
+                                        }
+                                        id_cache.erase<IdTag>(key);
+                                        id_cache.emplace(IdEntry{key, record});
+                                        return encode_status(wire::Status::Ok);
+                                    };
+                                    completions.push(std::move(request), std::move(apply),
+                                                      "PUT id=" + std::to_string(key), qkey);
+                                });
+            });
             return;
         }
 
         // Erase
         if (kind == wire::KeyKind::Name) {
             auto key = r.str();
-            std::cout << "[server] ERASE name=\"" << key << "\" -> dispatched to NATS\n";
-            nats.erase_async(name_bucket, key,
-                              [&completions, active_request = std::move(active_request),
-                               key](bool ok, std::string /*err*/) mutable {
-                                  ApplyFn apply = [key, ok](NameCache& name_cache,
-                                                             IdCache&) -> std::vector<std::uint8_t> {
-                                      if (!ok) {
-                                          return encode_status(wire::Status::Error);
-                                      }
-                                      name_cache.erase<NameTag>(key);
-                                      return encode_status(wire::Status::Ok);
-                                  };
-                                  completions.push(std::move(active_request), std::move(apply),
-                                                    "ERASE name=\"" + key + "\"");
-                              });
+            auto qkey = name_queue_key(key);
+            auto request = std::make_shared<ActiveRequestType>(std::move(active_request));
+            key_queue.enqueue(qkey, [&nats, &completions, name_bucket, request, key, qkey]() mutable {
+                std::cout << "[server] ERASE name=\"" << key << "\" -> dispatched to NATS\n";
+                nats.erase_async(name_bucket, key,
+                                  [&completions, request, key, qkey](bool ok, std::string /*err*/) mutable {
+                                      ApplyFn apply = [key, ok](NameCache& name_cache,
+                                                                 IdCache&) -> std::vector<std::uint8_t> {
+                                          if (!ok) {
+                                              return encode_status(wire::Status::Error);
+                                          }
+                                          name_cache.erase<NameTag>(key);
+                                          return encode_status(wire::Status::Ok);
+                                      };
+                                      completions.push(std::move(request), std::move(apply),
+                                                        "ERASE name=\"" + key + "\"", qkey);
+                                  });
+            });
             return;
         }
 
         auto key = r.i64();
-        std::cout << "[server] ERASE id=" << key << " -> dispatched to NATS\n";
-        nats.erase_async(
-            id_bucket, std::to_string(key),
-            [&completions, active_request = std::move(active_request), key](bool ok, std::string /*err*/) mutable {
-                ApplyFn apply = [key, ok](NameCache&, IdCache& id_cache) -> std::vector<std::uint8_t> {
-                    if (!ok) {
-                        return encode_status(wire::Status::Error);
-                    }
-                    id_cache.erase<IdTag>(key);
-                    return encode_status(wire::Status::Ok);
-                };
-                completions.push(std::move(active_request), std::move(apply), "ERASE id=" + std::to_string(key));
-            });
+        auto qkey = id_queue_key(key);
+        auto request = std::make_shared<ActiveRequestType>(std::move(active_request));
+        key_queue.enqueue(qkey, [&nats, &completions, id_bucket, request, key, qkey]() mutable {
+            std::cout << "[server] ERASE id=" << key << " -> dispatched to NATS\n";
+            nats.erase_async(id_bucket, std::to_string(key),
+                              [&completions, request, key, qkey](bool ok, std::string /*err*/) mutable {
+                                  ApplyFn apply = [key, ok](NameCache&, IdCache& id_cache) -> std::vector<std::uint8_t> {
+                                      if (!ok) {
+                                          return encode_status(wire::Status::Error);
+                                      }
+                                      id_cache.erase<IdTag>(key);
+                                      return encode_status(wire::Status::Ok);
+                                  };
+                                  completions.push(std::move(request), std::move(apply),
+                                                    "ERASE id=" + std::to_string(key), qkey);
+                              });
+        });
     } catch (const std::exception&) {
         respond(active_request, encode_status(wire::Status::Error));
     } catch (...) {

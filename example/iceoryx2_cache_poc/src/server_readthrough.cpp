@@ -80,6 +80,7 @@ int main(int argc, char** argv) {
     poc::NameCache name_cache(capacity);
     poc::IdCache id_cache(capacity);
     poc::CompletionQueue completions;
+    poc::KeyOperationQueue key_queue;
 
     auto node = NodeBuilder().create<ServiceType::Ipc>().value();
 
@@ -109,7 +110,12 @@ int main(int argc, char** argv) {
                           : status == poc::wire::Status::NotFound ? "not found (local miss, NATS miss)"
                                                                     : "error (NATS)")
                       << "\n";
-            poc::respond(completion.active_request, response_bytes);
+            poc::respond(*completion.active_request, response_bytes);
+            // Releases the per-key slot so the next queued operation (if
+            // any) for the same key -- e.g. a GET that arrived while this
+            // PUT was still in flight -- only starts now, after this
+            // completion's cache mutation and response are both done.
+            key_queue.complete(completion.queue_key);
         }
 
         while (true) {
@@ -121,7 +127,7 @@ int main(int argc, char** argv) {
             const auto& payload = active_request_opt->payload();
             std::vector<std::uint8_t> request_bytes(payload.data(), payload.data() + payload.number_of_bytes());
 
-            poc::dispatch_request(name_cache, id_cache, nats, name_bucket, id_bucket, completions,
+            poc::dispatch_request(name_cache, id_cache, nats, name_bucket, id_bucket, completions, key_queue,
                                    std::move(active_request_opt.value()), request_bytes.data(), request_bytes.size());
         }
     }
