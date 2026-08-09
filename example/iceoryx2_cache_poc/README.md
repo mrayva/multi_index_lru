@@ -41,9 +41,13 @@ C++20 compiler (see "Unit tests" below).
   carrying **get / put / erase**, each naming which cache to hit.
 - `client.cpp` runs a demo script exercising all three operations against
   both caches (see below), or a single manual command when given arguments.
-- `server_readthrough.cpp` / `nats_bridge.hpp` / `client_readthrough.cpp`:
-  the same wire protocol and caches, but backed by NATS JetStream KV — see
-  "Read-through / write-through over NATS" below.
+- `server_readthrough.cpp` / `server_dispatch.hpp` / `nats_bridge.hpp` /
+  `client_readthrough.cpp`: the same wire protocol and caches, but backed by
+  NATS JetStream KV — see "Read-through / write-through over NATS" below.
+  `server_dispatch.hpp` holds the actual non-blocking request-dispatch logic
+  (`dispatch_request()`, `CompletionQueue`) so it's includable from
+  `test/dispatch_request_test.cpp`, not just `server_readthrough.cpp`'s
+  `main()`.
 
 Everything else — LRU eviction, TTL, composite keys, node pooling — still
 lives entirely in `multi_index_lru::Container` on the server side; iceoryx2
@@ -161,8 +165,14 @@ communicating only via iceoryx2 shared memory) to produce the output above.
 
 ## Unit tests
 
-Two `ctest`-integrated GoogleTest suites cover the parts of this POC that
-don't need iceoryx2, NATS, or a second process to exercise:
+Four `ctest`-integrated GoogleTest suites in total: two dependency-free, and
+two integration suites for the NATS-backed path that need a real local NATS
+server (there's no fake for `nats_asio::iconnection`, and no way to construct
+a standalone/fake iceoryx2 `ActiveRequest` -- it can only come from a real
+`Server` that actually received a `RequestMut` over real IPC).
+
+The two dependency-free suites don't need iceoryx2, NATS, or a second
+process to exercise:
 
 - `test/wire_test.cpp` covers the `wire::Writer`/`wire::Reader` binary
   protocol in isolation: byte-level encoding of each primitive, round-trips
@@ -217,6 +227,44 @@ cmake --build build-poc
 ctest --test-dir build-poc --output-on-failure
 ```
 
+### Integration tests (require a real NATS server)
+
+Built only when `POC_ENABLE_NATS_READTHROUGH=ON` (see "Read-through /
+write-through over NATS" below for the full setup, including `nats_asio`
+itself); not part of the `poc-unit-tests` CI job for that reason.
+
+- `test/nats_bridge_test.cpp` exercises `NatsBridge` directly against the
+  `mil_bridge_test` bucket: blocking and async get/put/erase, overwrite,
+  binary-safe values, a nonexistent-bucket error (distinct from a
+  genuine key miss), several `get_async` calls fired without waiting between
+  them all completing correctly (the actual point of the async API), and the
+  constructor throwing on a real connection failure (an unreachable port).
+
+- `test/dispatch_request_test.cpp` exercises `dispatch_request()`
+  (`server_dispatch.hpp`, the logic `server_readthrough.cpp` runs in its
+  main loop) end to end: a real iceoryx2 `Client`/`Server` pair created
+  within the test process on a dedicated service name (`.../
+  dispatch_request_test`, distinct from `poc::kServiceName` so it can't
+  collide with a running demo daemon), driving `dispatch_request()` exactly
+  as `server_readthrough.cpp`'s `main()` does. Covers: a local hit never
+  touching `CompletionQueue`; a local miss reading through NATS and
+  populating the cache; `Put`/`Erase` write-through, confirmed against NATS
+  directly (not just the local cache); a malformed request responding with
+  `Status::Error` within a single pump (not deferred); and -- the one that
+  actually pins down the concurrency-model claim -- an in-flight NATS-bound
+  miss provably not blocking a concurrent local hit, by pumping the server
+  exactly once after dispatching the miss and asserting it has *no* response
+  yet, then completing an unrelated request in full before letting the miss
+  finish.
+
+```bash
+cmake -S example/iceoryx2_cache_poc -B build-poc \
+      -DPOC_ENABLE_NATS_READTHROUGH=ON \
+      -DCMAKE_PREFIX_PATH="/path/to/iceoryx2/install;/path/to/nats_asio/install;/path/to/nats_asio/build/vcpkg_installed/x64-linux"
+cmake --build build-poc
+ctest --test-dir build-poc --output-on-failure
+```
+
 ## Read-through / write-through over NATS
 
 `server_readthrough.cpp` speaks the identical wire protocol as `server.cpp`
@@ -248,11 +296,15 @@ Each of the two caches gets its own NATS KV bucket:
    ```
    (default client port 4222; `-m 8222` is just the HTTP monitoring port).
 
-2. **The two KV buckets, created once** (`nats_asio` has no bucket-creation
-   call — it assumes the backing JetStream stream already exists):
+2. **The KV buckets, created once** (`nats_asio` has no bucket-creation call
+   — it assumes the backing JetStream stream already exists). `mil_by_name`
+   / `mil_by_id` are what the servers use; `mil_bridge_test` is a third,
+   separate bucket the `nats_bridge_test`/`dispatch_request_test` suites use
+   so they never collide with a running demo daemon's data:
    ```bash
    nats --server localhost:4222 kv add mil_by_name
    nats --server localhost:4222 kv add mil_by_id
+   nats --server localhost:4222 kv add mil_bridge_test
    ```
 
 3. **A built `nats_asio`.** This POC was built and tested against

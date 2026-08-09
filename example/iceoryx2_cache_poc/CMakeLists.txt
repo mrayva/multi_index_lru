@@ -104,4 +104,27 @@ if(POC_BUILD_TESTS)
     include(GoogleTest)
     gtest_discover_tests(cache_poc_wire_test)
     gtest_discover_tests(cache_poc_handle_request_local_test)
+
+    # nats_bridge_test.cpp and dispatch_request_test.cpp are integration
+    # tests against a real local NATS server (there's no fake for
+    # nats_asio::iconnection, and no way to construct a standalone iceoryx2
+    # ActiveRequest) -- see their file comments for the one-time `nats kv
+    # add` setup they need. Built only when POC_ENABLE_NATS_READTHROUGH
+    # already pulled in nats_asio; not part of the dependency-free
+    # poc-unit-tests CI job for that reason.
+    if(POC_ENABLE_NATS_READTHROUGH)
+        add_executable(cache_poc_nats_bridge_test test/nats_bridge_test.cpp)
+        target_link_libraries(cache_poc_nats_bridge_test
+            PRIVATE multi_index_lru_headers nats_asio::nats_asio Threads::Threads GTest::gtest GTest::gtest_main
+        )
+
+        add_executable(cache_poc_dispatch_request_test test/dispatch_request_test.cpp)
+        target_link_libraries(cache_poc_dispatch_request_test
+            PRIVATE multi_index_lru_headers iceoryx2-cxx::static-lib-cxx nats_asio::nats_asio Threads::Threads
+                    GTest::gtest GTest::gtest_main
+        )
+
+        gtest_discover_tests(cache_poc_nats_bridge_test)
+        gtest_discover_tests(cache_poc_dispatch_request_test)
+    endif()
 endif()
