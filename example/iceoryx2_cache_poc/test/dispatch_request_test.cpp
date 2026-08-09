@@ -52,6 +52,19 @@ protected:
     static void SetUpTestSuite() {
         nats_ = std::make_unique<NatsBridge>("127.0.0.1", 4222);
 
+        // Cross-daemon coherence: watch both buckets for the whole test
+        // suite's lifetime, same as server_readthrough.cpp's main() does at
+        // startup. Every test's pump_server() drains and applies whatever
+        // showed up, so this doubles as a regression check that a daemon's
+        // own writes (across all the other tests in this file) never
+        // spuriously self-invalidate -- see OwnWriteDoesNotSelfInvalidate
+        // below for the direct version of that check.
+        auto on_kv_change = [](const nats_asio::kv_entry& entry) {
+            invalidations_.push(entry.bucket == kNameBucket, entry.key, entry.revision);
+        };
+        nats_->watch(kNameBucket, on_kv_change);
+        nats_->watch(kIdBucket, on_kv_change);
+
         node_.emplace(iox2::NodeBuilder().create<iox2::ServiceType::Ipc>().value());
 
         auto service = node_->service_builder(iox2::ServiceName::create(kTestServiceName).value())
@@ -84,13 +97,18 @@ protected:
     }
 
     // One iteration of what server_readthrough.cpp's main loop does: drain
-    // completions, then dispatch every currently-pending new request.
+    // completions, apply any pending kv_watch invalidations, then dispatch
+    // every currently-pending new request.
     void pump_server() {
         for (auto& completion : completions_.drain()) {
             auto response_bytes = completion.apply(*name_cache_, *id_cache_);
             respond(*completion.active_request, response_bytes);
+            if (completion.has_revision) {
+                revisions_.observe(completion.queue_key, completion.revision);
+            }
             key_queue_.complete(completion.queue_key);
         }
+        apply_pending_invalidations(*name_cache_, *id_cache_, revisions_, invalidations_);
         while (true) {
             auto active_request_opt = server_->receive().value();
             if (!active_request_opt.has_value()) {
@@ -140,12 +158,22 @@ protected:
     std::optional<IdCache> id_cache_;
     CompletionQueue completions_;
     KeyOperationQueue key_queue_;
+    // Per-test, unlike invalidations_ -- each test's caches are freshly
+    // reset in SetUp(), so there's nothing to gain from remembering
+    // revisions across tests, and keeping it per-test avoids one test's
+    // recorded revision suppressing another test's genuinely-new event.
+    RevisionTracker revisions_;
+
+    // Static: populated by the single watch subscription set up once in
+    // SetUpTestSuite(), which outlives every individual test.
+    static InvalidationQueue invalidations_;
 };
 
 std::unique_ptr<NatsBridge> DispatchRequestTest::nats_;
 std::optional<NodeType> DispatchRequestTest::node_;
 std::optional<ServerType> DispatchRequestTest::server_;
 std::optional<ClientType> DispatchRequestTest::client_;
+InvalidationQueue DispatchRequestTest::invalidations_;
 
 TEST_F(DispatchRequestTest, LocalHitRespondsWithoutTouchingNats) {
     name_cache_->emplace(NameEntry{"alice", bytes("A")});
@@ -333,6 +361,68 @@ TEST_F(DispatchRequestTest, ConcurrentGetMissesOnSameKeyCoalesceInsteadOfDuplica
     EXPECT_EQ(str(r2.remaining()), "herd-value");
 
     nats_->erase(kNameBucket, "herd_key");
+}
+
+// --- Cross-daemon coherence: kv_watch-driven invalidation -----------------
+
+TEST_F(DispatchRequestTest, ExternalWriteInvalidatesLocalCacheEntry) {
+    nats_->erase(kNameBucket, "watch_external_test");
+
+    // Read the key through once, exactly like a real client would, so it's
+    // cached here the normal way (and revisions_ learns its revision from
+    // that GET's completion, same as production).
+    ASSERT_TRUE(nats_->put(kNameBucket, "watch_external_test", bytes("v1")).first);
+    auto v1_bytes = round_trip(encode_get(wire::KeyKind::Name, "watch_external_test", 0));
+    wire::Reader v1_r(v1_bytes.data(), v1_bytes.size());
+    ASSERT_EQ(static_cast<wire::Status>(v1_r.u8()), wire::Status::Ok);
+    ASSERT_NE(name_cache_->find<NameTag>("watch_external_test"), name_cache_->end<NameTag>());
+
+    // Simulate a write from another process: goes straight to NATS, bypassing
+    // dispatch_request()/KeyOperationQueue entirely, so revisions_ here has
+    // no idea it happened until the watch event arrives.
+    ASSERT_TRUE(nats_->put(kNameBucket, "watch_external_test", bytes("v2-from-elsewhere")).first);
+
+    // Poll until the watch event lands and evicts the now-stale entry.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (std::chrono::steady_clock::now() < deadline &&
+           name_cache_->find<NameTag>("watch_external_test") != name_cache_->end<NameTag>()) {
+        pump_server();
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    EXPECT_EQ(name_cache_->find<NameTag>("watch_external_test"), name_cache_->end<NameTag>())
+        << "external write should have evicted the stale local entry via kv_watch";
+
+    // And the next GET reads the fresh value through from NATS.
+    auto v2_bytes = round_trip(encode_get(wire::KeyKind::Name, "watch_external_test", 0));
+    wire::Reader v2_r(v2_bytes.data(), v2_bytes.size());
+    ASSERT_EQ(static_cast<wire::Status>(v2_r.u8()), wire::Status::Ok);
+    EXPECT_EQ(str(v2_r.remaining()), "v2-from-elsewhere");
+
+    nats_->erase(kNameBucket, "watch_external_test");
+}
+
+TEST_F(DispatchRequestTest, OwnWriteDoesNotSelfInvalidate) {
+    nats_->erase(kIdBucket, "777");
+
+    auto response_bytes = round_trip(encode_put(wire::KeyKind::Id, "", 777, bytes("self-write-value")));
+    wire::Reader r(response_bytes.data(), response_bytes.size());
+    ASSERT_EQ(static_cast<wire::Status>(r.u8()), wire::Status::Ok);
+    ASSERT_NE(id_cache_->find<IdTag>(777), id_cache_->end<IdTag>());
+
+    // Keep pumping for long enough that the watch echo of this exact write
+    // would have arrived and been applied if RevisionTracker didn't
+    // recognize it as already-known -- the entry must survive.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(1500);
+    while (std::chrono::steady_clock::now() < deadline) {
+        pump_server();
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    auto it = id_cache_->find<IdTag>(777);
+    ASSERT_NE(it, id_cache_->end<IdTag>()) << "own write should not have been evicted by its own watch echo";
+    EXPECT_EQ(str(it->record), "self-write-value");
+
+    nats_->erase(kIdBucket, "777");
 }
 
 }  // namespace

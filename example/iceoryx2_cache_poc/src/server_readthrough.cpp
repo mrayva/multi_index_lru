@@ -27,6 +27,15 @@
 /// "the concurrency model" in README.md for how this differs from (and
 /// improves on) the single-threaded blocking-bridge design this replaced.
 ///
+/// Cross-daemon coherence: this daemon also subscribes (via NatsBridge::watch())
+/// to every key change in both buckets. When another process -- another
+/// daemon instance, a raw `nats kv put`, anything -- writes a key this
+/// daemon has cached, the watch event invalidates the local entry so the
+/// next GET for it reads the fresh value through from NATS. RevisionTracker
+/// (server_dispatch.hpp) recognizes and skips watch echoes of this daemon's
+/// own writes, so a PUT here doesn't immediately evict the value it just
+/// wrote.
+///
 /// The actual request-dispatch logic lives in server_dispatch.hpp, pulled
 /// out of this file so test/dispatch_request_test.cpp can drive it directly.
 ///
@@ -73,14 +82,36 @@ int main(int argc, char** argv) {
     const auto cb_open_duration =
         poc::config::resolve_millis(args, "--cb-open-duration-ms", "MIL_CB_OPEN_DURATION_MS", 2000);
 
-    std::cout << "[server] connecting to NATS at " << nats_host << ":" << nats_port << " ...\n";
-    poc::NatsBridge nats(nats_host, nats_port, nats_timeout, cb_failure_threshold, cb_open_duration);
-    std::cout << "[server] connected to NATS\n";
-
+    // Declared before `nats` on purpose: local variables are destroyed in
+    // reverse declaration order, and NatsBridge's own coroutines (get_async/
+    // put_async/erase_async/watch callbacks) capture references to some of
+    // these. `nats` must be the *last* of this group to be destroyed --
+    // hence declared last -- so its destructor (which stops and joins the
+    // NATS thread) always runs before anything it might still be using is
+    // torn down, even if a NATS operation is still in flight when main()'s
+    // loop exits (e.g. on SIGTERM).
     poc::NameCache name_cache(capacity);
     poc::IdCache id_cache(capacity);
     poc::CompletionQueue completions;
     poc::KeyOperationQueue key_queue;
+    poc::RevisionTracker revisions;
+    poc::InvalidationQueue invalidations;
+
+    std::cout << "[server] connecting to NATS at " << nats_host << ":" << nats_port << " ...\n";
+    poc::NatsBridge nats(nats_host, nats_port, nats_timeout, cb_failure_threshold, cb_open_duration);
+    std::cout << "[server] connected to NATS\n";
+
+    // Cross-daemon coherence: watch every key in both buckets. `entry.bucket`
+    // tells the shared callback which cache the change applies to. Runs on
+    // the NATS thread -- just hands off to InvalidationQueue, no cache or
+    // iceoryx2 access here.
+    auto on_kv_change = [&invalidations, name_bucket](const nats_asio::kv_entry& entry) {
+        invalidations.push(entry.bucket == name_bucket, entry.key, entry.revision);
+    };
+    nats.watch(name_bucket, on_kv_change);
+    nats.watch(id_bucket, on_kv_change);
+    std::cout << "[server] watching buckets \"" << name_bucket << "\" / \"" << id_bucket
+              << "\" for external changes\n";
 
     auto node = NodeBuilder().create<ServiceType::Ipc>().value();
 
@@ -111,12 +142,19 @@ int main(int argc, char** argv) {
                                                                     : "error (NATS)")
                       << "\n";
             poc::respond(*completion.active_request, response_bytes);
+            if (completion.has_revision) {
+                // So the watch echo of this exact write/read doesn't also
+                // trigger a redundant invalidation -- see RevisionTracker.
+                revisions.observe(completion.queue_key, completion.revision);
+            }
             // Releases the per-key slot so the next queued operation (if
             // any) for the same key -- e.g. a GET that arrived while this
             // PUT was still in flight -- only starts now, after this
             // completion's cache mutation and response are both done.
             key_queue.complete(completion.queue_key);
         }
+
+        poc::apply_pending_invalidations(name_cache, id_cache, revisions, invalidations);
 
         while (true) {
             auto active_request_opt = server.receive().value();

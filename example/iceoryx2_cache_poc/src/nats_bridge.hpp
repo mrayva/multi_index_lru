@@ -33,6 +33,11 @@
 /// as a probe: success closes the circuit, failure reopens it. A NotFound
 /// is a real answer from a healthy NATS, not a failure, and doesn't count
 /// against the breaker.
+///
+/// `watch()` subscribes to every key change in a bucket (cross-daemon
+/// coherence: see server_dispatch.hpp's InvalidationQueue/RevisionTracker
+/// for how server_readthrough.cpp uses this to invalidate local cache
+/// entries when another process writes the same NATS bucket).
 #pragma once
 
 #include <nats_asio/nats_asio.hpp>
@@ -62,6 +67,7 @@ enum class NatsResult { Ok, NotFound, Error };
 struct NatsGetResult {
     NatsResult result = NatsResult::Error;
     std::vector<std::uint8_t> value;  // valid iff result == Ok
+    std::uint64_t revision = 0;       // valid iff result == Ok; NATS KV revision (sequence) for this key
     std::string error;                // valid iff result == Error
 };
 
@@ -111,7 +117,10 @@ public:
     template <typename Callback>
     void get_async(const std::string& bucket, const std::string& key, Callback on_done) {
         if (is_circuit_open()) {
-            on_done(NatsGetResult{NatsResult::Error, {}, "circuit breaker open: NATS considered unavailable"});
+            NatsGetResult result;
+            result.result = NatsResult::Error;
+            result.error = "circuit breaker open: NATS considered unavailable";
+            on_done(std::move(result));
             return;
         }
 
@@ -125,37 +134,52 @@ public:
         asio::co_spawn(
             ioc_,
             [this, conn, bucket, key, timeout, on_done = std::move(on_done)]() mutable -> asio::awaitable<void> {
+                // Fields left at their NatsGetResult defaults are simply
+                // unused for that branch (documented per-field above) --
+                // set explicitly by name rather than positionally, since a
+                // 3-value aggregate-init silently shifts which field a
+                // literal lands in whenever NatsGetResult gains a member.
+                NatsGetResult result;
                 try {
                     auto [entry, status] = co_await conn->kv_get(bucket, key, timeout);
                     if (status.ok()) {
                         record_success();
-                        on_done(NatsGetResult{
-                            NatsResult::Ok, std::vector<std::uint8_t>(entry.value.begin(), entry.value.end()), {}});
+                        result.result = NatsResult::Ok;
+                        result.value.assign(entry.value.begin(), entry.value.end());
+                        result.revision = entry.revision;
                     } else if (status.code() == nats_asio::error_code::key_not_found) {
                         record_success();
-                        on_done(NatsGetResult{NatsResult::NotFound, {}, {}});
+                        result.result = NatsResult::NotFound;
                     } else {
                         record_failure();
-                        on_done(NatsGetResult{NatsResult::Error, {}, status.error()});
+                        result.result = NatsResult::Error;
+                        result.error = status.error();
                     }
                 } catch (const std::exception& e) {
                     record_failure();
-                    on_done(NatsGetResult{NatsResult::Error, {}, std::string("exception: ") + e.what()});
+                    result.result = NatsResult::Error;
+                    result.error = std::string("exception: ") + e.what();
                 } catch (...) {
                     record_failure();
-                    on_done(NatsGetResult{NatsResult::Error, {}, "unknown exception"});
+                    result.result = NatsResult::Error;
+                    result.error = "unknown exception";
                 }
+                on_done(std::move(result));
                 co_return;
             },
             asio::detached);
     }
 
-    // on_done: void(bool ok, std::string error)
+    // on_done: void(bool ok, std::uint64_t revision, std::string error)
+    // `revision` (valid iff ok) is the NATS KV revision this write produced --
+    // used by server_dispatch.hpp's RevisionTracker to recognize the daemon's
+    // own writes echoed back through its own kv_watch subscription, so it
+    // doesn't needlessly invalidate the entry it just wrote.
     template <typename Callback>
     void put_async(const std::string& bucket, const std::string& key, std::vector<std::uint8_t> value,
                     Callback on_done) {
         if (is_circuit_open()) {
-            on_done(false, "circuit breaker open: NATS considered unavailable");
+            on_done(false, 0, "circuit breaker open: NATS considered unavailable");
             return;
         }
 
@@ -168,19 +192,18 @@ public:
                 try {
                     std::span<const char> span(reinterpret_cast<const char*>(value.data()), value.size());
                     auto [revision, status] = co_await conn->kv_put(bucket, key, span, timeout);
-                    (void)revision;
                     if (status.ok()) {
                         record_success();
                     } else {
                         record_failure();
                     }
-                    on_done(status.ok(), status.ok() ? std::string{} : status.error());
+                    on_done(status.ok(), revision, status.ok() ? std::string{} : status.error());
                 } catch (const std::exception& e) {
                     record_failure();
-                    on_done(false, std::string("exception: ") + e.what());
+                    on_done(false, 0, std::string("exception: ") + e.what());
                 } catch (...) {
                     record_failure();
-                    on_done(false, "unknown exception");
+                    on_done(false, 0, "unknown exception");
                 }
                 co_return;
             },
@@ -231,13 +254,17 @@ public:
         return fut.get();
     }
 
-    // Returns {ok, error message (empty if ok)}.
+    // Returns {ok, error message (empty if ok)}. Discards the revision
+    // put_async()'s callback carries -- callers who need it (server_dispatch.hpp)
+    // use put_async() directly; the blocking callers of this wrapper
+    // (client_readthrough.cpp, most nats_bridge_test.cpp cases) don't.
     std::pair<bool, std::string> put(const std::string& bucket, const std::string& key,
                                       const std::vector<std::uint8_t>& value) {
         auto prom = std::make_shared<std::promise<std::pair<bool, std::string>>>();
         auto fut = prom->get_future();
-        put_async(bucket, key, value,
-                  [prom](bool ok, std::string err) { prom->set_value({ok, std::move(err)}); });
+        put_async(bucket, key, value, [prom](bool ok, std::uint64_t /*revision*/, std::string err) {
+            prom->set_value({ok, std::move(err)});
+        });
         return fut.get();
     }
 
@@ -247,6 +274,49 @@ public:
         auto fut = prom->get_future();
         erase_async(bucket, key, [prom](bool ok, std::string err) { prom->set_value({ok, std::move(err)}); });
         return fut.get();
+    }
+
+    // --- cross-daemon coherence: watch every key change in a bucket --------
+
+    // Subscribes to every key change (put/delete/purge) in `bucket` for the
+    // lifetime of this NatsBridge; `on_entry` runs on the NATS thread once
+    // per change event -- callers must not touch a multi_index_lru::Container
+    // from inside it directly, same rule as get_async()/put_async()/
+    // erase_async()'s on_done. Note: NATS delivers the *current* value of
+    // every existing key in the bucket immediately upon subscribing (not
+    // just future changes), so expect a burst of events right after this
+    // call returns.
+    //
+    // Meant to be called once per bucket during daemon startup, not per
+    // request -- blocks until the underlying subscription is confirmed
+    // established, or throws if it couldn't be.
+    template <typename Callback>
+    void watch(const std::string& bucket, Callback on_entry) {
+        auto conn = conn_;
+        auto prom = std::make_shared<std::promise<bool>>();
+        auto fut = prom->get_future();
+
+        asio::co_spawn(
+            ioc_,
+            [this, conn, bucket, on_entry = std::move(on_entry), prom]() mutable -> asio::awaitable<void> {
+                auto [watcher, status] = co_await conn->kv_watch(
+                    bucket,
+                    [on_entry](const nats_asio::kv_entry& entry) -> asio::awaitable<void> {
+                        on_entry(entry);
+                        co_return;
+                    },
+                    "");  // empty key = watch every key in the bucket
+                if (status.ok()) {
+                    watchers_.push_back(std::move(watcher));
+                }
+                prom->set_value(status.ok());
+                co_return;
+            },
+            asio::detached);
+
+        if (!fut.get()) {
+            throw std::runtime_error("NatsBridge: failed to start watch on bucket " + bucket);
+        }
     }
 
     // --- circuit breaker introspection (mainly for tests) -------------------
@@ -281,6 +351,9 @@ private:
     nats_asio::iconnection_sptr conn_;
     std::atomic<int> consecutive_failures_{0};
     std::atomic<std::chrono::steady_clock::time_point> circuit_opened_at_{std::chrono::steady_clock::time_point::min()};
+    // Keeps each watch() subscription alive; only ever touched from the NATS
+    // thread (inside watch()'s own coroutine, at subscription-setup time).
+    std::vector<nats_asio::ikv_watcher_sptr> watchers_;
 };
 
 }  // namespace poc

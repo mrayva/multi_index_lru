@@ -61,7 +61,9 @@ struct PendingCompletion {
     std::string description;  // for logging only, e.g. "GET name=\"alice\"" -- built on whichever
                                // thread calls push(), but only ever printed on the main thread's
                                // drain loop, so it doesn't need to touch std::cout itself.
-    std::string queue_key;    // KeyOperationQueue key this completion must release when applied.
+    std::string queue_key;     // KeyOperationQueue key this completion must release when applied.
+    std::uint64_t revision = 0;  // valid iff has_revision -- see RevisionTracker
+    bool has_revision = false;   // true for a successful GET-populate or PUT; false for Erase or a failed op
 };
 
 // Shared between the main iceoryx2 thread and NatsBridge's background NATS
@@ -73,10 +75,11 @@ struct PendingCompletion {
 // one thread.
 class CompletionQueue {
 public:
-    void push(ActiveRequestPtr active_request, ApplyFn apply, std::string description, std::string queue_key) {
+    void push(ActiveRequestPtr active_request, ApplyFn apply, std::string description, std::string queue_key,
+              std::uint64_t revision = 0, bool has_revision = false) {
         std::lock_guard<std::mutex> lock(mutex_);
         items_.push_back(PendingCompletion{std::move(active_request), std::move(apply), std::move(description),
-                                            std::move(queue_key)});
+                                            std::move(queue_key), revision, has_revision});
     }
 
     std::vector<PendingCompletion> drain() {
@@ -169,6 +172,108 @@ private:
 inline std::string name_queue_key(const std::string& name) { return "N:" + name; }
 inline std::string id_queue_key(std::int64_t id) { return "I:" + std::to_string(id); }
 
+// Cross-daemon coherence, part 1: tracks the highest NATS KV revision this
+// daemon already knows about for each key. Used two ways:
+//   - After applying a value from our own GET-populate or PUT completion,
+//     observe() records that revision.
+//   - When a kv_watch event arrives (server_dispatch.hpp's InvalidationQueue
+//     below), observe() reports whether that revision is genuinely new
+//     information. If it isn't -- because it's an echo of a write this same
+//     daemon just made, arriving back through its own watch subscription --
+//     the caller skips invalidating, avoiding the pointless
+//     evict-then-immediately-refetch "flicker" a daemon would otherwise
+//     inflict on every one of its own writes.
+//
+// Only ever touched from the main iceoryx2 thread (dispatch_request()'s
+// apply closures and the invalidation-drain loop in server_readthrough.cpp's
+// main()), so no locking is needed here.
+class RevisionTracker {
+public:
+    // Returns true if `revision` is new information -- greater than whatever
+    // was already recorded for `key` (or nothing was recorded yet) -- and
+    // updates the record to `revision` either way (so a later duplicate
+    // report of the same revision, from any source, is also recognized as
+    // already-known).
+    bool observe(const std::string& key, std::uint64_t revision) {
+        auto [it, inserted] = known_.try_emplace(key, revision);
+        if (inserted) {
+            return true;
+        }
+        if (revision > it->second) {
+            it->second = revision;
+            return true;
+        }
+        return false;
+    }
+
+private:
+    std::unordered_map<std::string, std::uint64_t> known_;
+};
+
+// Cross-daemon coherence, part 2: a NATS kv_watch change event, in the form
+// the main thread needs to act on it (see apply_pending_invalidations()
+// below). Built on the NATS thread (inside NatsBridge::watch()'s callback,
+// wired up in server_readthrough.cpp's main()); only ever applied on the
+// main thread.
+struct PendingInvalidation {
+    bool is_name_cache;  // true -> NameCache, false -> IdCache
+    std::string key;     // NameCache key verbatim, or IdCache key as its decimal string form
+    std::uint64_t revision;
+};
+
+// Thread-safe hand-off for PendingInvalidation, same shape as CompletionQueue.
+class InvalidationQueue {
+public:
+    void push(bool is_name_cache, std::string key, std::uint64_t revision) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        items_.push_back(PendingInvalidation{is_name_cache, std::move(key), revision});
+    }
+
+    std::vector<PendingInvalidation> drain() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        std::vector<PendingInvalidation> out;
+        out.reserve(items_.size());
+        for (auto& item : items_) {
+            out.push_back(std::move(item));
+        }
+        items_.clear();
+        return out;
+    }
+
+private:
+    std::mutex mutex_;
+    std::deque<PendingInvalidation> items_;
+};
+
+// Applies every currently-queued invalidation: for each one that's genuinely
+// new information (per `revisions`, not an echo of this daemon's own recent
+// write), erases the corresponding entry from the local cache so the next
+// GET for that key is a real miss and reads the fresh value through from
+// NATS. Meant to be called once per server_readthrough.cpp main-loop
+// iteration, alongside draining CompletionQueue.
+inline void apply_pending_invalidations(NameCache& name_cache, IdCache& id_cache, RevisionTracker& revisions,
+                                         InvalidationQueue& invalidations) {
+    for (auto& invalidation : invalidations.drain()) {
+        const auto qkey = invalidation.is_name_cache ? name_queue_key(invalidation.key)
+                                                       : id_queue_key(std::stoll(invalidation.key));
+        if (!revisions.observe(qkey, invalidation.revision)) {
+            continue;  // echo of our own recent write (or an already-processed event) -- nothing to do
+        }
+        if (invalidation.is_name_cache) {
+            if (name_cache.erase<NameTag>(invalidation.key)) {
+                std::cout << "[server] invalidated name=\"" << invalidation.key
+                          << "\" (external write, revision " << invalidation.revision << ")\n";
+            }
+        } else {
+            const auto id = std::stoll(invalidation.key);
+            if (id_cache.erase<IdTag>(id)) {
+                std::cout << "[server] invalidated id=" << id << " (external write, revision "
+                          << invalidation.revision << ")\n";
+            }
+        }
+    }
+}
+
 // Parses one request and either responds immediately (local cache hit, or a
 // malformed request) or hands `active_request` to `completions` -- to be
 // responded to once the async NATS operation it kicks off completes. Every
@@ -214,7 +319,9 @@ inline void dispatch_request(NameCache& name_cache, IdCache& id_cache, NatsBridg
                             }
                             return encode_status(wire::Status::Error);
                         };
-                        completions.push(std::move(request), std::move(apply), "GET name=\"" + key + "\"", qkey);
+                        completions.push(std::move(request), std::move(apply), "GET name=\"" + key + "\"", qkey,
+                                          result.result == NatsResult::Ok ? result.revision : 0,
+                                          result.result == NatsResult::Ok);
                     });
                 });
                 return;
@@ -247,7 +354,11 @@ inline void dispatch_request(NameCache& name_cache, IdCache& id_cache, NatsBridg
                                                           return encode_status(wire::Status::Error);
                                                       };
                                                       completions.push(std::move(request), std::move(apply),
-                                                                        "GET id=" + std::to_string(key), qkey);
+                                                                        "GET id=" + std::to_string(key), qkey,
+                                                                        result.result == NatsResult::Ok
+                                                                            ? result.revision
+                                                                            : 0,
+                                                                        result.result == NatsResult::Ok);
                                                   });
                                });
             return;
@@ -262,7 +373,8 @@ inline void dispatch_request(NameCache& name_cache, IdCache& id_cache, NatsBridg
                 key_queue.enqueue(qkey, [&nats, &completions, name_bucket, request, key, record, qkey]() mutable {
                     std::cout << "[server] PUT name=\"" << key << "\" -> dispatched to NATS\n";
                     nats.put_async(name_bucket, key, record,
-                                    [&completions, request, key, record, qkey](bool ok, std::string /*err*/) mutable {
+                                    [&completions, request, key, record, qkey](bool ok, std::uint64_t revision,
+                                                                                std::string /*err*/) mutable {
                                         ApplyFn apply = [key, record, ok](NameCache& name_cache,
                                                                            IdCache&) -> std::vector<std::uint8_t> {
                                             if (!ok) {
@@ -273,7 +385,7 @@ inline void dispatch_request(NameCache& name_cache, IdCache& id_cache, NatsBridg
                                             return encode_status(wire::Status::Ok);
                                         };
                                         completions.push(std::move(request), std::move(apply),
-                                                          "PUT name=\"" + key + "\"", qkey);
+                                                          "PUT name=\"" + key + "\"", qkey, revision, ok);
                                     });
                 });
                 return;
@@ -286,7 +398,8 @@ inline void dispatch_request(NameCache& name_cache, IdCache& id_cache, NatsBridg
             key_queue.enqueue(qkey, [&nats, &completions, id_bucket, request, key, record, qkey]() mutable {
                 std::cout << "[server] PUT id=" << key << " -> dispatched to NATS\n";
                 nats.put_async(id_bucket, std::to_string(key), record,
-                                [&completions, request, key, record, qkey](bool ok, std::string /*err*/) mutable {
+                                [&completions, request, key, record, qkey](bool ok, std::uint64_t revision,
+                                                                            std::string /*err*/) mutable {
                                     ApplyFn apply = [key, record, ok](NameCache&,
                                                                        IdCache& id_cache) -> std::vector<std::uint8_t> {
                                         if (!ok) {
@@ -297,7 +410,7 @@ inline void dispatch_request(NameCache& name_cache, IdCache& id_cache, NatsBridg
                                         return encode_status(wire::Status::Ok);
                                     };
                                     completions.push(std::move(request), std::move(apply),
-                                                      "PUT id=" + std::to_string(key), qkey);
+                                                      "PUT id=" + std::to_string(key), qkey, revision, ok);
                                 });
             });
             return;

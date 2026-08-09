@@ -114,7 +114,7 @@ TEST_F(NatsBridgeTest, GetAsyncInvokesCallbackWithTheResult) {
 TEST_F(NatsBridgeTest, PutAsyncThenGetAsyncRoundTrip) {
     std::promise<bool> put_done;
     nats_->put_async(kBucket, "async_put", bytes("via-async-put"),
-                      [&put_done](bool ok, std::string) { put_done.set_value(ok); });
+                      [&put_done](bool ok, std::uint64_t, std::string) { put_done.set_value(ok); });
     ASSERT_TRUE(put_done.get_future().get());
 
     std::promise<NatsGetResult> get_done;

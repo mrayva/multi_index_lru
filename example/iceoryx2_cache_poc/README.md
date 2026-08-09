@@ -566,6 +566,64 @@ after the cooldown succeeds.
 they already treat any NATS `Error` uniformly, so a circuit-open response
 looks exactly like any other NATS failure to `dispatch_request()`.
 
+### Cross-daemon coherence
+
+Everything above assumes one daemon owns each cache. Run a second
+`cache_poc_server_readthrough` against the same two buckets (a different
+`--service-name` so they don't fight over the same iceoryx2 service, e.g. for
+a horizontally-scaled deployment) and, without this, each keeps its own
+local cache with no idea the other exists -- a PUT on one leaves the other
+serving a now-stale value out of its local cache indefinitely.
+
+`NatsBridge::watch(bucket, on_entry)` closes that gap: at startup,
+`server_readthrough.cpp`'s `main()` subscribes to every key change (put,
+delete, purge) in both buckets via NATS JetStream KV's `kv_watch`. When
+*any* process writes a key -- another daemon instance, a raw `nats kv put`,
+anything -- the watch event lands in `InvalidationQueue`
+(`server_dispatch.hpp`); the main loop drains it once per cycle
+(`apply_pending_invalidations()`) and evicts the corresponding entry from
+whichever local cache holds it, so the next GET for that key is a real miss
+and reads the fresh value through from NATS.
+
+**Not evicting a daemon's own writes.** Without more care, this would make
+every daemon invalidate the value it *just wrote*, the instant its own write
+echoes back through its own watch subscription -- a pointless
+write-then-immediately-evict flicker on every PUT. `RevisionTracker`
+(`server_dispatch.hpp`) closes this using NATS KV's per-key revision (a
+monotonically increasing sequence number, returned by both `kv_put` and
+`kv_get`/`kv_watch`): whenever this daemon's own GET-populate or PUT
+completes, it records the revision that operation produced or observed. A
+watch event is only treated as genuinely new information -- and only then
+does it evict -- if its revision is *greater* than whatever was last
+recorded for that key; an echo of this daemon's own write carries the exact
+revision already recorded, so it's recognized and skipped.
+
+This needs a `nats_asio` build where `kv_watch`'s delivered `kv_entry`
+carries a real (non-zero, strictly increasing) `revision` --
+[mrayva/nats_asio](https://github.com/mrayva/nats_asio) `parse_kv_entry_from_message`
+originally only looked for a `Nats-Sequence` *header*, which nats-server
+attaches to `kv_get`'s Direct Get responses but not to ordinary
+push-consumer deliveries (`kv_watch`'s underlying mechanism); every watch
+event's revision silently came back `0`, which made `RevisionTracker`
+correctly recognize *nothing* as new after the first event per key --
+external writes stopped invalidating anything after that. Fixed to parse
+the stream sequence out of the JetStream ACK reply-to subject instead (the
+same technique `parse_js_message_metadata` already used elsewhere in that
+file), which is always present on a push-consumer delivery.
+
+Verified live: two `cache_poc_server_readthrough` instances (`--service-name`
+`.../e2e_a` and `.../e2e_b`) against the same `mil_by_name` bucket. A GET
+through daemon A cached `{"v":1}`; a PUT through daemon B wrote `{"v":2}` for
+the same key; daemon A's log showed `invalidated name="..." (external write,
+revision N)` without ever receiving a request telling it to, and daemon A's
+very next GET for that key returned `{"v":2}` -- read fresh through NATS, not
+served stale from its own cache. A second run confirmed a daemon's own PUT
+does *not* trigger this: no `invalidated` line ever appears for a key this
+same daemon just wrote. Both behaviors also have `dispatch_request_test.cpp`
+coverage (`ExternalWriteInvalidatesLocalCacheEntry`,
+`OwnWriteDoesNotSelfInvalidate`) that runs on every `ctest` invocation
+(`POC_ENABLE_NATS_READTHROUGH=ON` builds), not just this one manual check.
+
 ## What this doesn't answer yet
 
 This proves the pattern works end-to-end and is easy to wire up, not that
@@ -585,11 +643,10 @@ becomes more than a POC:
   string `"I:5"` while an `Id` key `5` was also in flight; harmless
   over-serialization in that vanishingly unlikely case, not a correctness
   bug, but worth knowing about.
-- **No invalidation broadcast.** Every daemon keeps its own local cache with
-  no cross-daemon coordination; if you ran two `cache_poc_server_readthrough`
-  processes against the same NATS buckets, a PUT on one wouldn't invalidate
-  the other's stale local entry. NATS KV's `kv_watch` is sitting right there
-  as the natural fix and isn't used here.
+- **Invalidation is eviction, not refresh.** "Cross-daemon coherence" above
+  covers multiple daemons; a watched key is dropped from the local cache, not
+  proactively re-fetched, so the cost of staying coherent is paid by the next
+  GET for that key (a real miss), not by the watch event itself.
 - **Negative caching.** A NATS miss is not cached, so a key that's genuinely
   absent from both layers gets a full NATS round trip on every GET.
 - **Throughput under sustained load.** "The concurrency model" above verified
