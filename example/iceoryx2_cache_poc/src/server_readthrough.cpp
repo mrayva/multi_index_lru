@@ -50,6 +50,10 @@
 ///   --nats-timeout-ms / MIL_NATS_TIMEOUT_MS          (default 3000)
 ///   --cb-failure-threshold / MIL_CB_FAILURE_THRESHOLD (default 3)
 ///   --cb-open-duration-ms / MIL_CB_OPEN_DURATION_MS   (default 2000)
+///   --max-clients / MIL_MAX_CLIENTS                   (default 16 -- iceoryx2-cxx's own
+///                                                        default is 8; see README.md "Load testing")
+///   --max-active-requests-per-client / MIL_MAX_ACTIVE_REQUESTS_PER_CLIENT
+///                                                      (default 32 -- iceoryx2-cxx's own default is 4)
 #include "server_dispatch.hpp"
 #include "config.hpp"
 
@@ -88,6 +92,9 @@ int main(int argc, char** argv) {
         poc::config::resolve_int(args, "--cb-failure-threshold", "MIL_CB_FAILURE_THRESHOLD", 3);
     const auto cb_open_duration =
         poc::config::resolve_millis(args, "--cb-open-duration-ms", "MIL_CB_OPEN_DURATION_MS", 2000);
+    const std::size_t max_clients = poc::config::resolve_size(args, "--max-clients", "MIL_MAX_CLIENTS", 16);
+    const std::size_t max_active_requests_per_client = poc::config::resolve_size(
+        args, "--max-active-requests-per-client", "MIL_MAX_ACTIVE_REQUESTS_PER_CLIENT", 32);
 
     // Declared before `nats` on purpose: local variables are destroyed in
     // reverse declaration order, and NatsBridge's own coroutines (get_async/
@@ -125,6 +132,8 @@ int main(int argc, char** argv) {
 
     auto service = node.service_builder(ServiceName::create(service_name.c_str()).value())
                         .request_response<bb::Slice<std::uint8_t>, bb::Slice<std::uint8_t>>()
+                        .max_clients(max_clients)
+                        .max_active_requests_per_client(max_active_requests_per_client)
                         .open_or_create()
                         .value();
 

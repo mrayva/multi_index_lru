@@ -51,7 +51,10 @@ C++20 compiler (see "Unit tests" below).
   (`dispatch_request()`, `CompletionQueue`, `KeyOperationQueue`) so it's
   includable from `test/dispatch_request_test.cpp`, not just
   `server_readthrough.cpp`'s `main()`.
-- `config.hpp` is the CLI-flag/env-var resolution all four binaries share —
+- `load_test.cpp` fires many concurrent requests at a running `server.cpp` /
+  `server_readthrough.cpp` from a pool of iceoryx2 Clients and reports
+  throughput/latency — see "Load testing" below.
+- `config.hpp` is the CLI-flag/env-var resolution all five binaries share —
   see "Configuration" below for the full flag/env-var list.
 
 Everything else — LRU eviction, TTL, composite keys, node pooling — still
@@ -180,6 +183,8 @@ accepted for flags with a value: `--flag value` or `--flag=value`.
 | `--service-name` | `MIL_SERVICE_NAME` | `poc::kServiceName` | all four -- client and server must agree |
 | `--cache-capacity` | `MIL_CACHE_CAPACITY` | `1000` | `server.cpp`, `server_readthrough.cpp` (applies to both caches) |
 | `--ttl-ms` | `MIL_TTL_MS` | `300000` (5min) | `server.cpp`, `server_readthrough.cpp` (applies to both caches) |
+| `--max-clients` | `MIL_MAX_CLIENTS` | `16` | `server.cpp`, `server_readthrough.cpp` (iceoryx2-cxx's own default is 8, see "Load testing") |
+| `--max-active-requests-per-client` | `MIL_MAX_ACTIVE_REQUESTS_PER_CLIENT` | `32` | `server.cpp`, `server_readthrough.cpp` (iceoryx2-cxx's own default is 4, see "Load testing") |
 | `--nats-host` | `MIL_NATS_HOST` | `127.0.0.1` | `server_readthrough.cpp`, `client_readthrough.cpp` |
 | `--nats-port` | `MIL_NATS_PORT` | `4222` | `server_readthrough.cpp`, `client_readthrough.cpp` |
 | `--name-bucket` | `MIL_NAME_BUCKET` | `poc::kNameBucket` (`mil_by_name`) | `server_readthrough.cpp`, `client_readthrough.cpp` |
@@ -700,6 +705,99 @@ level the same rigorous way the concurrency tests do: the second GET must
 resolve within a single pump, proving it never dispatched to NATS at all
 rather than just happening to finish quickly.
 
+## Load testing
+
+Every concurrency claim earlier in this README was verified at small scale
+(a handful of concurrent `cache_poc_client` processes). `cache_poc_load_test`
+(`src/load_test.cpp`) is a standalone driver that fires many concurrent
+requests at a running `cache_poc_server`/`cache_poc_server_readthrough` from
+a pool of iceoryx2 Clients, reporting throughput and latency percentiles --
+built specifically to answer "What this doesn't answer yet"'s old
+"Throughput under sustained load" question with real numbers instead of a
+guess. Not a `ctest` target -- point it at a real running daemon:
+
+```bash
+# terminal 1
+./cache_poc_server_readthrough
+
+# terminal 2
+./cache_poc_load_test --op get --key-pool-size 200 --concurrency 100 --total-requests 5000
+./cache_poc_load_test --op put --key-pool-size 200 --concurrency 100 --total-requests 3000
+./cache_poc_load_test --op put --key-pool-size 1   --concurrency 100 --total-requests 800   # hot-key/backlog scenario, see below
+```
+
+### iceoryx2's own concurrency ceiling (found by this, not designed around it)
+
+The first real run of this tool crashed immediately with `RequestSendError::
+ExceedsMaxActiveRequests`: iceoryx2 caps how many requests a single `Client`
+can have in flight at once (`max_active_requests_per_client`, **4** by
+default) *and* how many `Client`s can connect to one service at all
+(`max_clients`, **8** by default) -- both fixed at whichever process first
+creates the service, since neither `server.cpp` nor `server_readthrough.cpp`
+overrode them. Together that capped this whole service at **32** requests in
+flight, system-wide, before either default was touched -- a ceiling that
+would have silently throttled any real multi-client production deployment,
+not just this load tester.
+
+Fixed by adding `--max-clients`/`MIL_MAX_CLIENTS` (default 16) and
+`--max-active-requests-per-client`/`MIL_MAX_ACTIVE_REQUESTS_PER_CLIENT`
+(default 32) to both servers -- raising the reachable ceiling to 512 -- see
+"Configuration" above. `cache_poc_load_test` itself reads the *actual*
+ceiling back from `service.static_config()` rather than hardcoding either
+number, and spreads `--concurrency` across as many `Client`s as needed to
+reach it (never more than one client process's fair share, `max_active_requests_per_client`,
+per `Client` instance) -- which also happens to model production traffic
+more faithfully than one `Client` with an inflated per-instance cap would,
+since real traffic comes from many separate client processes/connections.
+
+### Results
+
+Against `cache_poc_server_readthrough` (default config, local `nats-server
+-js`, freshly started so nothing was pre-cached):
+
+| Scenario | Throughput | p50 latency | p99 latency |
+|---|---|---|---|
+| GET, 200 keys, concurrency 100 | ~105k req/s | 311us | 16.0ms |
+| PUT, 200 keys, concurrency 100 | ~3.1k req/s | 6.4ms | 788ms (see below) |
+| PUT, **1 key**, concurrency 100-200 | ~195 req/s | 1.03s | 1.03s |
+
+- **GET's huge throughput and tiny p50** are almost entirely negative/positive
+  local-cache hits (see "Negative caching" and read-through above) -- only
+  each key's *first* GET in the run pays a real NATS round trip; the rest of
+  the 5000 requests, spread over just 200 keys, are answered locally. p99
+  still shows the real NATS-bound minority.
+- **PUT is write-through and always pays NATS**, so its throughput (~3.1k
+  req/s across 200 independent keys, run concurrently since `KeyOperationQueue`
+  only serializes *same*-key operations) is a much more direct measure of
+  how many concurrent NATS round trips this setup can actually sustain. Its
+  p99 (788ms, vs. a 7ms p95) is a real, reproducible tail -- most likely
+  NATS-server-side (JetStream stream housekeeping, disk sync, or similar);
+  not diagnosed further here, since that would need profiling `nats-server`
+  itself, out of scope for this POC.
+- **The hot-key scenario is the one this tool exists for**: forcing every
+  PUT onto the *same* key collapses throughput to ~195 req/s regardless of
+  how much concurrency is offered (100 vs. 200 -- no difference) or how many
+  requests are in flight -- exactly the expected result of
+  `KeyOperationQueue`'s per-key linearizability (see "the concurrency
+  model" above): only one operation for that key is ever actually in
+  flight to NATS, everything else queues behind it, so throughput for a hot
+  key is bounded by the NATS round-trip latency alone, no matter how much
+  parallelism is thrown at it.
+
+**Memory under a sustained hot-key backlog**: sampled `cache_poc_server_readthrough`'s
+RSS every 150ms during the concurrency-200, single-key PUT run above. It
+climbed from a ~27MB baseline to ~35MB as the 200-deep backlog built up (the
+`ActiveRequest`s and closures `KeyOperationQueue`/`CompletionQueue` are
+holding for everything queued behind the one in-flight NATS call), then
+dropped back down to ~27MB within seconds of the backlog draining --
+consistent with memory usage that tracks queue depth and recedes once the
+backlog clears, not an unbounded leak. That said, nothing currently *caps*
+how deep that queue can get -- worst case is bounded only by iceoryx2's own
+`max_active_requests_per_client` x `max_clients` ceiling (512, per the fix
+above) times however many separate client processes are hammering the same
+key, which is the same gap "Failure handling" below already flags as
+"no rate limiting or backpressure."
+
 ## What this doesn't answer yet
 
 This proves the pattern works end-to-end and is easy to wire up, not that
@@ -723,15 +821,15 @@ becomes more than a POC:
   covers multiple daemons; a watched key is dropped from the local cache, not
   proactively re-fetched, so the cost of staying coherent is paid by the next
   GET for that key (a real miss), not by the watch event itself.
-- **Throughput under sustained load.** "The concurrency model" above verified
-  that several concurrent requests each requiring their own NATS round trip
-  complete concurrently rather than serialized, at small scale (7 requests).
-  That's a correctness/architecture check, not a load test -- it says
-  nothing about behavior under sustained high concurrency (how many
-  in-flight NATS operations `nats_asio`/the NATS server can actually sustain,
-  memory growth of `CompletionQueue`/`KeyOperationQueue` under backlog --
-  especially a long queue of operations piled up behind one slow/stuck
-  operation for a single hot key -- etc.).
+- **No backpressure or queue depth limit.** "Load testing" above measured
+  what was previously just a guess: a hot key's `KeyOperationQueue` backlog
+  grows with however many concurrent requests are offered for it, memory
+  tracks that and recedes once the backlog clears (not a leak), but nothing
+  actually *caps* how deep it can get -- the only ceiling is iceoryx2's own
+  `max_active_requests_per_client` x `max_clients` config, times however
+  many client processes are hammering that key at once. Same gap as
+  "Failure handling"'s "no rate limiting or backpressure" below, now with
+  real numbers behind it instead of a guess.
 - **Failure handling.** No handling of the daemon process dying mid-request
   beyond what iceoryx2 does by default. A malformed/truncated request (or an
   unexpected NATS-side exception) is now caught at the request-handling

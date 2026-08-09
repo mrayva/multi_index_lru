@@ -19,6 +19,10 @@
 ///   --service-name / MIL_SERVICE_NAME    (default poc::kServiceName)
 ///   --cache-capacity / MIL_CACHE_CAPACITY (default 1000, applies to both caches)
 ///   --ttl-ms / MIL_TTL_MS                 (default 300000 = 5min, applies to both caches)
+///   --max-clients / MIL_MAX_CLIENTS       (default 16 -- iceoryx2-cxx's own default is 8;
+///                                           see README.md "Load testing" for why this is raised)
+///   --max-active-requests-per-client / MIL_MAX_ACTIVE_REQUESTS_PER_CLIENT
+///                                          (default 32 -- iceoryx2-cxx's own default is 4)
 #include "cache_service.hpp"
 #include "config.hpp"
 
@@ -54,6 +58,9 @@ int main(int argc, char** argv) {
     const std::string service_name = poc::config::resolve_str(args, "--service-name", "MIL_SERVICE_NAME", poc::kServiceName);
     const std::size_t capacity = poc::config::resolve_size(args, "--cache-capacity", "MIL_CACHE_CAPACITY", 1000);
     const auto ttl = poc::config::resolve_millis(args, "--ttl-ms", "MIL_TTL_MS", 300000);
+    const std::size_t max_clients = poc::config::resolve_size(args, "--max-clients", "MIL_MAX_CLIENTS", 16);
+    const std::size_t max_active_requests_per_client = poc::config::resolve_size(
+        args, "--max-active-requests-per-client", "MIL_MAX_ACTIVE_REQUESTS_PER_CLIENT", 32);
 
     // --- seed the caches this process owns --------------------------------
     poc::NameCache name_cache(capacity, ttl);
@@ -70,6 +77,8 @@ int main(int argc, char** argv) {
 
     auto service = node.service_builder(ServiceName::create(service_name.c_str()).value())
                         .request_response<bb::Slice<std::uint8_t>, bb::Slice<std::uint8_t>>()
+                        .max_clients(max_clients)
+                        .max_active_requests_per_client(max_active_requests_per_client)
                         .open_or_create()
                         .value();
 

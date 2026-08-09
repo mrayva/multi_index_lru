@@ -57,6 +57,15 @@ if(POC_BUILD_ICEORYX2_TARGETS)
         PRIVATE multi_index_lru_headers iceoryx2-cxx::static-lib-cxx
     )
 
+    # A load-test client, not a server: no nats_asio dependency of its own,
+    # so it builds even with POC_ENABLE_NATS_READTHROUGH=OFF -- it just
+    # wouldn't have anything interesting (NATS-backed) to point at in that
+    # case. See src/load_test.cpp and README.md "Load testing".
+    add_executable(cache_poc_load_test src/load_test.cpp)
+    target_link_libraries(cache_poc_load_test
+        PRIVATE multi_index_lru_headers iceoryx2-cxx::static-lib-cxx
+    )
+
     if(POC_ENABLE_NATS_READTHROUGH)
         find_package(nats_asio CONFIG REQUIRED)
         find_package(Threads REQUIRED)
