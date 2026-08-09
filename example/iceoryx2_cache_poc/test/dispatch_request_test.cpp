@@ -240,7 +240,13 @@ TEST_F(DispatchRequestTest, EraseIsWriteThroughAndAppliesOnCompletion) {
     EXPECT_EQ(static_cast<wire::Status>(r.u8()), wire::Status::Ok);
 
     EXPECT_EQ(nats_->get(kNameBucket, "erase_test").result, NatsResult::NotFound);
-    EXPECT_EQ(name_cache_->find<NameTag>("erase_test"), name_cache_->end<NameTag>());
+
+    // Not gone from the local cache entirely: an ERASE now leaves a
+    // negative-cache entry (see NegativeCache tests below) so the next GET
+    // for this key doesn't cost another NATS round trip.
+    auto it = name_cache_->find<NameTag>("erase_test");
+    ASSERT_NE(it, name_cache_->end<NameTag>());
+    EXPECT_FALSE(it->found);
 }
 
 TEST_F(DispatchRequestTest, MalformedRequestRespondsWithErrorWithinOnePump) {
@@ -286,6 +292,78 @@ TEST_F(DispatchRequestTest, InFlightMissDoesNotBlockAConcurrentLocalHit) {
     EXPECT_EQ(static_cast<wire::Status>(miss_r.u8()), wire::Status::Ok);
 
     nats_->erase(kNameBucket, "blocking_check");
+}
+
+// --- Negative caching -------------------------------------------------------
+
+TEST_F(DispatchRequestTest, NegativeCacheAvoidsSecondNatsRoundTripForNeverWrittenKey) {
+    nats_->erase(kNameBucket, "never_written");
+
+    // First GET is a genuine miss: local cache empty, NATS also confirms
+    // absence -- must go through the deferred NATS path.
+    auto response_bytes = round_trip(encode_get(wire::KeyKind::Name, "never_written", 0));
+    wire::Reader r(response_bytes.data(), response_bytes.size());
+    EXPECT_EQ(static_cast<wire::Status>(r.u8()), wire::Status::NotFound);
+
+    // The miss is now negatively cached.
+    auto it = name_cache_->find<NameTag>("never_written");
+    ASSERT_NE(it, name_cache_->end<NameTag>());
+    EXPECT_FALSE(it->found);
+
+    // Second GET for the same key must resolve within a single pump --
+    // proving it was answered from the negative-cache entry, not by
+    // dispatching another NATS round trip (which would still be pending
+    // after just one pump, like every other NATS-backed miss in this file).
+    auto pending = send_request(encode_get(wire::KeyKind::Name, "never_written", 0));
+    pump_server();
+    auto response = pending.receive().value();
+    ASSERT_TRUE(response.has_value()) << "a negative-cache hit must resolve synchronously, not dispatch to NATS";
+    wire::Reader r2(response->payload().data(), response->payload().number_of_bytes());
+    EXPECT_EQ(static_cast<wire::Status>(r2.u8()), wire::Status::NotFound);
+    EXPECT_EQ(completions_.size(), 0u) << "a negative-cache hit must never touch the completion queue";
+}
+
+TEST_F(DispatchRequestTest, ErasedKeyIsNegativelyCachedSoNextGetAvoidsNats) {
+    ASSERT_TRUE(nats_->put(kNameBucket, "erase_negcache_test", bytes("x")).first);
+
+    auto erase_bytes = round_trip(encode_erase(wire::KeyKind::Name, "erase_negcache_test", 0));
+    wire::Reader erase_r(erase_bytes.data(), erase_bytes.size());
+    ASSERT_EQ(static_cast<wire::Status>(erase_r.u8()), wire::Status::Ok);
+
+    // A GET right after the erase must resolve within a single pump --
+    // proving it hit the negative-cache entry the erase itself just wrote,
+    // not dispatching yet another NATS round trip to rediscover what this
+    // same daemon just confirmed.
+    auto pending = send_request(encode_get(wire::KeyKind::Name, "erase_negcache_test", 0));
+    pump_server();
+    auto response = pending.receive().value();
+    ASSERT_TRUE(response.has_value()) << "should have resolved from the erase's own negative-cache entry";
+    wire::Reader r(response->payload().data(), response->payload().number_of_bytes());
+    EXPECT_EQ(static_cast<wire::Status>(r.u8()), wire::Status::NotFound);
+}
+
+TEST_F(DispatchRequestTest, OwnEraseDoesNotSelfInvalidateItsNegativeCacheEntry) {
+    ASSERT_TRUE(nats_->put(kNameBucket, "erase_self_test", bytes("x")).first);
+
+    auto erase_bytes = round_trip(encode_erase(wire::KeyKind::Name, "erase_self_test", 0));
+    wire::Reader erase_r(erase_bytes.data(), erase_bytes.size());
+    ASSERT_EQ(static_cast<wire::Status>(erase_r.u8()), wire::Status::Ok);
+
+    // Keep pumping for long enough that the watch echo of this exact delete
+    // would have arrived and been applied if RevisionTracker didn't
+    // recognize it as already-known -- the negative-cache entry must survive.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(1500);
+    while (std::chrono::steady_clock::now() < deadline) {
+        pump_server();
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    auto it = name_cache_->find<NameTag>("erase_self_test");
+    ASSERT_NE(it, name_cache_->end<NameTag>())
+        << "own erase's negative-cache entry should not have been evicted by its own watch echo";
+    EXPECT_FALSE(it->found);
+
+    nats_->erase(kNameBucket, "erase_self_test");
 }
 
 // --- KeyOperationQueue: the fix for "the stale GET response race" ---------

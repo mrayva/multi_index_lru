@@ -128,7 +128,8 @@ TEST_F(NatsBridgeTest, EraseAsyncInvokesCallback) {
     nats_->put(kBucket, "async_erase", bytes("x"));
 
     std::promise<bool> erase_done;
-    nats_->erase_async(kBucket, "async_erase", [&erase_done](bool ok, std::string) { erase_done.set_value(ok); });
+    nats_->erase_async(kBucket, "async_erase",
+                        [&erase_done](bool ok, std::uint64_t, std::string) { erase_done.set_value(ok); });
     EXPECT_TRUE(erase_done.get_future().get());
     EXPECT_EQ(nats_->get(kBucket, "async_erase").result, NatsResult::NotFound);
 }

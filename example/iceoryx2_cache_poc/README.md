@@ -664,6 +664,42 @@ coverage (`ExternalWriteInvalidatesLocalCacheEntry`,
 `OwnWriteDoesNotSelfInvalidate`) that runs on every `ctest` invocation
 (`POC_ENABLE_NATS_READTHROUGH=ON` builds), not just this one manual check.
 
+### Negative caching
+
+Without this, a key that's genuinely absent from NATS pays a full round trip
+on *every* GET for it -- there was nothing remembering "already checked,
+it's not there." `NameEntry`/`IdEntry` now carry a `found` flag (default
+`true`) alongside `record`; a NATS-confirmed miss on GET emplaces a
+`found=false` entry instead of just returning `NotFound` and forgetting it.
+The local-hit fast path checks `found`: a positive entry responds with the
+record as before, a negative one responds `NotFound` immediately -- still
+without touching NATS. `ERASE` does the same on success (writes a
+`found=false` entry instead of merely removing the local one), so the very
+next GET for a key this same daemon just deleted is also a local hit, not
+another round trip to rediscover what it already knows.
+
+No new config knob: negative entries share `--ttl-ms` and the
+cross-daemon-coherence `kv_watch` subscription with everything else --
+if another process later writes that key, the watch event evicts the
+negative entry exactly like it would a positive one (see "Cross-daemon
+coherence" above), and `erase_async()` now threads through NATS's delete
+revision the same way `put_async()` already did, so an ERASE's own
+negative-cache entry gets the same self-echo-suppression PUT's does --
+verified with an `OwnEraseDoesNotSelfInvalidateItsNegativeCacheEntry` test
+mirroring `OwnWriteDoesNotSelfInvalidate`.
+
+Verified live: `GET` on a key confirmed absent from NATS logged
+`local miss, dispatched to NATS` then `not found (local miss, NATS miss)`;
+the *second* `GET` for the same key logged `local negative hit (cached
+miss)` -- no second `dispatched to NATS` line. Same for `ERASE`: a `PUT`
+then `ERASE` of a key, followed immediately by a `GET`, logged
+`local negative hit (cached miss)` straight away, with no NATS round trip
+in between. `dispatch_request_test.cpp`'s `NegativeCacheAvoidsSecondNatsRoundTripForNeverWrittenKey`
+and `ErasedKeyIsNegativelyCachedSoNextGetAvoidsNats` cover this at the test
+level the same rigorous way the concurrency tests do: the second GET must
+resolve within a single pump, proving it never dispatched to NATS at all
+rather than just happening to finish quickly.
+
 ## What this doesn't answer yet
 
 This proves the pattern works end-to-end and is easy to wire up, not that
@@ -687,8 +723,6 @@ becomes more than a POC:
   covers multiple daemons; a watched key is dropped from the local cache, not
   proactively re-fetched, so the cost of staying coherent is paid by the next
   GET for that key (a real miss), not by the watch event itself.
-- **Negative caching.** A NATS miss is not cached, so a key that's genuinely
-  absent from both layers gets a full NATS round trip on every GET.
 - **Throughput under sustained load.** "The concurrency model" above verified
   that several concurrent requests each requiring their own NATS round trip
   complete concurrently rather than serialized, at small scale (7 requests).

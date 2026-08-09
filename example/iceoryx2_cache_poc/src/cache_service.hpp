@@ -31,14 +31,23 @@
 
 namespace poc {
 
+// `found`: true for a real cached record, false for a negative-cache entry
+// (server_dispatch.hpp -- "this key is confirmed absent from NATS as of the
+// last check", not "never looked up"). `record` is empty and meaningless
+// when found is false. Defaults to true so every existing 2-arg
+// NameEntry{key, record} construction (server.cpp's seed data,
+// handle_request_local()'s plain in-memory upsert, which never negatively
+// caches) is unaffected.
 struct NameEntry {
     std::string key;
     std::vector<std::uint8_t> record;
+    bool found = true;
 };
 
 struct IdEntry {
     std::int64_t key;
     std::vector<std::uint8_t> record;
+    bool found = true;
 };
 
 struct NameTag {};

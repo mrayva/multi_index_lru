@@ -210,11 +210,15 @@ public:
             asio::detached);
     }
 
-    // on_done: void(bool ok, std::string error)
+    // on_done: void(bool ok, std::uint64_t revision, std::string error)
+    // `revision` (valid iff ok) is the NATS KV revision this delete produced --
+    // same purpose as put_async()'s, so an erase's negative-cache entry
+    // (server_dispatch.hpp) participates in RevisionTracker the same way a
+    // positive PUT does.
     template <typename Callback>
     void erase_async(const std::string& bucket, const std::string& key, Callback on_done) {
         if (is_circuit_open()) {
-            on_done(false, "circuit breaker open: NATS considered unavailable");
+            on_done(false, 0, "circuit breaker open: NATS considered unavailable");
             return;
         }
 
@@ -226,19 +230,18 @@ public:
             [this, conn, bucket, key, timeout, on_done = std::move(on_done)]() mutable -> asio::awaitable<void> {
                 try {
                     auto [revision, status] = co_await conn->kv_delete(bucket, key, timeout);
-                    (void)revision;
                     if (status.ok()) {
                         record_success();
                     } else {
                         record_failure();
                     }
-                    on_done(status.ok(), status.ok() ? std::string{} : status.error());
+                    on_done(status.ok(), revision, status.ok() ? std::string{} : status.error());
                 } catch (const std::exception& e) {
                     record_failure();
-                    on_done(false, std::string("exception: ") + e.what());
+                    on_done(false, 0, std::string("exception: ") + e.what());
                 } catch (...) {
                     record_failure();
-                    on_done(false, "unknown exception");
+                    on_done(false, 0, "unknown exception");
                 }
                 co_return;
             },
@@ -268,11 +271,14 @@ public:
         return fut.get();
     }
 
-    // Returns {ok, error message (empty if ok)}.
+    // Returns {ok, error message (empty if ok)}. Discards the revision
+    // erase_async()'s callback carries, same as put()'s wrapper above.
     std::pair<bool, std::string> erase(const std::string& bucket, const std::string& key) {
         auto prom = std::make_shared<std::promise<std::pair<bool, std::string>>>();
         auto fut = prom->get_future();
-        erase_async(bucket, key, [prom](bool ok, std::string err) { prom->set_value({ok, std::move(err)}); });
+        erase_async(bucket, key, [prom](bool ok, std::uint64_t /*revision*/, std::string err) {
+            prom->set_value({ok, std::move(err)});
+        });
         return fut.get();
     }
 

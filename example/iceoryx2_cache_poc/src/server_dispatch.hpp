@@ -63,7 +63,9 @@ struct PendingCompletion {
                                // drain loop, so it doesn't need to touch std::cout itself.
     std::string queue_key;     // KeyOperationQueue key this completion must release when applied.
     std::uint64_t revision = 0;  // valid iff has_revision -- see RevisionTracker
-    bool has_revision = false;   // true for a successful GET-populate or PUT; false for Erase or a failed op
+    bool has_revision = false;   // true for a successful GET-populate, PUT, or Erase; false for a
+                                  // failed op, or a GET-populate that found nothing (a key that's
+                                  // never existed has no revision to record)
 };
 
 // Shared between the main iceoryx2 thread and NatsBridge's background NATS
@@ -302,8 +304,13 @@ inline void dispatch_request(NameCache& name_cache, IdCache& id_cache, NatsBridg
                 key_queue.enqueue(qkey, [&name_cache, &nats, &completions, &key_queue, name_bucket, request, key,
                                           qkey]() mutable {
                     if (auto it = name_cache.find<NameTag>(key); it != name_cache.end<NameTag>()) {
-                        std::cout << "[server] GET name=\"" << key << "\" -> local hit\n";
-                        respond(*request, encode_found(it->record));
+                        if (it->found) {
+                            std::cout << "[server] GET name=\"" << key << "\" -> local hit\n";
+                            respond(*request, encode_found(it->record));
+                        } else {
+                            std::cout << "[server] GET name=\"" << key << "\" -> local negative hit (cached miss)\n";
+                            respond(*request, encode_status(wire::Status::NotFound));
+                        }
                         key_queue.complete(qkey);
                         return;
                     }
@@ -315,6 +322,11 @@ inline void dispatch_request(NameCache& name_cache, IdCache& id_cache, NatsBridg
                                 return encode_found(result.value);
                             }
                             if (result.result == NatsResult::NotFound) {
+                                // Negative-cache the miss: the next GET for
+                                // this key is a local (negative) hit instead
+                                // of another NATS round trip, until kv_watch
+                                // sees it written or the TTL lapses.
+                                name_cache.emplace(NameEntry{key, {}, false});
                                 return encode_status(wire::Status::NotFound);
                             }
                             return encode_status(wire::Status::Error);
@@ -333,8 +345,14 @@ inline void dispatch_request(NameCache& name_cache, IdCache& id_cache, NatsBridg
             key_queue.enqueue(qkey,
                                [&id_cache, &nats, &completions, &key_queue, id_bucket, request, key, qkey]() mutable {
                                    if (auto it = id_cache.find<IdTag>(key); it != id_cache.end<IdTag>()) {
-                                       std::cout << "[server] GET id=" << key << " -> local hit\n";
-                                       respond(*request, encode_found(it->record));
+                                       if (it->found) {
+                                           std::cout << "[server] GET id=" << key << " -> local hit\n";
+                                           respond(*request, encode_found(it->record));
+                                       } else {
+                                           std::cout << "[server] GET id=" << key
+                                                     << " -> local negative hit (cached miss)\n";
+                                           respond(*request, encode_status(wire::Status::NotFound));
+                                       }
                                        key_queue.complete(qkey);
                                        return;
                                    }
@@ -349,6 +367,8 @@ inline void dispatch_request(NameCache& name_cache, IdCache& id_cache, NatsBridg
                                                               return encode_found(result.value);
                                                           }
                                                           if (result.result == NatsResult::NotFound) {
+                                                              // See the Name branch's identical comment.
+                                                              id_cache.emplace(IdEntry{key, {}, false});
                                                               return encode_status(wire::Status::NotFound);
                                                           }
                                                           return encode_status(wire::Status::Error);
@@ -424,17 +444,24 @@ inline void dispatch_request(NameCache& name_cache, IdCache& id_cache, NatsBridg
             key_queue.enqueue(qkey, [&nats, &completions, name_bucket, request, key, qkey]() mutable {
                 std::cout << "[server] ERASE name=\"" << key << "\" -> dispatched to NATS\n";
                 nats.erase_async(name_bucket, key,
-                                  [&completions, request, key, qkey](bool ok, std::string /*err*/) mutable {
+                                  [&completions, request, key, qkey](bool ok, std::uint64_t revision,
+                                                                      std::string /*err*/) mutable {
                                       ApplyFn apply = [key, ok](NameCache& name_cache,
                                                                  IdCache&) -> std::vector<std::uint8_t> {
                                           if (!ok) {
                                               return encode_status(wire::Status::Error);
                                           }
+                                          // Negative-cache the now-confirmed
+                                          // absence, same as a NATS-confirmed
+                                          // GET miss -- the next GET for this
+                                          // key is a local hit, not another
+                                          // NATS round trip.
                                           name_cache.erase<NameTag>(key);
+                                          name_cache.emplace(NameEntry{key, {}, false});
                                           return encode_status(wire::Status::Ok);
                                       };
                                       completions.push(std::move(request), std::move(apply),
-                                                        "ERASE name=\"" + key + "\"", qkey);
+                                                        "ERASE name=\"" + key + "\"", qkey, revision, ok);
                                   });
             });
             return;
@@ -446,16 +473,19 @@ inline void dispatch_request(NameCache& name_cache, IdCache& id_cache, NatsBridg
         key_queue.enqueue(qkey, [&nats, &completions, id_bucket, request, key, qkey]() mutable {
             std::cout << "[server] ERASE id=" << key << " -> dispatched to NATS\n";
             nats.erase_async(id_bucket, std::to_string(key),
-                              [&completions, request, key, qkey](bool ok, std::string /*err*/) mutable {
+                              [&completions, request, key, qkey](bool ok, std::uint64_t revision,
+                                                                  std::string /*err*/) mutable {
                                   ApplyFn apply = [key, ok](NameCache&, IdCache& id_cache) -> std::vector<std::uint8_t> {
                                       if (!ok) {
                                           return encode_status(wire::Status::Error);
                                       }
+                                      // See the Name branch's identical comment.
                                       id_cache.erase<IdTag>(key);
+                                      id_cache.emplace(IdEntry{key, {}, false});
                                       return encode_status(wire::Status::Ok);
                                   };
                                   completions.push(std::move(request), std::move(apply),
-                                                    "ERASE id=" + std::to_string(key), qkey);
+                                                    "ERASE id=" + std::to_string(key), qkey, revision, ok);
                               });
         });
     } catch (const std::exception&) {
