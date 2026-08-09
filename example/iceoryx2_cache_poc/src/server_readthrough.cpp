@@ -54,6 +54,11 @@
 ///                                                        default is 8; see README.md "Load testing")
 ///   --max-active-requests-per-client / MIL_MAX_ACTIVE_REQUESTS_PER_CLIENT
 ///                                                      (default 32 -- iceoryx2-cxx's own default is 4)
+///   --max-queue-depth-per-key / MIL_MAX_QUEUE_DEPTH_PER_KEY
+///                                                      (default 64 -- backpressure: a key already
+///                                                       this deep in KeyOperationQueue rejects any
+///                                                       further request for it with Error instead of
+///                                                       queuing indefinitely; see README.md "Backpressure")
 #include "server_dispatch.hpp"
 #include "config.hpp"
 
@@ -95,6 +100,8 @@ int main(int argc, char** argv) {
     const std::size_t max_clients = poc::config::resolve_size(args, "--max-clients", "MIL_MAX_CLIENTS", 16);
     const std::size_t max_active_requests_per_client = poc::config::resolve_size(
         args, "--max-active-requests-per-client", "MIL_MAX_ACTIVE_REQUESTS_PER_CLIENT", 32);
+    const std::size_t max_queue_depth_per_key =
+        poc::config::resolve_size(args, "--max-queue-depth-per-key", "MIL_MAX_QUEUE_DEPTH_PER_KEY", 64);
 
     // Declared before `nats` on purpose: local variables are destroyed in
     // reverse declaration order, and NatsBridge's own coroutines (get_async/
@@ -107,7 +114,7 @@ int main(int argc, char** argv) {
     poc::NameCache name_cache(capacity, ttl);
     poc::IdCache id_cache(capacity, ttl);
     poc::CompletionQueue completions;
-    poc::KeyOperationQueue key_queue;
+    poc::KeyOperationQueue key_queue(max_queue_depth_per_key);
     poc::RevisionTracker revisions;
     poc::InvalidationQueue invalidations;
     auto last_cleanup = std::chrono::steady_clock::now();

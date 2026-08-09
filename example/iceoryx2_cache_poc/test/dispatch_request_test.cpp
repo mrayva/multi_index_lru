@@ -32,12 +32,19 @@ namespace poc {
 namespace {
 
 constexpr auto kTestServiceName = "multi_index_lru/cache/rpc/dispatch_request_test";
+// Comfortably above the deepest any other test in this file pushes for a
+// single key (2), while still small enough that
+// KeyQueueBackpressureRejectsRequestsBeyondPerKeyDepthLimit below can
+// exceed it without needing an unwieldy number of requests.
+constexpr std::size_t kKeyQueueDepth = 8;
 
 using NodeType = iox2::Node<iox2::ServiceType::Ipc>;
 using ServerType = iox2::Server<iox2::ServiceType::Ipc, iox2::bb::Slice<std::uint8_t>, void, iox2::bb::Slice<std::uint8_t>,
                                  void>;
 using ClientType = iox2::Client<iox2::ServiceType::Ipc, iox2::bb::Slice<std::uint8_t>, void, iox2::bb::Slice<std::uint8_t>,
                                  void>;
+using PendingResponseType = iox2::PendingResponse<iox2::ServiceType::Ipc, iox2::bb::Slice<std::uint8_t>, void,
+                                                    iox2::bb::Slice<std::uint8_t>, void>;
 
 std::vector<std::uint8_t> bytes(const std::string& s) {
     return std::vector<std::uint8_t>(s.begin(), s.end());
@@ -67,8 +74,15 @@ protected:
 
         node_.emplace(iox2::NodeBuilder().create<iox2::ServiceType::Ipc>().value());
 
+        // max_active_requests_per_client above iceoryx2-cxx's own default
+        // (4) -- KeyQueueBackpressureRejectsRequestsBeyondPerKeyDepthLimit
+        // below keeps kKeyQueueDepth + 3 requests in flight on this same
+        // client at once to observe the backpressure rejection itself, not
+        // iceoryx2's own separate concurrency ceiling (see README.md "Load
+        // testing" for how that ceiling was found in the first place).
         auto service = node_->service_builder(iox2::ServiceName::create(kTestServiceName).value())
                            .request_response<iox2::bb::Slice<std::uint8_t>, iox2::bb::Slice<std::uint8_t>>()
+                           .max_active_requests_per_client(kKeyQueueDepth + 8)
                            .open_or_create()
                            .value();
 
@@ -161,7 +175,7 @@ protected:
     std::optional<NameCache> name_cache_;
     std::optional<IdCache> id_cache_;
     CompletionQueue completions_;
-    KeyOperationQueue key_queue_;
+    KeyOperationQueue key_queue_{kKeyQueueDepth};
     // Per-test, unlike invalidations_ -- each test's caches are freshly
     // reset in SetUp(), so there's nothing to gain from remembering
     // revisions across tests, and keeping it per-test avoids one test's
@@ -298,6 +312,24 @@ TEST_F(DispatchRequestTest, InFlightMissDoesNotBlockAConcurrentLocalHit) {
 
 TEST_F(DispatchRequestTest, NegativeCacheAvoidsSecondNatsRoundTripForNeverWrittenKey) {
     nats_->erase(kNameBucket, "never_written");
+
+    // Drain that erase's own watch echo before proceeding: it's a direct
+    // NATS call bypassing dispatch_request(), so its revision never reaches
+    // revisions_, and the GET-miss below is about to populate a
+    // negative-cache entry that -- for the same reason NATS gives no
+    // revision for a key that's never existed -- also can't record one.
+    // If the echo of *this* erase call instead arrived after that entry
+    // existed, apply_pending_invalidations() would have nothing to compare
+    // it against and would wrongly treat an echo of something that
+    // logically happened *before* the GET below as new information,
+    // evicting the entry this test is about to assert on. Give it a moment
+    // to arrive and be processed first so nothing is left in flight to
+    // race against.
+    const auto drain_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+    while (std::chrono::steady_clock::now() < drain_deadline) {
+        pump_server();
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
 
     // First GET is a genuine miss: local cache empty, NATS also confirms
     // absence -- must go through the deferred NATS path.
@@ -443,6 +475,51 @@ TEST_F(DispatchRequestTest, ConcurrentGetMissesOnSameKeyCoalesceInsteadOfDuplica
     EXPECT_EQ(str(r2.remaining()), "herd-value");
 
     nats_->erase(kNameBucket, "herd_key");
+}
+
+// --- Backpressure: KeyOperationQueue's per-key depth limit -----------------
+
+TEST_F(DispatchRequestTest, KeyQueueBackpressureRejectsRequestsBeyondPerKeyDepthLimit) {
+    nats_->erase(kNameBucket, "backpressure_key");
+
+    // Send more GETs for the SAME key than kKeyQueueDepth allows. The first
+    // is dispatched to NATS; everything after it queues behind that one
+    // in-flight operation -- until the queue is full, at which point
+    // enqueue() must reject rather than keep growing it. Rejection itself
+    // is synchronous (no network round trip involved), so it's always
+    // resolved by the time this loop's own pump_server() call returns --
+    // but *accepted* ones can resolve at any point after that (including
+    // cascading through several at once the instant the one in-flight NATS
+    // call completes, via KeyOperationQueue::complete()), so this test reads
+    // final status per request via wait_for_response() below rather than
+    // asserting anything about whether a given one is "still pending" at
+    // any particular moment.
+    std::vector<PendingResponseType> pendings;
+    for (std::size_t i = 0; i < kKeyQueueDepth + 3; ++i) {
+        pendings.push_back(send_request(encode_get(wire::KeyKind::Name, "backpressure_key", 0)));
+        pump_server();
+    }
+
+    for (std::size_t i = 0; i < pendings.size(); ++i) {
+        auto response_bytes = wait_for_response(pendings[i]);
+        wire::Reader r(response_bytes.data(), response_bytes.size());
+        const auto status = static_cast<wire::Status>(r.u8());
+        if (i < kKeyQueueDepth) {
+            EXPECT_NE(status, wire::Status::Error)
+                << "request #" << i << " (within the depth limit) should not have been rejected";
+        } else {
+            EXPECT_EQ(status, wire::Status::Error)
+                << "request #" << i << " (past the depth limit) should have been rejected";
+        }
+    }
+
+    // A completely different key must be entirely unaffected by the first
+    // key's queue being full -- backpressure is per-key, not global.
+    auto other_bytes = round_trip(encode_get(wire::KeyKind::Id, "", 424242));
+    wire::Reader other_r(other_bytes.data(), other_bytes.size());
+    EXPECT_EQ(static_cast<wire::Status>(other_r.u8()), wire::Status::NotFound);
+
+    nats_->erase(kNameBucket, "backpressure_key");
 }
 
 // --- Cross-daemon coherence: kv_watch-driven invalidation -----------------

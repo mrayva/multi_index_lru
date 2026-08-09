@@ -185,6 +185,7 @@ accepted for flags with a value: `--flag value` or `--flag=value`.
 | `--ttl-ms` | `MIL_TTL_MS` | `300000` (5min) | `server.cpp`, `server_readthrough.cpp` (applies to both caches) |
 | `--max-clients` | `MIL_MAX_CLIENTS` | `16` | `server.cpp`, `server_readthrough.cpp` (iceoryx2-cxx's own default is 8, see "Load testing") |
 | `--max-active-requests-per-client` | `MIL_MAX_ACTIVE_REQUESTS_PER_CLIENT` | `32` | `server.cpp`, `server_readthrough.cpp` (iceoryx2-cxx's own default is 4, see "Load testing") |
+| `--max-queue-depth-per-key` | `MIL_MAX_QUEUE_DEPTH_PER_KEY` | `64` | `server_readthrough.cpp` (`KeyOperationQueue` backpressure, see "Backpressure") |
 | `--nats-host` | `MIL_NATS_HOST` | `127.0.0.1` | `server_readthrough.cpp`, `client_readthrough.cpp` |
 | `--nats-port` | `MIL_NATS_PORT` | `4222` | `server_readthrough.cpp`, `client_readthrough.cpp` |
 | `--name-bucket` | `MIL_NAME_BUCKET` | `poc::kNameBucket` (`mil_by_name`) | `server_readthrough.cpp`, `client_readthrough.cpp` |
@@ -791,12 +792,42 @@ climbed from a ~27MB baseline to ~35MB as the 200-deep backlog built up (the
 holding for everything queued behind the one in-flight NATS call), then
 dropped back down to ~27MB within seconds of the backlog draining --
 consistent with memory usage that tracks queue depth and recedes once the
-backlog clears, not an unbounded leak. That said, nothing currently *caps*
-how deep that queue can get -- worst case is bounded only by iceoryx2's own
-`max_active_requests_per_client` x `max_clients` ceiling (512, per the fix
-above) times however many separate client processes are hammering the same
-key, which is the same gap "Failure handling" below already flags as
-"no rate limiting or backpressure."
+backlog clears, not an unbounded leak. At the time, though, nothing actually
+*capped* how deep that queue could get -- see "Backpressure" below for the
+fix this measurement led to directly.
+
+## Backpressure
+
+"Load testing" above measured what was previously just a guess: a hot key's
+`KeyOperationQueue` backlog grows with however many concurrent requests are
+offered for it, with no ceiling of its own -- the only thing stopping it
+from growing arbitrarily deep was iceoryx2's own
+`max_active_requests_per_client` x `max_clients` config, times however many
+separate client processes were hammering that key at once (512, per "Load
+testing"'s fix to those). A client (or several) that can push past whatever
+that product happens to be could still queue indefinitely.
+
+`KeyOperationQueue` now takes a `max_depth_per_key` (`--max-queue-depth-per-key`/
+`MIL_MAX_QUEUE_DEPTH_PER_KEY`, default 64, see "Configuration" above):
+`enqueue()` counts what's already queued for that key (the one operation in
+flight plus everything waiting behind it) and, once at the limit, rejects
+the next one instead of growing the queue further -- `dispatch_request()`
+responds `Error` immediately rather than making that caller wait behind an
+ever-growing backlog for a key that's clearly not keeping up. Every other
+key is completely unaffected: this is a per-key limit enforced inside
+`KeyOperationQueue` itself, not a global one, so a saturated hot key never
+throttles traffic to any other key.
+
+Verified live: started `cache_poc_server_readthrough --max-queue-depth-per-key=5`,
+then ran `cache_poc_load_test --op put --key-pool-size 1 --concurrency 32
+--total-requests 100` against it -- exactly 6 PUTs succeeded (1 in flight +
+5 queued) and the other 94 came back `Error`, matching 94 `rejected (queue
+full for this key)` lines in the daemon's own log. A `GET` for a completely
+different key immediately afterward, while that queue was still full,
+returned normally -- confirming the per-key scoping. `dispatch_request_test.cpp`'s
+`KeyQueueBackpressureRejectsRequestsBeyondPerKeyDepthLimit` covers the same
+two things at the unit level (exactly the requests past the depth limit are
+rejected, a different key is unaffected) on every `ctest` invocation.
 
 ## What this doesn't answer yet
 
@@ -821,23 +852,16 @@ becomes more than a POC:
   covers multiple daemons; a watched key is dropped from the local cache, not
   proactively re-fetched, so the cost of staying coherent is paid by the next
   GET for that key (a real miss), not by the watch event itself.
-- **No backpressure or queue depth limit.** "Load testing" above measured
-  what was previously just a guess: a hot key's `KeyOperationQueue` backlog
-  grows with however many concurrent requests are offered for it, memory
-  tracks that and recedes once the backlog clears (not a leak), but nothing
-  actually *caps* how deep it can get -- the only ceiling is iceoryx2's own
-  `max_active_requests_per_client` x `max_clients` config, times however
-  many client processes are hammering that key at once. Same gap as
-  "Failure handling"'s "no rate limiting or backpressure" below, now with
-  real numbers behind it instead of a guess.
 - **Failure handling.** No handling of the daemon process dying mid-request
   beyond what iceoryx2 does by default. A malformed/truncated request (or an
   unexpected NATS-side exception) is now caught at the request-handling
   boundary and turned into an `Error` response instead of crashing the
   daemon — see `handle_request_local()` in `cache_service.hpp` and
-  `handle_request()`/`nats_bridge.hpp` in the NATS-backed server — but there's
-  still no rate limiting or backpressure if a client hammers the daemon with
-  bad requests. Signal handling needed no fix: iceoryx2's `node.wait()`
+  `handle_request()`/`nats_bridge.hpp` in the NATS-backed server. "Backpressure"
+  above caps how deep a single *hot key*'s backlog can get, but there's
+  still no *global* rate limit -- nothing stops a client from spamming
+  requests spread across many different (valid or malformed) keys as fast
+  as it can. Signal handling needed no fix: iceoryx2's `node.wait()`
   already returns an unhappy result on SIGINT/SIGTERM, so the existing
   `while (node.wait(...))` loop already exits gracefully and lets `main()`
   return normally, running `NatsBridge`'s destructor (clean NATS thread

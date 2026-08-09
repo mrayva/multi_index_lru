@@ -21,6 +21,7 @@
 #include <iostream>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -128,16 +129,44 @@ inline void respond(ActiveRequestType& active_request, const std::vector<std::ui
 // protection the old blocking-bridge design gave for free and the move to
 // non-blocking dispatch had otherwise dropped.
 //
+// Backpressure: `max_depth_per_key` caps how many operations (in flight plus
+// queued) a single key can accumulate. Without a cap, a client (or several)
+// hammering one hot key with PUTs -- each necessarily serialized behind the
+// last since they share a key -- can queue arbitrarily many closures (each
+// holding an ActiveRequestPtr and its own captured request bytes) with
+// throughput bounded by NATS round-trip latency alone; README.md "Load
+// testing" measured this directly (memory tracked queue depth and receded
+// once it drained, so not a leak, but nothing was stopping that depth from
+// growing without limit). Once a key is at capacity, enqueue() rejects
+// instead of queuing -- dispatch_request() responds Error immediately,
+// rather than making the caller wait behind an ever-growing backlog for a
+// key that's clearly not keeping up. Other keys are entirely unaffected:
+// this is a per-key limit, not a global one.
+//
 // enqueue() and complete() are only ever called from the main iceoryx2
 // thread (dispatch_request()'s call site and CompletionQueue's drain loop in
 // server_readthrough.cpp's main()), never from the NATS thread, so no
 // locking is needed here.
 class KeyOperationQueue {
 public:
+    explicit KeyOperationQueue(std::size_t max_depth_per_key) : max_depth_per_key_(max_depth_per_key) {
+        if (max_depth_per_key == 0) {
+            throw std::invalid_argument("KeyOperationQueue: max_depth_per_key must be positive");
+        }
+    }
+
     // If no operation is currently in flight for `key`, runs `op` immediately
-    // (synchronously, before returning). If one already is, queues `op` to
-    // run automatically once the current holder calls complete(key).
-    void enqueue(const std::string& key, std::function<void()> op) {
+    // (synchronously, before returning) and returns true. If one already is,
+    // queues `op` to run automatically once the current holder calls
+    // complete(key) and returns true -- unless `key`'s queue (in flight plus
+    // already queued) is already at max_depth_per_key, in which case `op` is
+    // left untouched and this returns false: the caller must respond to
+    // that request itself instead (see dispatch_request()'s rejection path).
+    bool enqueue(const std::string& key, std::function<void()> op) {
+        auto it = queues_.find(key);
+        if (it != queues_.end() && it->second.size() >= max_depth_per_key_) {
+            return false;
+        }
         auto& q = queues_[key];
         q.push_back(std::move(op));
         if (q.size() == 1) {
@@ -148,6 +177,7 @@ public:
             std::function<void()> to_run = q.front();
             to_run();
         }
+        return true;
     }
 
     // Must be called exactly once, when the operation currently at the front
@@ -168,6 +198,7 @@ public:
     }
 
 private:
+    std::size_t max_depth_per_key_;
     std::unordered_map<std::string, std::deque<std::function<void()>>> queues_;
 };
 
@@ -301,8 +332,8 @@ inline void dispatch_request(NameCache& name_cache, IdCache& id_cache, NatsBridg
                 auto key = r.str();
                 auto qkey = name_queue_key(key);
                 auto request = std::make_shared<ActiveRequestType>(std::move(active_request));
-                key_queue.enqueue(qkey, [&name_cache, &nats, &completions, &key_queue, name_bucket, request, key,
-                                          qkey]() mutable {
+                if (!key_queue.enqueue(qkey, [&name_cache, &nats, &completions, &key_queue, name_bucket, request, key,
+                                               qkey]() mutable {
                     if (auto it = name_cache.find<NameTag>(key); it != name_cache.end<NameTag>()) {
                         if (it->found) {
                             std::cout << "[server] GET name=\"" << key << "\" -> local hit\n";
@@ -335,15 +366,18 @@ inline void dispatch_request(NameCache& name_cache, IdCache& id_cache, NatsBridg
                                           result.result == NatsResult::Ok ? result.revision : 0,
                                           result.result == NatsResult::Ok);
                     });
-                });
+                })) {
+                    std::cout << "[server] GET name=\"" << key << "\" -> rejected (queue full for this key)\n";
+                    respond(*request, encode_status(wire::Status::Error));
+                }
                 return;
             }
 
             auto key = r.i64();
             auto qkey = id_queue_key(key);
             auto request = std::make_shared<ActiveRequestType>(std::move(active_request));
-            key_queue.enqueue(qkey,
-                               [&id_cache, &nats, &completions, &key_queue, id_bucket, request, key, qkey]() mutable {
+            if (!key_queue.enqueue(
+                    qkey, [&id_cache, &nats, &completions, &key_queue, id_bucket, request, key, qkey]() mutable {
                                    if (auto it = id_cache.find<IdTag>(key); it != id_cache.end<IdTag>()) {
                                        if (it->found) {
                                            std::cout << "[server] GET id=" << key << " -> local hit\n";
@@ -380,7 +414,10 @@ inline void dispatch_request(NameCache& name_cache, IdCache& id_cache, NatsBridg
                                                                             : 0,
                                                                         result.result == NatsResult::Ok);
                                                   });
-                               });
+                               })) {
+                std::cout << "[server] GET id=" << key << " -> rejected (queue full for this key)\n";
+                respond(*request, encode_status(wire::Status::Error));
+            }
             return;
         }
 
@@ -390,7 +427,7 @@ inline void dispatch_request(NameCache& name_cache, IdCache& id_cache, NatsBridg
                 auto record = r.bytes(r.u32());
                 auto qkey = name_queue_key(key);
                 auto request = std::make_shared<ActiveRequestType>(std::move(active_request));
-                key_queue.enqueue(qkey, [&nats, &completions, name_bucket, request, key, record, qkey]() mutable {
+                if (!key_queue.enqueue(qkey, [&nats, &completions, name_bucket, request, key, record, qkey]() mutable {
                     std::cout << "[server] PUT name=\"" << key << "\" -> dispatched to NATS\n";
                     nats.put_async(name_bucket, key, record,
                                     [&completions, request, key, record, qkey](bool ok, std::uint64_t revision,
@@ -407,7 +444,10 @@ inline void dispatch_request(NameCache& name_cache, IdCache& id_cache, NatsBridg
                                         completions.push(std::move(request), std::move(apply),
                                                           "PUT name=\"" + key + "\"", qkey, revision, ok);
                                     });
-                });
+                })) {
+                    std::cout << "[server] PUT name=\"" << key << "\" -> rejected (queue full for this key)\n";
+                    respond(*request, encode_status(wire::Status::Error));
+                }
                 return;
             }
 
@@ -415,7 +455,7 @@ inline void dispatch_request(NameCache& name_cache, IdCache& id_cache, NatsBridg
             auto record = r.bytes(r.u32());
             auto qkey = id_queue_key(key);
             auto request = std::make_shared<ActiveRequestType>(std::move(active_request));
-            key_queue.enqueue(qkey, [&nats, &completions, id_bucket, request, key, record, qkey]() mutable {
+            if (!key_queue.enqueue(qkey, [&nats, &completions, id_bucket, request, key, record, qkey]() mutable {
                 std::cout << "[server] PUT id=" << key << " -> dispatched to NATS\n";
                 nats.put_async(id_bucket, std::to_string(key), record,
                                 [&completions, request, key, record, qkey](bool ok, std::uint64_t revision,
@@ -432,7 +472,10 @@ inline void dispatch_request(NameCache& name_cache, IdCache& id_cache, NatsBridg
                                     completions.push(std::move(request), std::move(apply),
                                                       "PUT id=" + std::to_string(key), qkey, revision, ok);
                                 });
-            });
+            })) {
+                std::cout << "[server] PUT id=" << key << " -> rejected (queue full for this key)\n";
+                respond(*request, encode_status(wire::Status::Error));
+            }
             return;
         }
 
@@ -441,7 +484,7 @@ inline void dispatch_request(NameCache& name_cache, IdCache& id_cache, NatsBridg
             auto key = r.str();
             auto qkey = name_queue_key(key);
             auto request = std::make_shared<ActiveRequestType>(std::move(active_request));
-            key_queue.enqueue(qkey, [&nats, &completions, name_bucket, request, key, qkey]() mutable {
+            if (!key_queue.enqueue(qkey, [&nats, &completions, name_bucket, request, key, qkey]() mutable {
                 std::cout << "[server] ERASE name=\"" << key << "\" -> dispatched to NATS\n";
                 nats.erase_async(name_bucket, key,
                                   [&completions, request, key, qkey](bool ok, std::uint64_t revision,
@@ -463,14 +506,17 @@ inline void dispatch_request(NameCache& name_cache, IdCache& id_cache, NatsBridg
                                       completions.push(std::move(request), std::move(apply),
                                                         "ERASE name=\"" + key + "\"", qkey, revision, ok);
                                   });
-            });
+            })) {
+                std::cout << "[server] ERASE name=\"" << key << "\" -> rejected (queue full for this key)\n";
+                respond(*request, encode_status(wire::Status::Error));
+            }
             return;
         }
 
         auto key = r.i64();
         auto qkey = id_queue_key(key);
         auto request = std::make_shared<ActiveRequestType>(std::move(active_request));
-        key_queue.enqueue(qkey, [&nats, &completions, id_bucket, request, key, qkey]() mutable {
+        if (!key_queue.enqueue(qkey, [&nats, &completions, id_bucket, request, key, qkey]() mutable {
             std::cout << "[server] ERASE id=" << key << " -> dispatched to NATS\n";
             nats.erase_async(id_bucket, std::to_string(key),
                               [&completions, request, key, qkey](bool ok, std::uint64_t revision,
@@ -487,7 +533,10 @@ inline void dispatch_request(NameCache& name_cache, IdCache& id_cache, NatsBridg
                                   completions.push(std::move(request), std::move(apply),
                                                     "ERASE id=" + std::to_string(key), qkey, revision, ok);
                               });
-        });
+        })) {
+            std::cout << "[server] ERASE id=" << key << " -> rejected (queue full for this key)\n";
+            respond(*request, encode_status(wire::Status::Error));
+        }
     } catch (const std::exception&) {
         respond(active_request, encode_status(wire::Status::Error));
     } catch (...) {
