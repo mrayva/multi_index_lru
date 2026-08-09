@@ -233,6 +233,23 @@ TEST_F(HandleRequestLocalTest, EraseRemovesEntryFromCategoryIndexToo) {
     EXPECT_EQ(decode_get_all(handle(encode_get_all("friends"))), std::nullopt);
 }
 
+// GetAll(KeyKind::Name) -- prefix lookup -- is NATS-backed only
+// (server_readthrough.cpp); this purely in-memory handler has no NATS to
+// ask, so it must reject rather than silently reinterpreting the prefix
+// string as a category. See cache_service.hpp "Prefix lookup (GetAll,
+// KeyKind::Name)".
+TEST_F(HandleRequestLocalTest, GetAllWithNameKindIsRejectedNoNatsToAskHere) {
+    // Seed a category that happens to share its name with the prefix this
+    // request sends, so a bug that ignored `kind` (falling through to the
+    // category path) would silently "succeed" with a wrong-but-plausible
+    // answer instead of erroring -- a stronger check than an empty cache
+    // would give.
+    handle(encode_put(wire::KeyKind::Name, "alice", 0, text("A"), "some_prefix"));
+
+    EXPECT_EQ(decode_status(handle(encode_get_all_by_prefix("some_prefix"))), wire::Status::Error);
+    EXPECT_EQ(decode_get_all(handle(encode_get_all_by_prefix("some_prefix"))), std::nullopt);
+}
+
 TEST_F(HandleRequestLocalTest, GetAllRespectsMaxResultsCapAndSetsTruncatedFlag) {
     for (int i = 0; i < 5; ++i) {
         handle(encode_put(wire::KeyKind::Name, "person" + std::to_string(i), 0, text("v"), "crowd"));

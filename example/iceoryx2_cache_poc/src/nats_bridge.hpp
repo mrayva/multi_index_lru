@@ -71,6 +71,19 @@ struct NatsGetResult {
     std::string error;                // valid iff result == Error
 };
 
+// Result of list_and_get_async(): every (full NATS key, value) pair matching
+// a wildcard pattern, fetched as of a single point in time. `entries` uses
+// the *full* NATS key (e.g. "alice.email"), not the prefix that was queried
+// -- see server_dispatch.hpp's GetAll/prefix handling for why that matters
+// (each entry becomes its own NameCache record, individually addressable by
+// a later plain Get).
+struct NatsListResult {
+    NatsResult result = NatsResult::Error;
+    std::vector<std::pair<std::string, std::vector<std::uint8_t>>> entries;  // valid iff result == Ok
+    bool truncated = false;  // valid iff result == Ok; true iff more than max_results keys matched
+    std::string error;       // valid iff result == Error
+};
+
 class NatsBridge {
 public:
     NatsBridge(const std::string& host, std::uint16_t port,
@@ -243,6 +256,85 @@ public:
                     record_failure();
                     on_done(false, 0, "unknown exception");
                 }
+                co_return;
+            },
+            asio::detached);
+    }
+
+    // Lists every key matching `key_pattern` (a NATS subject pattern scoped
+    // under `bucket` -- e.g. "alice.*" or "alice.>", NOT a plain key) and
+    // fetches each one's current value, one at a time, in a single
+    // coroutine. Sequential rather than fanned out in parallel: this is a
+    // POC-scope tradeoff (see server_dispatch.hpp's GetAll/prefix handling)
+    // -- fine for a prefix with a handful of matches, would want
+    // parallelizing if some prefix's fan-out gets wide. `max_results` caps
+    // how many matched keys are actually fetched (`truncated` reports
+    // whether more existed than that).
+    //
+    // Listing and fetching aren't atomic: a key can be deleted between the
+    // kv_keys() call and its kv_get() here, racing with a concurrent writer.
+    // Such a key is silently dropped from `entries` rather than failing the
+    // whole call -- same "best effort as of roughly now" contract GetAll
+    // already has for the local category index (see cache_service.hpp).
+    //
+    // on_done: void(NatsListResult)
+    template <typename Callback>
+    void list_and_get_async(const std::string& bucket, const std::string& key_pattern, std::size_t max_results,
+                             Callback on_done) {
+        if (is_circuit_open()) {
+            NatsListResult result;
+            result.result = NatsResult::Error;
+            result.error = "circuit breaker open: NATS considered unavailable";
+            on_done(std::move(result));
+            return;
+        }
+
+        auto conn = conn_;
+        auto timeout = timeout_;
+
+        asio::co_spawn(
+            ioc_,
+            [this, conn, bucket, key_pattern, timeout, max_results,
+             on_done = std::move(on_done)]() mutable -> asio::awaitable<void> {
+                NatsListResult result;
+                try {
+                    auto [keys, key_status] = co_await conn->kv_keys(bucket, key_pattern, timeout);
+                    if (!key_status.ok()) {
+                        record_failure();
+                        result.result = NatsResult::Error;
+                        result.error = key_status.error();
+                        on_done(std::move(result));
+                        co_return;
+                    }
+
+                    result.truncated = keys.size() > max_results;
+                    if (result.truncated) {
+                        keys.resize(max_results);
+                    }
+
+                    for (const auto& key : keys) {
+                        auto [entry, get_status] = co_await conn->kv_get(bucket, key, timeout);
+                        if (get_status.ok()) {
+                            result.entries.emplace_back(
+                                key, std::vector<std::uint8_t>(entry.value.begin(), entry.value.end()));
+                        }
+                        // A miss/error on one key (raced with a delete, or a
+                        // transient hiccup) doesn't fail the whole batch --
+                        // it's simply excluded, same as it would be if it
+                        // hadn't matched the pattern at all.
+                    }
+                    record_success();
+                    result.result = NatsResult::Ok;
+                } catch (const std::exception& e) {
+                    record_failure();
+                    result.result = NatsResult::Error;
+                    result.error = std::string("exception: ") + e.what();
+                } catch (...) {
+                    record_failure();
+                    result.result = NatsResult::Error;
+                    result.error = "unknown exception";
+                }
+                on_done(std::move(result));
                 co_return;
             },
             asio::detached);

@@ -13,10 +13,15 @@
 ///   cache_poc_client put    name <name> <record-text> [category]
 ///   cache_poc_client put    id   <id>   <record-text>
 ///   cache_poc_client getall <category>
+///   cache_poc_client getallprefix <name-prefix>
 ///
 /// `getall` and `put name`'s optional trailing [category] exercise
 /// NameCache's second (non-unique) index -- see cache_service.hpp
 /// "Non-unique key lookup (GetAll)". Id-keyed entries have no category.
+///
+/// `getallprefix` is NATS-backed only (server_readthrough.cpp) -- see
+/// cache_service.hpp "Prefix lookup (GetAll, KeyKind::Name)". Against
+/// server.cpp (no NATS) it always responds "error".
 ///
 /// Run server.cpp (or server_readthrough.cpp) first in one terminal, then
 /// this in another.
@@ -102,6 +107,26 @@ void print_get_all_result(const std::vector<std::uint8_t>& response_bytes) {
     for (std::uint32_t i = 0; i < count; ++i) {
         auto record = r.bytes(r.u32());
         std::cout << "     " << std::string(record.begin(), record.end()) << "\n";
+    }
+}
+
+// Decodes a GetAll(prefix) response -- see cache_service.hpp's
+// "GetAll(prefix)+Ok" wire format: unlike category GetAll, each match
+// carries its own full NATS key alongside the record.
+void print_get_all_prefix_result(const std::vector<std::uint8_t>& response_bytes) {
+    poc::wire::Reader r(response_bytes.data(), response_bytes.size());
+    const auto status = static_cast<poc::wire::Status>(r.u8());
+    if (status != poc::wire::Status::Ok) {
+        std::cout << "  -> " << status_name(status) << "\n";
+        return;
+    }
+    const auto count = r.u32();
+    const bool truncated = r.u8() != 0;
+    std::cout << "  -> " << count << " key(s)" << (truncated ? " (truncated -- more matched)" : "") << ":\n";
+    for (std::uint32_t i = 0; i < count; ++i) {
+        auto key = r.str();
+        auto record = r.bytes(r.u32());
+        std::cout << "     " << key << " = " << std::string(record.begin(), record.end()) << "\n";
     }
 }
 
@@ -222,6 +247,8 @@ void run_manual_command(Client& client, iox2::Node<iox2::ServiceType::Ipc>& node
             "put");
     } else if (verb == "getall" && args.size() == 2) {
         print_get_all_result(call(client, node, poc::encode_get_all(args[1])));
+    } else if (verb == "getallprefix" && args.size() == 2) {
+        print_get_all_prefix_result(call(client, node, poc::encode_get_all_by_prefix(args[1])));
     } else {
         std::cerr << "usage:\n"
                   << "  cache_poc_client                                    (run demo script)\n"
@@ -231,7 +258,8 @@ void run_manual_command(Client& client, iox2::Node<iox2::ServiceType::Ipc>& node
                   << "  cache_poc_client erase  id   <id>\n"
                   << "  cache_poc_client put    name <name> <record-text> [category]\n"
                   << "  cache_poc_client put    id   <id>   <record-text>\n"
-                  << "  cache_poc_client getall <category>\n";
+                  << "  cache_poc_client getall <category>\n"
+                  << "  cache_poc_client getallprefix <name-prefix>          (NATS-backed only)\n";
         std::exit(1);
     }
 }

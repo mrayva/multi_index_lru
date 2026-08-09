@@ -84,6 +84,26 @@ void print_put_result(const std::vector<std::uint8_t>& response_bytes) {
     std::cout << "  -> put: " << status_name(status) << "\n";
 }
 
+// Decodes a GetAll(prefix) response -- see cache_service.hpp's
+// "GetAll(prefix)+Ok" wire format: unlike category GetAll, each match
+// carries its own full NATS key alongside the record.
+void print_get_all_prefix_result(const std::vector<std::uint8_t>& response_bytes) {
+    poc::wire::Reader r(response_bytes.data(), response_bytes.size());
+    const auto status = static_cast<poc::wire::Status>(r.u8());
+    if (status != poc::wire::Status::Ok) {
+        std::cout << "  -> " << status_name(status) << "\n";
+        return;
+    }
+    const auto count = r.u32();
+    const bool truncated = r.u8() != 0;
+    std::cout << "  -> " << count << " key(s)" << (truncated ? " (truncated -- more matched)" : "") << ":\n";
+    for (std::uint32_t i = 0; i < count; ++i) {
+        auto key = r.str();
+        auto record = r.bytes(r.u32());
+        std::cout << "     " << key << " = " << std::string(record.begin(), record.end()) << "\n";
+    }
+}
+
 std::vector<std::uint8_t> to_bytes(const std::string& s) {
     return std::vector<std::uint8_t>(s.begin(), s.end());
 }
@@ -177,6 +197,34 @@ int main(int argc, char** argv) {
                       ? "not found -- confirmed NATS was updated, not just the local cache"
                       : "still present -- erase did NOT propagate to NATS!")
               << "\n";
+
+    std::cout << "\n--- GetAll(prefix): one primary key, several NATS keys underneath it ---\n";
+
+    // Seed directly into NATS, bypassing the daemon entirely -- same idea as
+    // "seeded_directly" above, but three keys sharing a "." prefix rather
+    // than one plain key. Delete first so repeat runs are deterministic.
+    nats.erase(name_bucket, "prefix_demo.email");
+    nats.erase(name_bucket, "prefix_demo.phone");
+    nats.erase(name_bucket, "other_prefix.email");
+    nats.put(name_bucket, "prefix_demo.email", to_bytes("prefix_demo@example.com"));
+    nats.put(name_bucket, "prefix_demo.phone", to_bytes("555-0100"));
+    nats.put(name_bucket, "other_prefix.email", to_bytes("someone-else@example.com"));
+    std::cout << "[client] seeded \"prefix_demo.email\", \"prefix_demo.phone\", \"other_prefix.email\" directly in NATS\n";
+
+    std::cout << "[client] GETALL name-prefix=\"prefix_demo\" (should return exactly the two prefix_demo.* keys) ...\n";
+    print_get_all_prefix_result(call(client, node, poc::encode_get_all_by_prefix("prefix_demo")));
+
+    std::cout << "[client] GETALL name-prefix=\"prefix_demo\" again (still asks NATS -- a repeat GetAll never trusts"
+                 " the cache alone, since a new key added under the prefix since the last call wouldn't be known"
+                 " locally; see cache_service.hpp) ...\n";
+    print_get_all_prefix_result(call(client, node, poc::encode_get_all_by_prefix("prefix_demo")));
+
+    std::cout << "[client] GET name=\"prefix_demo.email\" (a *plain* Get for one of GETALL's matches IS a local hit"
+                 " now -- watch server_readthrough.cpp's own log) ...\n";
+    print_get_result(call(client, node, poc::encode_get(poc::wire::KeyKind::Name, "prefix_demo.email", 0)));
+
+    std::cout << "[client] GETALL name-prefix=\"nonexistent_prefix\" ...\n";
+    print_get_all_prefix_result(call(client, node, poc::encode_get_all_by_prefix("nonexistent_prefix")));
 
     std::cout << "\n[client] exit\n";
     return 0;

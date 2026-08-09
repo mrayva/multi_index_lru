@@ -366,9 +366,14 @@ inline void apply_pending_invalidations(NameCache& name_cache, IdCache& id_cache
 // server_readthrough.cpp and README.md "Read-only by default"): when false,
 // both are rejected with Status::ReadOnly before touching key_queue or NATS
 // at all -- a write that's always going to be refused shouldn't cost a
-// queue slot or count against another key's backpressure budget. Get (and,
-// if it's ever wired up here, GetAll) are never gated; this only concerns
-// writes.
+// queue slot or count against another key's backpressure budget. Get and
+// GetAll are never gated; this only concerns writes.
+//
+// `max_getall_results` caps how many matched keys a GetAll(prefix) request
+// actually fetches from NATS -- same purpose and default as server.cpp's
+// --max-getall-results for the local category flavor (cache_service.hpp),
+// just threaded through as a parameter here since this handler has no
+// config module of its own to read it from.
 //
 // Any exception here (malformed/truncated request -- see wire::Reader) is
 // caught and turned into an immediate Error response; the same hardening
@@ -378,8 +383,8 @@ inline void apply_pending_invalidations(NameCache& name_cache, IdCache& id_cache
 // always respond with the still-intact `active_request` parameter directly.
 inline void dispatch_request(NameCache& name_cache, IdCache& id_cache, NatsBridge& nats, const std::string& name_bucket,
                               const std::string& id_bucket, CompletionQueue& completions, KeyOperationQueue& key_queue,
-                              bool allow_writes, ActiveRequestType active_request, const std::uint8_t* data,
-                              std::size_t size) {
+                              bool allow_writes, std::size_t max_getall_results, ActiveRequestType active_request,
+                              const std::uint8_t* data, std::size_t size) {
     try {
         wire::Reader r(data, size);
         const auto op = static_cast<wire::Op>(r.u8());
@@ -479,6 +484,69 @@ inline void dispatch_request(NameCache& name_cache, IdCache& id_cache, NatsBridg
                                                   });
                                })) {
                 std::cout << "[server] GET id=" << key << " -> rejected (queue full for this key)\n";
+                respond(*request, encode_status(wire::Status::Error));
+            }
+            return;
+        }
+
+        if (op == wire::Op::GetAll) {
+            if (kind != wire::KeyKind::Name) {
+                // Category-based GetAll has no NATS equivalent -- see
+                // cache_service.hpp "Non-unique key lookup (GetAll)".
+                respond(active_request, encode_status(wire::Status::Error));
+                return;
+            }
+            auto prefix = r.str();
+            const auto pattern = prefix + ".*";
+            // Its own queue slot, namespaced like a plain Get/Put/Erase on
+            // "prefix" itself would be -- note this does NOT serialize
+            // against a concurrent Get on one of the prefix's *matched*
+            // sub-keys (e.g. "alice.email" while this fetches "alice.*"):
+            // KeyOperationQueue's key namespace is per-exact-key, and which
+            // sub-keys a prefix expands to isn't known until the NATS list
+            // call returns. A GetAll racing a Get on one if its own matches
+            // is a known, accepted gap -- see README.md.
+            auto qkey = name_queue_key(prefix);
+            auto request = std::make_shared<ActiveRequestType>(std::move(active_request));
+            if (!key_queue.enqueue(qkey, [&nats, &completions, name_bucket, request, prefix, pattern, qkey,
+                                           max_getall_results]() mutable {
+                std::cout << "[server] GETALL name-prefix=\"" << prefix << "\" (pattern \"" << pattern
+                          << "\") -> dispatched to NATS\n";
+                nats.list_and_get_async(
+                    name_bucket, pattern, max_getall_results,
+                    [&completions, request, prefix, qkey](NatsListResult result) mutable {
+                        ApplyFn apply = [prefix, result](NameCache& name_cache,
+                                                           IdCache&) -> std::vector<std::uint8_t> {
+                            if (result.result != NatsResult::Ok) {
+                                return encode_status(wire::Status::Error);
+                            }
+                            // Populate the cache with each match under its
+                            // own full key -- a later plain Get for e.g.
+                            // "alice.email" is a local hit for free. This
+                            // GetAll never claims local completeness for
+                            // the prefix itself, though (a key added under
+                            // it later, that this call never saw, isn't
+                            // known locally until asked for): a repeat
+                            // GetAll for the same prefix always re-asks
+                            // NATS rather than trusting the cache.
+                            for (const auto& [full_key, value] : result.entries) {
+                                name_cache.erase<NameTag>(full_key);
+                                name_cache.emplace(NameEntry{full_key, value});
+                            }
+                            if (result.entries.empty()) {
+                                return encode_status(wire::Status::NotFound);
+                            }
+                            return encode_found_all_with_keys(result.entries, result.truncated);
+                        };
+                        // No revision: this is a read, not a write -- unlike
+                        // Put/Erase there's no self-echo for RevisionTracker
+                        // to suppress, and the prefix itself was never a
+                        // real NATS key with a revision of its own.
+                        completions.push(std::move(request), std::move(apply),
+                                          "GETALL name-prefix=\"" + prefix + "\"", qkey, 0, false);
+                    });
+            })) {
+                std::cout << "[server] GETALL name-prefix=\"" << prefix << "\" -> rejected (queue full for this key)\n";
                 respond(*request, encode_status(wire::Status::Error));
             }
             return;

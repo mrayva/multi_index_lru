@@ -21,11 +21,13 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <chrono>
 #include <memory>
 #include <optional>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace poc {
@@ -52,6 +54,31 @@ std::vector<std::uint8_t> bytes(const std::string& s) {
 
 std::string str(const std::vector<std::uint8_t>& b) {
     return std::string(b.begin(), b.end());
+}
+
+struct FoundAllWithKeysEntry {
+    std::string key;
+    std::string value;
+};
+
+// Decodes a GetAll(prefix)+Ok response body (see cache_service.hpp's
+// "GetAll(prefix)+Ok" wire format comment). Asserts status == Ok first --
+// callers that expect NotFound/Error check that separately via a plain
+// wire::Reader, same as every other test in this file.
+std::pair<std::vector<FoundAllWithKeysEntry>, bool> decode_found_all_with_keys(
+    const std::vector<std::uint8_t>& response_bytes) {
+    wire::Reader r(response_bytes.data(), response_bytes.size());
+    EXPECT_EQ(static_cast<wire::Status>(r.u8()), wire::Status::Ok);
+    const auto count = r.u32();
+    const bool truncated = r.u8() != 0;
+    std::vector<FoundAllWithKeysEntry> entries;
+    entries.reserve(count);
+    for (std::uint32_t i = 0; i < count; ++i) {
+        auto key = r.str();
+        auto value = str(r.bytes(r.u32()));
+        entries.push_back({std::move(key), std::move(value)});
+    }
+    return {std::move(entries), truncated};
 }
 
 class DispatchRequestTest : public ::testing::Test {
@@ -137,8 +164,8 @@ protected:
             const auto& payload = active_request_opt->payload();
             std::vector<std::uint8_t> request_bytes(payload.data(), payload.data() + payload.number_of_bytes());
             dispatch_request(*name_cache_, *id_cache_, *nats_, kNameBucket, kIdBucket, completions_, key_queue_,
-                              allow_writes_, std::move(active_request_opt.value()), request_bytes.data(),
-                              request_bytes.size());
+                              allow_writes_, max_getall_results_, std::move(active_request_opt.value()),
+                              request_bytes.data(), request_bytes.size());
         }
     }
 
@@ -188,6 +215,10 @@ protected:
     // were written against. PrewarmTest below sets this to a future
     // deadline to exercise the prewarm path instead.
     std::chrono::steady_clock::time_point prewarm_deadline_ = std::chrono::steady_clock::now() - std::chrono::hours(1);
+    // Same default server_readthrough.cpp's --max-getall-results uses.
+    // GetAllPrefixTruncatesAtMaxResults below lowers it to exercise
+    // truncation without needing to seed 100+ keys.
+    std::size_t max_getall_results_ = 100;
     // Per-test, unlike invalidations_ -- each test's caches are freshly
     // reset in SetUp(), so there's nothing to gain from remembering
     // revisions across tests, and keeping it per-test avoids one test's
@@ -747,6 +778,82 @@ TEST_F(DispatchRequestTest, AfterPrewarmWindowExternalWriteStillOnlyEvicts) {
         << "outside the prewarm window, an external write should still just evict, not populate directly";
 
     nats_->erase(kNameBucket, "post_prewarm_test");
+}
+
+// --- GetAll(prefix): a primary key that's really several NATS keys --------
+
+TEST_F(DispatchRequestTest, GetAllPrefixFetchesAllMatchingKeysFromNats) {
+    nats_->erase(kNameBucket, "getall_prefix_test.a");
+    nats_->erase(kNameBucket, "getall_prefix_test.b");
+    nats_->erase(kNameBucket, "getall_prefix_test_unrelated");  // no "." after the prefix -- must not match
+    ASSERT_TRUE(nats_->put(kNameBucket, "getall_prefix_test.a", bytes("value-a")).first);
+    ASSERT_TRUE(nats_->put(kNameBucket, "getall_prefix_test.b", bytes("value-b")).first);
+    ASSERT_TRUE(nats_->put(kNameBucket, "getall_prefix_test_unrelated", bytes("should-not-appear")).first);
+
+    auto response_bytes = round_trip(encode_get_all_by_prefix("getall_prefix_test"));
+    auto [entries, truncated] = decode_found_all_with_keys(response_bytes);
+    EXPECT_FALSE(truncated);
+    ASSERT_EQ(entries.size(), 2u);
+    std::sort(entries.begin(), entries.end(), [](const auto& a, const auto& b) { return a.key < b.key; });
+    EXPECT_EQ(entries[0].key, "getall_prefix_test.a");
+    EXPECT_EQ(entries[0].value, "value-a");
+    EXPECT_EQ(entries[1].key, "getall_prefix_test.b");
+    EXPECT_EQ(entries[1].value, "value-b");
+
+    // Each match is now individually addressable as its own NameCache entry.
+    auto it_a = name_cache_->find<NameTag>("getall_prefix_test.a");
+    ASSERT_NE(it_a, name_cache_->end<NameTag>());
+    EXPECT_EQ(str(it_a->record), "value-a");
+    auto it_b = name_cache_->find<NameTag>("getall_prefix_test.b");
+    ASSERT_NE(it_b, name_cache_->end<NameTag>());
+    EXPECT_EQ(str(it_b->record), "value-b");
+
+    // And the unrelated key must not have been swept in.
+    auto it_unrelated = name_cache_->find<NameTag>("getall_prefix_test_unrelated");
+    EXPECT_TRUE(it_unrelated == name_cache_->end<NameTag>() || str(it_unrelated->record) != "should-not-appear");
+
+    nats_->erase(kNameBucket, "getall_prefix_test.a");
+    nats_->erase(kNameBucket, "getall_prefix_test.b");
+    nats_->erase(kNameBucket, "getall_prefix_test_unrelated");
+}
+
+TEST_F(DispatchRequestTest, GetAllPrefixReturnsNotFoundWhenNoKeysMatch) {
+    auto response_bytes = round_trip(encode_get_all_by_prefix("no_such_prefix_anywhere"));
+    wire::Reader r(response_bytes.data(), response_bytes.size());
+    EXPECT_EQ(static_cast<wire::Status>(r.u8()), wire::Status::NotFound);
+}
+
+TEST_F(DispatchRequestTest, GetAllPrefixTruncatesAtMaxResults) {
+    max_getall_results_ = 2;
+    for (const char* suffix : {"a", "b", "c"}) {
+        auto key = std::string("getall_truncate_test.") + suffix;
+        nats_->erase(kNameBucket, key);
+        ASSERT_TRUE(nats_->put(kNameBucket, key, bytes("v")).first);
+    }
+
+    auto response_bytes = round_trip(encode_get_all_by_prefix("getall_truncate_test"));
+    auto [entries, truncated] = decode_found_all_with_keys(response_bytes);
+    EXPECT_TRUE(truncated);
+    EXPECT_EQ(entries.size(), 2u) << "must fetch no more than max_getall_results, even though 3 keys matched";
+
+    for (const char* suffix : {"a", "b", "c"}) {
+        nats_->erase(kNameBucket, std::string("getall_truncate_test.") + suffix);
+    }
+}
+
+TEST_F(DispatchRequestTest, GetAllWithCategoryKindIsRejectedNatsHasNoCategoryEquivalent) {
+    // GetAll(KeyKind::Category) is the *other* GetAll flavor -- local-cache
+    // only (server.cpp), no NATS equivalent -- see cache_service.hpp
+    // "Non-unique key lookup (GetAll)". server_readthrough.cpp must reject
+    // it outright rather than silently misinterpreting the category string
+    // as a prefix.
+    auto pending = send_request(encode_get_all("some_category"));
+    pump_server();  // rejection is synchronous -- no NATS round trip involved
+    auto response = pending.receive().value();
+    ASSERT_TRUE(response.has_value()) << "a rejected GetAll(category) must resolve immediately";
+    wire::Reader r(response->payload().data(), response->payload().number_of_bytes());
+    EXPECT_EQ(static_cast<wire::Status>(r.u8()), wire::Status::Error);
+    EXPECT_EQ(completions_.size(), 0u);
 }
 
 }  // namespace

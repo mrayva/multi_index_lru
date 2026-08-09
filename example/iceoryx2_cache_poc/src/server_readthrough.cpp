@@ -89,6 +89,10 @@
 ///                                                       kv_watch events populate the cache directly
 ///                                                       from their own value instead of merely
 ///                                                       evicting; see "Prewarm" above)
+///   --max-getall-results / MIL_MAX_GETALL_RESULTS     (default 100 -- caps how many matched keys a
+///                                                       GetAll(prefix) request fetches from NATS;
+///                                                       see cache_service.hpp "Prefix lookup (GetAll,
+///                                                       KeyKind::Name)")
 #include "server_dispatch.hpp"
 #include "config.hpp"
 
@@ -135,6 +139,8 @@ int main(int argc, char** argv) {
     const bool allow_writes = poc::config::resolve_bool(args, "--allow-writes", "MIL_ALLOW_WRITES", false);
     const auto prewarm_window =
         poc::config::resolve_millis(args, "--prewarm-window-ms", "MIL_PREWARM_WINDOW_MS", 2000);
+    const std::size_t max_getall_results =
+        poc::config::resolve_size(args, "--max-getall-results", "MIL_MAX_GETALL_RESULTS", 100);
 
     // Declared before `nats` on purpose: local variables are destroyed in
     // reverse declaration order, and NatsBridge's own coroutines (get_async/
@@ -242,8 +248,8 @@ int main(int argc, char** argv) {
             std::vector<std::uint8_t> request_bytes(payload.data(), payload.data() + payload.number_of_bytes());
 
             poc::dispatch_request(name_cache, id_cache, nats, name_bucket, id_bucket, completions, key_queue,
-                                   allow_writes, std::move(active_request_opt.value()), request_bytes.data(),
-                                   request_bytes.size());
+                                   allow_writes, max_getall_results, std::move(active_request_opt.value()),
+                                   request_bytes.data(), request_bytes.size());
         }
     }
 

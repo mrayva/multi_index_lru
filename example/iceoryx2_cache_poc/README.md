@@ -71,12 +71,19 @@ Request: `[op:u8][key_kind:u8][...]`
 - `Put`: same key, then -- for key_kind=Name only -- `[category:u32-prefixed-str]`
   (see "Non-unique key lookup (GetAll)" below; always present on the wire, empty
   string if the caller didn't specify one), then `[record_len:u32][record bytes]`
-- `GetAll`: key_kind is always Category, followed by `[category:u32-prefixed-str]`
+- `GetAll` (category): key_kind is Category, followed by `[category:u32-prefixed-str]`
+  -- see "Non-unique key lookup (GetAll)" below.
+- `GetAll` (prefix): key_kind is Name, followed by `[prefix:u32-prefixed-str]`
+  -- see "Prefix lookup (GetAll, KeyKind::Name)" below.
 
 Response:
 - `Get+Ok`: `[status:u8=Ok][record bytes]`
-- `GetAll+Ok` (at least one match): `[status:u8=Ok][count:u32][truncated:u8]
+- `GetAll(category)+Ok` (at least one match): `[status:u8=Ok][count:u32][truncated:u8]
   [record_len:u32][record bytes] x count`
+- `GetAll(prefix)+Ok` (at least one match): `[status:u8=Ok][count:u32][truncated:u8]
+  ([key:u32-prefixed-str][record_len:u32][record bytes]) x count` -- carries
+  each match's own full NATS key alongside its record, unlike the category
+  form, since discovering what keys exist under the prefix is the point.
 - everything else (a miss, `Erase`, `Put`, or an error): `[status:u8]` alone
   — `status` is `Ok`, `NotFound`, `Error` (only ever produced by the
   NATS-backed server, e.g. on a NATS timeout), or `ReadOnly` (a `Put`/`Erase`
@@ -219,7 +226,7 @@ accepted for flags with a value: `--flag value` or `--flag=value`.
 | `--max-clients` | `MIL_MAX_CLIENTS` | `16` | `server.cpp`, `server_readthrough.cpp` (iceoryx2-cxx's own default is 8, see "Load testing") |
 | `--max-active-requests-per-client` | `MIL_MAX_ACTIVE_REQUESTS_PER_CLIENT` | `32` | `server.cpp`, `server_readthrough.cpp` (iceoryx2-cxx's own default is 4, see "Load testing") |
 | `--max-queue-depth-per-key` | `MIL_MAX_QUEUE_DEPTH_PER_KEY` | `64` | `server_readthrough.cpp` (`KeyOperationQueue` backpressure, see "Backpressure") |
-| `--max-getall-results` | `MIL_MAX_GETALL_RESULTS` | `100` | `server.cpp` (caps a single GetAll response, see "Non-unique key lookup (GetAll)") |
+| `--max-getall-results` | `MIL_MAX_GETALL_RESULTS` | `100` | `server.cpp` (category GetAll, see "Non-unique key lookup (GetAll)"), `server_readthrough.cpp` (prefix GetAll, see "Prefix lookup (GetAll, KeyKind::Name)") |
 | `--allow-writes` | `MIL_ALLOW_WRITES` | `false` | `server_readthrough.cpp` (Put/Erase rejected unless set, see "Read-only by default") |
 | `--prewarm-window-ms` | `MIL_PREWARM_WINDOW_MS` | `2000` | `server_readthrough.cpp` (populates from kv_watch's initial burst instead of just evicting, see "Prewarm") |
 | `--nats-host` | `MIL_NATS_HOST` | `127.0.0.1` | `server_readthrough.cpp`, `client_readthrough.cpp` |
@@ -324,18 +331,19 @@ every other response in this protocol, which is one record or less --
 "Configuration" above) caps it, with a `truncated` flag distinguishing "here
 are all N matches" from "here are the first 100 of more."
 
-**`server.cpp` only** -- `server_readthrough.cpp` does not implement
-`GetAll`. NATS JetStream KV is a primary-key store with no concept of
+**`server.cpp` only** -- `server_readthrough.cpp` rejects this flavor with
+`Status::Error`. NATS JetStream KV is a primary-key store with no concept of
 "category"; a NATS-backed `GetAll` could only reflect whatever happens to
 already be in the local cache from prior `Get`/`Put`s, not query NATS the
 way every other operation here does. That's a materially different (and
 easy to accidentally rely on as if it *were* authoritative) semantic from
 everything else in this POC, so it's left as an explicit open question --
-see "What this doesn't answer yet" -- rather than shipped half-right.
-`server_dispatch.hpp`'s `Put` (Name) branch still parses and stores the
-category field either way, since it's part of the wire format now
-regardless of which server is on the other end; it's just never queried
-back out there.
+see "What this doesn't answer yet" -- rather than shipped half-right. (There
+*is* a NATS-backed `GetAll` now, just addressed differently -- see "Prefix
+lookup (GetAll, KeyKind::Name)" below.) `server_dispatch.hpp`'s `Put` (Name)
+branch still parses and stores the category field either way, since it's
+part of the wire format now regardless of which server is on the other end;
+it's just never queried back out there.
 
 Verified live: `PUT` `alice`/`bob` (pre-seeded, category `friends`) plus a
 manually-added `dave` (also `friends`), then `GETALL friends` returned all
@@ -348,6 +356,76 @@ the unit level by `test/handle_request_local_test.cpp`'s seven new
 unknown category is `NotFound`, categories don't cross-contaminate, the
 default-empty-category case, upsert moving an entry between categories,
 erase removing it from the index, and the truncation cap).
+
+## Prefix lookup (GetAll, KeyKind::Name)
+
+A second, unrelated `GetAll` flavor, for a different problem than the
+category one above: what if `NameCache`'s "primary" key isn't really 1:1
+with what's stored in NATS -- e.g. a logical name like `"alice"` actually
+addressing several NATS keys (`"alice.email"`, `"alice.phone"`, ...) rather
+than one? `key_kind=Name` under `GetAll` treats the request string as a NATS
+key *prefix* and asks NATS itself what exists underneath it, via
+[`nats_asio`](https://github.com/mrayva/nats_asio)'s `kv_keys(bucket,
+pattern, timeout)` -- a pattern-aware overload of `kv_keys` added alongside
+this feature (previously `kv_keys` could only list *every* key in a bucket;
+`*`/`>` are now accepted as NATS subject wildcards in a dedicated pattern
+parameter, validated separately from a literal key so `kv_get`/`kv_put`/etc.
+still reject them as invalid key characters, same as before). The `nats`
+CLI's own `nats kv ls BUCKET "pattern"` is the same idea at the tool level;
+`nats_tool`'s `kvkeys --key <pattern>` mode now supports it too.
+
+Unlike the category flavor, this one **is** NATS-backed
+(`server_readthrough.cpp` only -- `server.cpp` rejects it with
+`Status::Error`, since a plain in-memory cache has no prefix concept
+either): `NatsBridge::list_and_get_async()` lists every key matching
+`<prefix>.*` via `kv_keys`, then fetches each one's current value with its
+own `kv_get`, sequentially, in a single coroutine -- capped by
+`--max-getall-results`/`MIL_MAX_GETALL_RESULTS`, the same flag and default
+the category flavor uses, with the same `truncated` semantics. Sequential
+rather than parallel fan-out is a deliberate POC-scope tradeoff: fine for a
+prefix with a handful of matches, would want parallelizing if some prefix's
+fan-out gets wide.
+
+Each match becomes its own `NameEntry` in the local cache, under its *full*
+NATS key -- so a later plain `Get` for `"alice.email"` is a local hit, no
+NATS round trip. A repeat `GetAll` for the same prefix never trusts the
+cache alone, though, and always re-asks NATS: a key added under the prefix
+since the last call wouldn't be known locally otherwise (the same kind of
+gap the category flavor has, just resolved here by paying the round trip
+every time rather than declaring it out of scope, since NATS -- unlike the
+local `CategoryTag` index -- can actually answer "what exists under this
+prefix right now" authoritatively).
+
+**Known gap**: `KeyOperationQueue` (see "the concurrency model" below)
+serializes this under its own queue key (the prefix), not under the queue
+keys of whatever it turns out to match -- so a `GetAll` for `"alice"` racing
+a concurrent plain `Get` for `"alice.email"` isn't serialized against each
+other the way two operations on the literal same key would be. Which sub-keys
+a prefix expands to isn't known until the NATS list call returns, so there's
+no key to enqueue against up front. Not believed to cause incorrect
+*responses* (each operation still reads/writes NATS independently and
+correctly), just a cache-population race that a subsequent `Get` would
+resolve anyway -- but it's a real gap from the guarantee every other
+same-key operation pair in this POC has.
+
+Verified live via `client_readthrough.cpp`'s new demo section: seeds
+`"prefix_demo.email"`/`"prefix_demo.phone"` directly in NATS (plus an
+unrelated `"other_prefix.email"`), `GETALL name-prefix="prefix_demo"`
+through the daemon returns exactly the two matching keys and values, a
+follow-up plain `GET name="prefix_demo.email"` resolves as a local hit, and
+`GETALL name-prefix="nonexistent_prefix"` returns `NotFound`. Covered at the
+unit level by `dispatch_request_test.cpp`'s `GetAllPrefixFetchesAllMatchingKeysFromNats`,
+`GetAllPrefixReturnsNotFoundWhenNoKeysMatch`, `GetAllPrefixTruncatesAtMaxResults`,
+and `GetAllWithCategoryKindIsRejectedNatsHasNoCategoryEquivalent`, and by
+`handle_request_local_test.cpp`'s `GetAllWithNameKindIsRejectedNoNatsToAskHere`
+(confirming `server.cpp` rejects it even when a category happens to share
+the prefix's name, rather than silently misinterpreting one as the other).
+`nats_asio`'s own test suite covers the underlying pattern-`kv_keys` change
+separately: `kv_pattern_validation`/`kv_pattern_subject` unit tests, plus a
+live `nats_tool_integration.sh` case (`kvkeys wildcard pattern`) seeding
+`alice.email`/`alice.phone`/`bob.email` and confirming `kvkeys --key
+"alice.*"` returns exactly the two `alice.*` keys, not bob's and not a bare
+`"alice"` key.
 
 ## Unit tests
 
@@ -460,7 +538,9 @@ itself); not part of the `poc-unit-tests` CI job for that reason.
   pre-PUT value while the cache and NATS both end up with the PUT's value,
   not a stale overwrite), and two concurrent GET-misses on the same key
   coalesce into one NATS fetch (the second resolves as a local hit in the
-  very same completion that resolved the first).
+  very same completion that resolved the first). Also covers `GetAll`
+  (prefix) -- see "Prefix lookup (GetAll, KeyKind::Name)" above for the
+  specific tests.
 
 ```bash
 cmake -S example/iceoryx2_cache_poc -B build-poc \
@@ -1009,14 +1089,19 @@ This proves the pattern works end-to-end and is easy to wire up, not that
 it's the right architecture for a given workload. Open questions before this
 becomes more than a POC:
 
-- **GetAll has no NATS-backed equivalent.** "Non-unique key lookup (GetAll)"
-  above covers why: NATS JetStream KV has no concept of a secondary,
-  non-unique index, so a `server_readthrough.cpp` `GetAll` could only
-  reflect the local cache's current contents, not query NATS authoritatively
-  the way `Get`/`Put`/`Erase` do there. Building a real one would mean
-  maintaining a second NATS bucket as an explicit category -> set-of-names
-  index, updated on every `Put`/`Erase` -- a materially bigger undertaking
-  than this POC currently takes on, not a small follow-up.
+- **Category-based GetAll still has no NATS-backed equivalent.** "Non-unique
+  key lookup (GetAll)" above covers why: NATS JetStream KV has no concept of
+  a secondary, non-unique index, so a `server_readthrough.cpp` `GetAll` by
+  category could only reflect the local cache's current contents, not query
+  NATS authoritatively the way `Get`/`Put`/`Erase` do there. Building a real
+  one would mean maintaining a second NATS bucket as an explicit
+  category -> set-of-names index, updated on every `Put`/`Erase` -- a
+  materially bigger undertaking than this POC currently takes on, not a
+  small follow-up. (Prefix-based `GetAll` -- a different axis, addressing
+  several NATS keys sharing a "." prefix rather than a category -- *is* now
+  NATS-backed; see "Prefix lookup (GetAll, KeyKind::Name)" above. Its own
+  known gap -- `KeyOperationQueue` not serializing against a prefix's
+  individual matched keys -- is documented there, not here.)
 - **NATS KV's own max-age is unused.** "TTL / expiration" above covers the
   local caches; NATS KV buckets also support a per-bucket max-age for the
   durable data itself, independent of either daemon's local TTL, which isn't
@@ -1040,10 +1125,12 @@ becomes more than a POC:
   boundary and turned into an `Error` response instead of crashing the
   daemon — see `handle_request_local()` in `cache_service.hpp` and
   `handle_request()`/`nats_bridge.hpp` in the NATS-backed server. "Backpressure"
-  above caps how deep a single *hot key*'s backlog can get, but there's
-  still no *global* rate limit -- nothing stops a client from spamming
-  requests spread across many different (valid or malformed) keys as fast
-  as it can. Signal handling needed no fix: iceoryx2's `node.wait()`
+  above caps how deep a single *hot key*'s backlog can get; there's still no
+  *global* rate limit spread across many different keys at once, but that's
+  a deliberate scope decision, not an open gap -- this POC's target workload
+  is a handful of individual keys getting very popular (exactly what
+  per-key backpressure already covers), not broad spam fanned out across
+  many distinct keys. Signal handling needed no fix: iceoryx2's `node.wait()`
   already returns an unhappy result on SIGINT/SIGTERM, so the existing
   `while (node.wait(...))` loop already exits gracefully and lets `main()`
   return normally, running `NatsBridge`'s destructor (clean NATS thread

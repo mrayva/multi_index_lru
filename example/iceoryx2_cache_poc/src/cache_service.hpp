@@ -16,23 +16,37 @@
 ///
 /// server.cpp answers requests purely from these in-memory caches. See
 /// server_readthrough.cpp for the variant that falls through to a NATS
-/// JetStream KV bucket per cache on a local miss (GetAll is local-cache-only
-/// -- server_readthrough.cpp doesn't implement it; see README.md "What this
-/// doesn't answer yet").
+/// JetStream KV bucket per cache on a local miss.
 ///
 /// --- Non-unique key lookup (GetAll) --------------------------------------
 ///
 /// NameCache's primary key (`NameTag`, hashed_unique) addresses one
 /// NameEntry at a time, same as IdCache's. `CategoryTag` is a second,
 /// hashed_non_unique index over the same NameEntry data: multiple entries
-/// can share a category, and GetAll returns every one of them in a single
-/// response, not just the first (see wire::Op::GetAll's request/response
-/// shape below, and handle_request_local()'s GetAll case for how it's
-/// answered). boost::multi_index keeps both indices in sync automatically
-/// on every insert/erase/upsert -- Put's existing erase-then-emplace upsert
-/// (see handle_request_local()'s Put case) needs no special handling to
-/// move an entry from one category to another; erasing by the primary key
-/// removes it from the category index too.
+/// can share a category, and GetAll (KeyKind::Category) returns every one of
+/// them in a single response, not just the first (see wire::Op::GetAll's
+/// request/response shape below, and handle_request_local()'s GetAll case
+/// for how it's answered). boost::multi_index keeps both indices in sync
+/// automatically on every insert/erase/upsert -- Put's existing
+/// erase-then-emplace upsert (see handle_request_local()'s Put case) needs
+/// no special handling to move an entry from one category to another;
+/// erasing by the primary key removes it from the category index too. This
+/// flavor is local-cache-only: server_readthrough.cpp doesn't implement it
+/// (NATS KV has no secondary-index concept to fall through to on a miss).
+///
+/// --- Prefix lookup (GetAll, KeyKind::Name) --------------------------------
+///
+/// A second, unrelated GetAll flavor: KeyKind::Name treats the request
+/// string as a NATS key *prefix* rather than a category, and IS NATS-backed
+/// (server_readthrough.cpp only -- server.cpp rejects it, since a plain
+/// in-memory cache has no prefix concept either). This exists for a primary
+/// key that isn't really 1:1 with what's stored in NATS -- e.g. "alice"
+/// addressing several NATS keys ("alice.email", "alice.phone", ...) rather
+/// than one -- and is answered by asking NATS itself what exists under the
+/// prefix (nats_asio::kv_keys with a wildcard pattern) rather than via any
+/// local index, since only NATS can authoritatively answer "what keys exist
+/// under this prefix right now." See NatsBridge::list_and_get_async() and
+/// server_dispatch.hpp's GetAll/KeyKind::Name case.
 #pragma once
 
 #include "wire.hpp"
@@ -45,6 +59,7 @@
 #include <chrono>
 #include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace poc {
@@ -144,15 +159,23 @@ inline constexpr auto kServiceName = "multi_index_lru/cache/rpc";
 //               -- the category field only appears for KeyKind::Name (see
 //               "Non-unique key lookup (GetAll)" below); Id-keyed Puts are
 //               unchanged.
-//   GetAll:     [op:u8][key_kind:u8=Category][category:u32-prefixed-str]
+//   GetAll (category):  [op:u8][key_kind:u8=Category][category:u32-prefixed-str]
+//   GetAll (prefix):    [op:u8][key_kind:u8=Name][prefix:u32-prefixed-str]
 //
 // Response:
 //   Get/GetAll miss, Erase, Put: [status:u8] -- Ok, NotFound, or Error.
 //   Get+Ok:   [status:u8=Ok][record bytes]
-//   GetAll+Ok (at least one match): [status:u8=Ok][count:u32][truncated:u8]
-//             [record_len:u32][record bytes] x count -- truncated is 1 iff
-//             more than --max-getall-results/MIL_MAX_GETALL_RESULTS records
-//             matched and the rest were left out, 0 otherwise.
+//   GetAll(category)+Ok (at least one match): [status:u8=Ok][count:u32]
+//             [truncated:u8][record_len:u32][record bytes] x count --
+//             truncated is 1 iff more than --max-getall-results/
+//             MIL_MAX_GETALL_RESULTS records matched and the rest were left
+//             out, 0 otherwise.
+//   GetAll(prefix)+Ok (at least one match): [status:u8=Ok][count:u32]
+//             [truncated:u8]([key:u32-prefixed-str][record_len:u32][record
+//             bytes]) x count -- same truncation meaning as above; carries
+//             each match's full NATS key (e.g. "alice.email") alongside its
+//             record, unlike the category form, since the whole point of a
+//             prefix lookup is discovering what keys exist underneath it.
 
 inline std::vector<std::uint8_t> encode_get(wire::KeyKind kind, const std::string& name, std::int64_t id) {
     wire::Writer w;
@@ -203,6 +226,16 @@ inline std::vector<std::uint8_t> encode_get_all(const std::string& category) {
     return w.buffer();
 }
 
+// See "Prefix lookup (GetAll, KeyKind::Name)" above -- server.cpp (local,
+// no NATS) rejects this; only server_readthrough.cpp answers it.
+inline std::vector<std::uint8_t> encode_get_all_by_prefix(const std::string& name_prefix) {
+    wire::Writer w;
+    w.u8(static_cast<std::uint8_t>(wire::Op::GetAll));
+    w.u8(static_cast<std::uint8_t>(wire::KeyKind::Name));
+    w.str(name_prefix);
+    return w.buffer();
+}
+
 // --- response encoding (server side) -------------------------------------
 
 inline std::vector<std::uint8_t> encode_status(wire::Status status) {
@@ -229,6 +262,23 @@ inline std::vector<std::uint8_t> encode_found_all(const std::vector<std::vector<
     w.u32(static_cast<std::uint32_t>(records.size()));
     w.u8(truncated ? 1 : 0);
     for (const auto& record : records) {
+        w.u32(static_cast<std::uint32_t>(record.size()));
+        w.bytes(record);
+    }
+    return w.buffer();
+}
+
+// Same shape as encode_found_all(), plus each match's own full NATS key --
+// see "GetAll(prefix)+Ok" in the wire format comment above for why the
+// prefix flavor needs that and the category flavor doesn't.
+inline std::vector<std::uint8_t> encode_found_all_with_keys(
+    const std::vector<std::pair<std::string, std::vector<std::uint8_t>>>& entries, bool truncated) {
+    wire::Writer w;
+    w.u8(static_cast<std::uint8_t>(wire::Status::Ok));
+    w.u32(static_cast<std::uint32_t>(entries.size()));
+    w.u8(truncated ? 1 : 0);
+    for (const auto& [key, record] : entries) {
+        w.str(key);
         w.u32(static_cast<std::uint32_t>(record.size()));
         w.bytes(record);
     }
@@ -300,6 +350,12 @@ inline std::vector<std::uint8_t> handle_request_local(
                 return encode_status(wire::Status::Ok);
             }
             case wire::Op::GetAll: {
+                if (kind != wire::KeyKind::Category) {
+                    // KeyKind::Name (prefix lookup) is NATS-backed only --
+                    // see "Prefix lookup (GetAll, KeyKind::Name)" above.
+                    // This purely in-memory handler has no NATS to ask.
+                    return encode_status(wire::Status::Error);
+                }
                 auto category = r.str();
                 auto [begin, end] = name_cache.equal_range<CategoryTag>(category);
                 std::vector<std::vector<std::uint8_t>> records;
