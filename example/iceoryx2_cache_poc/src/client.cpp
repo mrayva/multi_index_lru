@@ -15,7 +15,12 @@
 ///
 /// Run server.cpp (or server_readthrough.cpp) first in one terminal, then
 /// this in another.
+///
+/// Configurable via CLI flag or env var (flag wins if both are given), and
+/// must match whatever the server was given:
+///   --service-name / MIL_SERVICE_NAME    (default poc::kServiceName)
 #include "cache_service.hpp"
+#include "config.hpp"
 
 #include "iox2/iceoryx2.hpp"
 
@@ -194,9 +199,12 @@ int main(int argc, char** argv) {
 
     set_log_level_from_env_or(LogLevel::Info);
 
+    std::vector<std::string> args(argv + 1, argv + argc);
+    const std::string service_name = poc::config::resolve_str(args, "--service-name", "MIL_SERVICE_NAME", poc::kServiceName);
+
     auto node = NodeBuilder().create<ServiceType::Ipc>().value();
 
-    auto service = node.service_builder(ServiceName::create(poc::kServiceName).value())
+    auto service = node.service_builder(ServiceName::create(service_name.c_str()).value())
                         .request_response<bb::Slice<std::uint8_t>, bb::Slice<std::uint8_t>>()
                         .open_or_create()
                         .value();
@@ -207,7 +215,6 @@ int main(int argc, char** argv) {
                       .create()
                       .value();
 
-    const std::vector<std::string> args(argv + 1, argv + argc);
     if (args.empty()) {
         run_demo_script(client, node);
     } else {

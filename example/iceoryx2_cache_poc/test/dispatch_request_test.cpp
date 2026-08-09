@@ -92,8 +92,8 @@ protected:
             }
             const auto& payload = active_request_opt->payload();
             std::vector<std::uint8_t> request_bytes(payload.data(), payload.data() + payload.number_of_bytes());
-            dispatch_request(*name_cache_, *id_cache_, *nats_, completions_, std::move(active_request_opt.value()),
-                              request_bytes.data(), request_bytes.size());
+            dispatch_request(*name_cache_, *id_cache_, *nats_, kNameBucket, kIdBucket, completions_,
+                              std::move(active_request_opt.value()), request_bytes.data(), request_bytes.size());
         }
     }
 

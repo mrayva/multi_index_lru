@@ -6,7 +6,16 @@
 /// seen -- and shows it comes back correctly. Watch server_readthrough.cpp's
 /// own console output alongside this to see "local miss, NATS hit" for
 /// yourself.
+///
+/// Configurable via CLI flag or env var (flag wins if both are given), and
+/// must match whatever the server was given:
+///   --service-name / MIL_SERVICE_NAME    (default poc::kServiceName)
+///   --nats-host / MIL_NATS_HOST          (default 127.0.0.1)
+///   --nats-port / MIL_NATS_PORT          (default 4222)
+///   --name-bucket / MIL_NAME_BUCKET      (default poc::kNameBucket)
+///   --id-bucket / MIL_ID_BUCKET          (default poc::kIdBucket)
 #include "cache_service.hpp"
+#include "config.hpp"
 #include "nats_bridge.hpp"
 
 #include "iox2/iceoryx2.hpp"
@@ -22,8 +31,13 @@ using iox2::bb::Slice;
 
 constexpr iox2::bb::Duration kCycleTime = iox2::bb::Duration::from_millis(50);
 constexpr std::uint64_t kInitialSliceLenHint = 256;
-constexpr auto kNameBucket = "mil_by_name";
-constexpr auto kIdBucket = "mil_by_id";
+// Same default bucket names server_readthrough.cpp uses (poc::kNameBucket/
+// poc::kIdBucket, defined in server_dispatch.hpp) -- duplicated here as
+// plain string literals rather than including that header, which would also
+// pull in the (server-only) dispatch/CompletionQueue machinery this client
+// has no use for.
+constexpr auto kDefaultNameBucket = "mil_by_name";
+constexpr auto kDefaultIdBucket = "mil_by_id";
 
 template <typename Client>
 std::vector<std::uint8_t> call(Client& client, iox2::Node<iox2::ServiceType::Ipc>& node,
@@ -75,32 +89,39 @@ std::vector<std::uint8_t> to_bytes(const std::string& s) {
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
     using namespace iox2;
 
     set_log_level_from_env_or(LogLevel::Info);
 
+    std::vector<std::string> args(argv + 1, argv + argc);
+    const std::string service_name = poc::config::resolve_str(args, "--service-name", "MIL_SERVICE_NAME", poc::kServiceName);
+    const std::string nats_host = poc::config::resolve_str(args, "--nats-host", "MIL_NATS_HOST", "127.0.0.1");
+    const std::uint16_t nats_port = poc::config::resolve_u16(args, "--nats-port", "MIL_NATS_PORT", 4222);
+    const std::string name_bucket = poc::config::resolve_str(args, "--name-bucket", "MIL_NAME_BUCKET", kDefaultNameBucket);
+    const std::string id_bucket = poc::config::resolve_str(args, "--id-bucket", "MIL_ID_BUCKET", kDefaultIdBucket);
+
     std::cout << "[client] connecting directly to NATS (bypassing the daemon) to seed test data ...\n";
-    poc::NatsBridge nats("127.0.0.1", 4222);
+    poc::NatsBridge nats(nats_host, nats_port);
 
     // Seed keys that server_readthrough.cpp's caches have never seen -- if
     // it hasn't been restarted since these ran before, delete first so the
     // demo is deterministic regardless of prior runs.
-    nats.erase(kNameBucket, "seeded_directly");
-    nats.erase(kIdBucket, "777");
+    nats.erase(name_bucket, "seeded_directly");
+    nats.erase(id_bucket, "777");
 
     auto [name_ok, name_err] =
-        nats.put(kNameBucket, "seeded_directly", to_bytes(R"({"note":"came from NATS, not a daemon PUT"})"));
-    std::cout << "[client] seeded NATS bucket \"" << kNameBucket << "\" key \"seeded_directly\": "
+        nats.put(name_bucket, "seeded_directly", to_bytes(R"({"note":"came from NATS, not a daemon PUT"})"));
+    std::cout << "[client] seeded NATS bucket \"" << name_bucket << "\" key \"seeded_directly\": "
               << (name_ok ? "ok" : ("FAILED: " + name_err)) << "\n";
 
-    auto [id_ok, id_err] = nats.put(kIdBucket, "777", to_bytes(R"({"note":"came from NATS, not a daemon PUT"})"));
-    std::cout << "[client] seeded NATS bucket \"" << kIdBucket << "\" key \"777\": "
+    auto [id_ok, id_err] = nats.put(id_bucket, "777", to_bytes(R"({"note":"came from NATS, not a daemon PUT"})"));
+    std::cout << "[client] seeded NATS bucket \"" << id_bucket << "\" key \"777\": "
               << (id_ok ? "ok" : ("FAILED: " + id_err)) << "\n\n";
 
     auto node = NodeBuilder().create<ServiceType::Ipc>().value();
 
-    auto service = node.service_builder(ServiceName::create(poc::kServiceName).value())
+    auto service = node.service_builder(ServiceName::create(service_name.c_str()).value())
                         .request_response<bb::Slice<std::uint8_t>, bb::Slice<std::uint8_t>>()
                         .open_or_create()
                         .value();
@@ -126,7 +147,7 @@ int main() {
                            poc::encode_put(poc::wire::KeyKind::Name, "via_daemon", 0,
                                             to_bytes(R"({"note":"written through the daemon"})"))));
 
-    auto direct = nats.get(kNameBucket, "via_daemon");
+    auto direct = nats.get(name_bucket, "via_daemon");
     std::cout << "[client] direct NATS get of \"via_daemon\" (bypassing the daemon): "
               << (direct.result == poc::NatsResult::Ok ? std::string(direct.value.begin(), direct.value.end())
                                                          : "not found in NATS -- write-through failed!")
@@ -149,7 +170,7 @@ int main() {
         std::cout << "  -> erase: " << status_name(static_cast<poc::wire::Status>(r.u8())) << "\n";
     }
 
-    auto direct_after_erase = nats.get(kIdBucket, "777");
+    auto direct_after_erase = nats.get(id_bucket, "777");
     std::cout << "[client] direct NATS get of id=777 (bypassing the daemon): "
               << (direct_after_erase.result == poc::NatsResult::NotFound
                       ? "not found -- confirmed NATS was updated, not just the local cache"

@@ -48,6 +48,8 @@ C++20 compiler (see "Unit tests" below).
   (`dispatch_request()`, `CompletionQueue`) so it's includable from
   `test/dispatch_request_test.cpp`, not just `server_readthrough.cpp`'s
   `main()`.
+- `config.hpp` is the CLI-flag/env-var resolution all four binaries share —
+  see "Configuration" below for the full flag/env-var list.
 
 Everything else — LRU eviction, TTL, composite keys, node pooling — still
 lives entirely in `multi_index_lru::Container` on the server side; iceoryx2
@@ -163,15 +165,65 @@ Expected demo-script output:
 This was run for real (client and server as separate OS processes,
 communicating only via iceoryx2 shared memory) to produce the output above.
 
+## Configuration
+
+Everything that previously had to be recompiled to change is now a CLI flag
+or env var, resolved by `config.hpp` (shared by all four binaries): **a CLI
+flag always wins if both are given for the same setting.** Both forms are
+accepted for flags with a value: `--flag value` or `--flag=value`.
+
+| Flag | Env var | Default | Used by |
+|---|---|---|---|
+| `--service-name` | `MIL_SERVICE_NAME` | `poc::kServiceName` | all four -- client and server must agree |
+| `--cache-capacity` | `MIL_CACHE_CAPACITY` | `1000` | `server.cpp`, `server_readthrough.cpp` (applies to both caches) |
+| `--nats-host` | `MIL_NATS_HOST` | `127.0.0.1` | `server_readthrough.cpp`, `client_readthrough.cpp` |
+| `--nats-port` | `MIL_NATS_PORT` | `4222` | `server_readthrough.cpp`, `client_readthrough.cpp` |
+| `--name-bucket` | `MIL_NAME_BUCKET` | `poc::kNameBucket` (`mil_by_name`) | `server_readthrough.cpp`, `client_readthrough.cpp` |
+| `--id-bucket` | `MIL_ID_BUCKET` | `poc::kIdBucket` (`mil_by_id`) | `server_readthrough.cpp`, `client_readthrough.cpp` |
+| `--nats-timeout-ms` | `MIL_NATS_TIMEOUT_MS` | `3000` | `server_readthrough.cpp` (`NatsBridge` op timeout) |
+| `--cb-failure-threshold` | `MIL_CB_FAILURE_THRESHOLD` | `3` | `server_readthrough.cpp` (circuit breaker) |
+| `--cb-open-duration-ms` | `MIL_CB_OPEN_DURATION_MS` | `2000` | `server_readthrough.cpp` (circuit breaker) |
+
+`dispatch_request()` (`server_dispatch.hpp`) now takes the two bucket names
+as parameters rather than reading the `poc::kNameBucket`/`poc::kIdBucket`
+constants directly, so `server_readthrough.cpp` can override them per
+instance -- those constants remain as the actual defaults, and
+`client_readthrough.cpp`/tests still use them directly where a fixed default
+is all that's needed.
+
+Verified live, not just wired up: started `cache_poc_server` with
+`--cache-capacity=3` and confirmed real LRU eviction at that capacity (the
+third insert correctly evicted the least-recently-touched entry, not
+whichever one happened to be oldest by insertion order); confirmed
+`MIL_SERVICE_NAME` alone (no flag) lets a client find a server; confirmed a
+`--service-name` flag overrides a conflicting `MIL_SERVICE_NAME` env var
+(pointing the client at a nonexistent service name correctly failed to find
+the running server); and started `server_readthrough` with
+`--name-bucket=mil_bridge_test` and confirmed a `PUT` through it landed in
+that bucket and *not* in `mil_by_name`.
+
+```bash
+# override the service name and point the read-through daemon at a
+# non-default NATS instance and bucket set
+./cache_poc_server_readthrough --service-name=my-cache --nats-host=nats.internal --nats-port=4222 \
+    --name-bucket=my_name_bucket --id-bucket=my_id_bucket
+
+# or via env vars (handy for containers)
+MIL_SERVICE_NAME=my-cache MIL_NATS_HOST=nats.internal MIL_NAME_BUCKET=my_name_bucket \
+    MIL_ID_BUCKET=my_id_bucket ./cache_poc_server_readthrough
+```
+
+`test/config_test.cpp` covers `config.hpp` itself -- see "Unit tests" below.
+
 ## Unit tests
 
-Four `ctest`-integrated GoogleTest suites in total: two dependency-free, and
-two integration suites for the NATS-backed path that need a real local NATS
-server (there's no fake for `nats_asio::iconnection`, and no way to construct
-a standalone/fake iceoryx2 `ActiveRequest` -- it can only come from a real
-`Server` that actually received a `RequestMut` over real IPC).
+Five `ctest`-integrated GoogleTest suites in total: three dependency-free,
+and two integration suites for the NATS-backed path that need a real local
+NATS server (there's no fake for `nats_asio::iconnection`, and no way to
+construct a standalone/fake iceoryx2 `ActiveRequest` -- it can only come
+from a real `Server` that actually received a `RequestMut` over real IPC).
 
-The two dependency-free suites don't need iceoryx2, NATS, or a second
+The three dependency-free suites don't need iceoryx2, NATS, or a second
 process to exercise:
 
 - `test/wire_test.cpp` covers the `wire::Writer`/`wire::Reader` binary
@@ -204,10 +256,20 @@ process to exercise:
   target links `multi_index_lru_headers` (so it needs Boost, like the rest
   of this directory) but nothing from iceoryx2 or `nats_asio`.
 
+- `test/config_test.cpp` covers `config.hpp`'s CLI-flag/env-var resolution
+  directly: both accepted flag forms (`--flag value` and `--flag=value`),
+  `take_flag()` not false-matching one flag as a prefix of another (e.g.
+  looking for `--id-bucket` must not match `--name-bucket`), a missing-value
+  flag throwing, and flag-over-env-over-default precedence for every
+  `resolve_*()` variant (`resolve_str`/`resolve_u16`/`resolve_size`/
+  `resolve_int`/`resolve_millis`). Uses real `setenv`/`unsetenv` against a
+  test-only env var name, cleaned up in `TearDown()` so it can't leak
+  between tests. `config.hpp` is standard-library-only, same as `wire.hpp`.
+
 `POC_BUILD_ICEORYX2_TARGETS` (default `ON`) gates `iceoryx2-cxx` itself and
 every target that links it. Turned off, this directory configures and
 builds with nothing but Boost and a C++20 compiler -- no Rust toolchain
-needed -- which is exactly what the main repo's CI does to run these two
+needed -- which is exactly what the main repo's CI does to run these three
 suites on every push (see `poc-unit-tests` in `.github/workflows/ci.yml`):
 
 ```bash

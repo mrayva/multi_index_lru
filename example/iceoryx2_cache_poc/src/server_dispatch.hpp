@@ -23,6 +23,11 @@
 
 namespace poc {
 
+// Defaults only -- dispatch_request() takes the actual bucket names as
+// parameters so server_readthrough.cpp can override them via
+// --name-bucket/--id-bucket or MIL_NAME_BUCKET/MIL_ID_BUCKET (see
+// config.hpp). Kept as named constants since tests and client_readthrough.cpp
+// still want a sensible fixed default to talk to.
 inline constexpr auto kNameBucket = "mil_by_name";
 inline constexpr auto kIdBucket = "mil_by_id";
 
@@ -99,7 +104,8 @@ inline void respond(ActiveRequestType& active_request, const std::vector<std::ui
 // server.cpp's handle_request_local() has, but active_request is always
 // still valid at that point since parsing (and any exception from it)
 // happens before active_request is ever moved into a deferred callback.
-inline void dispatch_request(NameCache& name_cache, IdCache& id_cache, NatsBridge& nats, CompletionQueue& completions,
+inline void dispatch_request(NameCache& name_cache, IdCache& id_cache, NatsBridge& nats, const std::string& name_bucket,
+                              const std::string& id_bucket, CompletionQueue& completions,
                               ActiveRequestType active_request, const std::uint8_t* data, std::size_t size) {
     try {
         wire::Reader r(data, size);
@@ -115,7 +121,7 @@ inline void dispatch_request(NameCache& name_cache, IdCache& id_cache, NatsBridg
                     return;
                 }
                 std::cout << "[server] GET name=\"" << key << "\" -> local miss, dispatched to NATS\n";
-                nats.get_async(kNameBucket, key,
+                nats.get_async(name_bucket, key,
                                 [&completions, active_request = std::move(active_request),
                                  key](NatsGetResult result) mutable {
                                     ApplyFn apply = [key, result](NameCache& name_cache,
@@ -143,7 +149,7 @@ inline void dispatch_request(NameCache& name_cache, IdCache& id_cache, NatsBridg
             }
             std::cout << "[server] GET id=" << key << " -> local miss, dispatched to NATS\n";
             nats.get_async(
-                kIdBucket, std::to_string(key),
+                id_bucket, std::to_string(key),
                 [&completions, active_request = std::move(active_request), key](NatsGetResult result) mutable {
                     ApplyFn apply = [key, result](NameCache&, IdCache& id_cache) -> std::vector<std::uint8_t> {
                         if (result.result == NatsResult::Ok) {
@@ -165,7 +171,7 @@ inline void dispatch_request(NameCache& name_cache, IdCache& id_cache, NatsBridg
                 auto key = r.str();
                 auto record = r.bytes(r.u32());
                 std::cout << "[server] PUT name=\"" << key << "\" -> dispatched to NATS\n";
-                nats.put_async(kNameBucket, key, record,
+                nats.put_async(name_bucket, key, record,
                                 [&completions, active_request = std::move(active_request), key,
                                  record](bool ok, std::string /*err*/) mutable {
                                     ApplyFn apply = [key, record, ok](NameCache& name_cache,
@@ -186,7 +192,7 @@ inline void dispatch_request(NameCache& name_cache, IdCache& id_cache, NatsBridg
             auto key = r.i64();
             auto record = r.bytes(r.u32());
             std::cout << "[server] PUT id=" << key << " -> dispatched to NATS\n";
-            nats.put_async(kIdBucket, std::to_string(key), record,
+            nats.put_async(id_bucket, std::to_string(key), record,
                             [&completions, active_request = std::move(active_request), key,
                              record](bool ok, std::string /*err*/) mutable {
                                 ApplyFn apply = [key, record, ok](NameCache&, IdCache& id_cache) -> std::vector<std::uint8_t> {
@@ -207,7 +213,7 @@ inline void dispatch_request(NameCache& name_cache, IdCache& id_cache, NatsBridg
         if (kind == wire::KeyKind::Name) {
             auto key = r.str();
             std::cout << "[server] ERASE name=\"" << key << "\" -> dispatched to NATS\n";
-            nats.erase_async(kNameBucket, key,
+            nats.erase_async(name_bucket, key,
                               [&completions, active_request = std::move(active_request),
                                key](bool ok, std::string /*err*/) mutable {
                                   ApplyFn apply = [key, ok](NameCache& name_cache,
@@ -227,7 +233,7 @@ inline void dispatch_request(NameCache& name_cache, IdCache& id_cache, NatsBridg
         auto key = r.i64();
         std::cout << "[server] ERASE id=" << key << " -> dispatched to NATS\n";
         nats.erase_async(
-            kIdBucket, std::to_string(key),
+            id_bucket, std::to_string(key),
             [&completions, active_request = std::move(active_request), key](bool ok, std::string /*err*/) mutable {
                 ApplyFn apply = [key, ok](NameCache&, IdCache& id_cache) -> std::vector<std::uint8_t> {
                     if (!ok) {

@@ -4,7 +4,8 @@
 /// either).
 ///
 /// Two independent Container instances (string-keyed / int64-keyed), each
-/// backed by its own NATS KV bucket:
+/// backed by its own NATS KV bucket (default names below, see "Configurable
+/// via..." further down).
 ///   - name cache -> bucket "mil_by_name"
 ///   - id cache   -> bucket "mil_by_id"
 ///
@@ -28,34 +29,61 @@
 ///
 /// The actual request-dispatch logic lives in server_dispatch.hpp, pulled
 /// out of this file so test/dispatch_request_test.cpp can drive it directly.
+///
+/// Configurable via CLI flag or env var (flag wins if both are given):
+///   --service-name / MIL_SERVICE_NAME               (default poc::kServiceName)
+///   --cache-capacity / MIL_CACHE_CAPACITY            (default 1000, applies to both caches)
+///   --nats-host / MIL_NATS_HOST                      (default 127.0.0.1)
+///   --nats-port / MIL_NATS_PORT                      (default 4222)
+///   --name-bucket / MIL_NAME_BUCKET                  (default poc::kNameBucket)
+///   --id-bucket / MIL_ID_BUCKET                       (default poc::kIdBucket)
+///   --nats-timeout-ms / MIL_NATS_TIMEOUT_MS          (default 3000)
+///   --cb-failure-threshold / MIL_CB_FAILURE_THRESHOLD (default 3)
+///   --cb-open-duration-ms / MIL_CB_OPEN_DURATION_MS   (default 2000)
 #include "server_dispatch.hpp"
+#include "config.hpp"
 
 #include "iox2/iceoryx2.hpp"
 
 #include <iostream>
+#include <string>
+#include <vector>
 
 namespace {
 constexpr iox2::bb::Duration kCycleTime = iox2::bb::Duration::from_millis(5);
 constexpr std::uint64_t kInitialSliceLenHint = 256;
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
     using namespace iox2;
 
     set_log_level_from_env_or(LogLevel::Info);
     std::cout << std::unitbuf;  // flush every line -- this process is normally run with stdout redirected to a log file
 
-    std::cout << "[server] connecting to NATS at 127.0.0.1:4222 ...\n";
-    poc::NatsBridge nats("127.0.0.1", 4222);
+    std::vector<std::string> args(argv + 1, argv + argc);
+    const std::string service_name = poc::config::resolve_str(args, "--service-name", "MIL_SERVICE_NAME", poc::kServiceName);
+    const std::size_t capacity = poc::config::resolve_size(args, "--cache-capacity", "MIL_CACHE_CAPACITY", 1000);
+    const std::string nats_host = poc::config::resolve_str(args, "--nats-host", "MIL_NATS_HOST", "127.0.0.1");
+    const std::uint16_t nats_port = poc::config::resolve_u16(args, "--nats-port", "MIL_NATS_PORT", 4222);
+    const std::string name_bucket = poc::config::resolve_str(args, "--name-bucket", "MIL_NAME_BUCKET", poc::kNameBucket);
+    const std::string id_bucket = poc::config::resolve_str(args, "--id-bucket", "MIL_ID_BUCKET", poc::kIdBucket);
+    const auto nats_timeout = poc::config::resolve_millis(args, "--nats-timeout-ms", "MIL_NATS_TIMEOUT_MS", 3000);
+    const int cb_failure_threshold =
+        poc::config::resolve_int(args, "--cb-failure-threshold", "MIL_CB_FAILURE_THRESHOLD", 3);
+    const auto cb_open_duration =
+        poc::config::resolve_millis(args, "--cb-open-duration-ms", "MIL_CB_OPEN_DURATION_MS", 2000);
+
+    std::cout << "[server] connecting to NATS at " << nats_host << ":" << nats_port << " ...\n";
+    poc::NatsBridge nats(nats_host, nats_port, nats_timeout, cb_failure_threshold, cb_open_duration);
     std::cout << "[server] connected to NATS\n";
 
-    poc::NameCache name_cache(1000);
-    poc::IdCache id_cache(1000);
+    poc::NameCache name_cache(capacity);
+    poc::IdCache id_cache(capacity);
     poc::CompletionQueue completions;
 
     auto node = NodeBuilder().create<ServiceType::Ipc>().value();
 
-    auto service = node.service_builder(ServiceName::create(poc::kServiceName).value())
+    auto service = node.service_builder(ServiceName::create(service_name.c_str()).value())
                         .request_response<bb::Slice<std::uint8_t>, bb::Slice<std::uint8_t>>()
                         .open_or_create()
                         .value();
@@ -66,8 +94,8 @@ int main() {
                       .create()
                       .value();
 
-    std::cout << "[server] read-through cache daemon ready (non-blocking), service \"" << poc::kServiceName
-              << "\", buckets \"" << poc::kNameBucket << "\" / \"" << poc::kIdBucket << "\". Ctrl+C to stop.\n";
+    std::cout << "[server] read-through cache daemon ready (non-blocking), service \"" << service_name
+              << "\", buckets \"" << name_bucket << "\" / \"" << id_bucket << "\". Ctrl+C to stop.\n";
 
     while (node.wait(kCycleTime).has_value()) {
         // Respond to whatever NATS operations finished since the last cycle
@@ -93,8 +121,8 @@ int main() {
             const auto& payload = active_request_opt->payload();
             std::vector<std::uint8_t> request_bytes(payload.data(), payload.data() + payload.number_of_bytes());
 
-            poc::dispatch_request(name_cache, id_cache, nats, completions, std::move(active_request_opt.value()),
-                                   request_bytes.data(), request_bytes.size());
+            poc::dispatch_request(name_cache, id_cache, nats, name_bucket, id_bucket, completions,
+                                   std::move(active_request_opt.value()), request_bytes.data(), request_bytes.size());
         }
     }
 

@@ -170,17 +170,18 @@ jobs:
           _build/integration/example/sbepp_cache
 
   poc-unit-tests:
-    name: iceoryx2 POC unit tests (wire.hpp + handle_request_local)
+    name: iceoryx2 POC unit tests (wire.hpp + handle_request_local + config)
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
 
       # example/iceoryx2_cache_poc/ as a whole depends on iceoryx2-cxx (Rust
       # toolchain to build) and, optionally, nats_asio's own heavy dependency
-      # tree -- deliberately not part of this repo's normal CI. wire.hpp and
-      # handle_request_local() (cache_service.hpp) have no dependency on
-      # either, though, so POC_BUILD_ICEORYX2_TARGETS=OFF configures and
-      # builds their unit tests with nothing but Boost and a C++20 compiler.
+      # tree -- deliberately not part of this repo's normal CI. wire.hpp,
+      # handle_request_local() (cache_service.hpp), and config.hpp have no
+      # dependency on either, though, so POC_BUILD_ICEORYX2_TARGETS=OFF
+      # configures and builds their unit tests with nothing but Boost and a
+      # C++20 compiler.
       - name: Install build dependencies
         run: |
           sudo apt-get update

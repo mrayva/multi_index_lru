@@ -101,9 +101,14 @@ if(POC_BUILD_TESTS)
         PRIVATE multi_index_lru_headers GTest::gtest GTest::gtest_main
     )
 
+    # config.hpp is standard-library-only, same as wire.hpp.
+    add_executable(cache_poc_config_test test/config_test.cpp)
+    target_link_libraries(cache_poc_config_test PRIVATE GTest::gtest GTest::gtest_main)
+
     include(GoogleTest)
     gtest_discover_tests(cache_poc_wire_test)
     gtest_discover_tests(cache_poc_handle_request_local_test)
+    gtest_discover_tests(cache_poc_config_test)
 
     # nats_bridge_test.cpp and dispatch_request_test.cpp are integration
     # tests against a real local NATS server (there's no fake for

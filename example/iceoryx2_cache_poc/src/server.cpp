@@ -14,11 +14,18 @@
 ///
 /// See server_readthrough.cpp for the variant that falls through to a NATS
 /// JetStream KV bucket on a local miss.
+///
+/// Configurable via CLI flag or env var (flag wins if both are given):
+///   --service-name / MIL_SERVICE_NAME    (default poc::kServiceName)
+///   --cache-capacity / MIL_CACHE_CAPACITY (default 1000, applies to both caches)
 #include "cache_service.hpp"
+#include "config.hpp"
 
 #include "iox2/iceoryx2.hpp"
 
 #include <iostream>
+#include <string>
+#include <vector>
 
 namespace {
 
@@ -31,25 +38,29 @@ std::vector<std::uint8_t> to_bytes(const std::string& s) {
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
     using namespace iox2;
 
     set_log_level_from_env_or(LogLevel::Info);
     std::cout << std::unitbuf;  // flush every line -- this process is normally run with stdout redirected to a log file
 
+    std::vector<std::string> args(argv + 1, argv + argc);
+    const std::string service_name = poc::config::resolve_str(args, "--service-name", "MIL_SERVICE_NAME", poc::kServiceName);
+    const std::size_t capacity = poc::config::resolve_size(args, "--cache-capacity", "MIL_CACHE_CAPACITY", 1000);
+
     // --- seed the caches this process owns --------------------------------
-    poc::NameCache name_cache(1000);
+    poc::NameCache name_cache(capacity);
     name_cache.emplace(poc::NameEntry{"alice", to_bytes(R"({"name":"Alice"})")});
     name_cache.emplace(poc::NameEntry{"bob", to_bytes(R"({"name":"Bob"})")});
 
-    poc::IdCache id_cache(1000);
+    poc::IdCache id_cache(capacity);
     id_cache.emplace(poc::IdEntry{1, to_bytes(R"({"id":1,"name":"Alice"})")});
     id_cache.emplace(poc::IdEntry{2, to_bytes(R"({"id":2,"name":"Bob"})")});
 
     // --- set up the iceoryx2 side ----------------------------------------
     auto node = NodeBuilder().create<ServiceType::Ipc>().value();
 
-    auto service = node.service_builder(ServiceName::create(poc::kServiceName).value())
+    auto service = node.service_builder(ServiceName::create(service_name.c_str()).value())
                         .request_response<bb::Slice<std::uint8_t>, bb::Slice<std::uint8_t>>()
                         .open_or_create()
                         .value();
@@ -60,7 +71,7 @@ int main() {
                       .create()
                       .value();
 
-    std::cout << "[server] cache daemon ready, service \"" << poc::kServiceName << "\", "
+    std::cout << "[server] cache daemon ready, service \"" << service_name << "\", "
               << name_cache.size() << " name-keyed + " << id_cache.size() << " id-keyed entries loaded. "
               << "Ctrl+C to stop.\n";
 
