@@ -11,8 +11,12 @@
 
 namespace poc::wire {
 
-enum class Op : std::uint8_t { Get = 0, Put = 1, Erase = 2 };
-enum class KeyKind : std::uint8_t { Name = 0, Id = 1 };
+// GetAll: looks up every NameEntry sharing a (non-unique) category rather
+// than a single record by its (unique) primary key -- see cache_service.hpp
+// "Non-unique key lookup (GetAll)" and README.md for the full design; it's
+// the only Op that pairs with KeyKind::Category.
+enum class Op : std::uint8_t { Get = 0, Put = 1, Erase = 2, GetAll = 3 };
+enum class KeyKind : std::uint8_t { Name = 0, Id = 1, Category = 2 };
 enum class Status : std::uint8_t { Ok = 0, NotFound = 1, Error = 2 };
 
 class Writer {

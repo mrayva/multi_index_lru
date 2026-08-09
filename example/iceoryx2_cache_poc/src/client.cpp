@@ -6,12 +6,17 @@
 /// against both the string-keyed and int64-keyed cache. With arguments,
 /// sends a single manual request:
 ///
-///   cache_poc_client get   name <name>
-///   cache_poc_client get   id   <id>
-///   cache_poc_client erase name <name>
-///   cache_poc_client erase id   <id>
-///   cache_poc_client put   name <name> <record-text>
-///   cache_poc_client put   id   <id>   <record-text>
+///   cache_poc_client get    name <name>
+///   cache_poc_client get    id   <id>
+///   cache_poc_client erase  name <name>
+///   cache_poc_client erase  id   <id>
+///   cache_poc_client put    name <name> <record-text> [category]
+///   cache_poc_client put    id   <id>   <record-text>
+///   cache_poc_client getall <category>
+///
+/// `getall` and `put name`'s optional trailing [category] exercise
+/// NameCache's second (non-unique) index -- see cache_service.hpp
+/// "Non-unique key lookup (GetAll)". Id-keyed entries have no category.
 ///
 /// Run server.cpp (or server_readthrough.cpp) first in one terminal, then
 /// this in another.
@@ -83,6 +88,22 @@ void print_status_result(const std::vector<std::uint8_t>& response_bytes, const 
     std::cout << "  -> " << verb << ": " << status_name(status) << "\n";
 }
 
+void print_get_all_result(const std::vector<std::uint8_t>& response_bytes) {
+    poc::wire::Reader r(response_bytes.data(), response_bytes.size());
+    const auto status = static_cast<poc::wire::Status>(r.u8());
+    if (status != poc::wire::Status::Ok) {
+        std::cout << "  -> " << status_name(status) << "\n";
+        return;
+    }
+    const auto count = r.u32();
+    const bool truncated = r.u8() != 0;
+    std::cout << "  -> " << count << " record(s)" << (truncated ? " (truncated -- more matched)" : "") << ":\n";
+    for (std::uint32_t i = 0; i < count; ++i) {
+        auto record = r.bytes(r.u32());
+        std::cout << "     " << std::string(record.begin(), record.end()) << "\n";
+    }
+}
+
 template <typename Client>
 void run_demo_script(Client& client, iox2::Node<iox2::ServiceType::Ipc>& node) {
     std::cout << "--- string-keyed cache ---\n";
@@ -93,22 +114,27 @@ void run_demo_script(Client& client, iox2::Node<iox2::ServiceType::Ipc>& node) {
     std::cout << "[client] GET name=\"dave\" (does not exist yet) ...\n";
     print_get_result(call(client, node, poc::encode_get(poc::wire::KeyKind::Name, "dave", 0)));
 
-    std::cout << "[client] PUT name=\"dave\" record={\"name\":\"Dave\"} ...\n";
+    std::cout << "[client] PUT name=\"dave\" category=\"friends\" record={\"name\":\"Dave\"} ...\n";
     print_status_result(
         call(client, node,
              poc::encode_put(poc::wire::KeyKind::Name, "dave", 0,
-                              {'{', '"', 'n', 'a', 'm', 'e', '"', ':', '"', 'D', 'a', 'v', 'e', '"', '}'})),
+                              {'{', '"', 'n', 'a', 'm', 'e', '"', ':', '"', 'D', 'a', 'v', 'e', '"', '}'}, "friends")),
         "put");
 
     std::cout << "[client] GET name=\"dave\" (should be there now) ...\n";
     print_get_result(call(client, node, poc::encode_get(poc::wire::KeyKind::Name, "dave", 0)));
 
-    std::cout << "[client] PUT name=\"dave\" record={\"name\":\"Dave\",\"v\":2} (update) ...\n";
+    std::cout << "\n--- non-unique key lookup (GetAll) ---\n";
+
+    std::cout << "[client] GETALL category=\"friends\" (alice, bob pre-seeded + dave just added) ...\n";
+    print_get_all_result(call(client, node, poc::encode_get_all("friends")));
+
+    std::cout << "[client] PUT name=\"dave\" category=\"friends\" record={\"name\":\"Dave\",\"v\":2} (update) ...\n";
     print_status_result(
         call(client, node,
              poc::encode_put(poc::wire::KeyKind::Name, "dave", 0,
                               {'{', '"', 'n', 'a', 'm', 'e', '"', ':', '"', 'D', 'a', 'v', 'e', '"', ',', '"', 'v',
-                               '"', ':', '2', '}'})),
+                               '"', ':', '2', '}'}, "friends")),
         "put");
 
     std::cout << "[client] GET name=\"dave\" (should show the update) ...\n";
@@ -119,6 +145,15 @@ void run_demo_script(Client& client, iox2::Node<iox2::ServiceType::Ipc>& node) {
 
     std::cout << "[client] GET name=\"dave\" (erased) ...\n";
     print_get_result(call(client, node, poc::encode_get(poc::wire::KeyKind::Name, "dave", 0)));
+
+    std::cout << "[client] GETALL category=\"friends\" (dave's erase should have removed him from here too) ...\n";
+    print_get_all_result(call(client, node, poc::encode_get_all("friends")));
+
+    std::cout << "[client] GETALL category=\"coworkers\" (carol, pre-seeded) ...\n";
+    print_get_all_result(call(client, node, poc::encode_get_all("coworkers")));
+
+    std::cout << "[client] GETALL category=\"nonexistent\" ...\n";
+    print_get_all_result(call(client, node, poc::encode_get_all("nonexistent")));
 
     std::cout << "\n--- int64-keyed cache ---\n";
 
@@ -170,24 +205,32 @@ void run_manual_command(Client& client, iox2::Node<iox2::ServiceType::Ipc>& node
         std::int64_t id = 0;
         parse_kind_and_key(1, kind, name, id);
         print_status_result(call(client, node, poc::encode_erase(kind, name, id)), "erase");
-    } else if (verb == "put" && args.size() == 4) {
+    } else if (verb == "put" && (args.size() == 4 || args.size() == 5)) {
         poc::wire::KeyKind kind{};
         std::string name;
         std::int64_t id = 0;
         parse_kind_and_key(1, kind, name, id);
         const auto& text = args[3];
+        // args[4], if given, is the category -- only meaningful for
+        // KeyKind::Name (encode_put ignores it for Id, same as Id-keyed
+        // Puts have no category field on the wire at all).
+        const std::string category = (args.size() == 5) ? args[4] : "";
         print_status_result(
-            call(client, node, poc::encode_put(kind, name, id, std::vector<std::uint8_t>(text.begin(), text.end()))),
+            call(client, node,
+                 poc::encode_put(kind, name, id, std::vector<std::uint8_t>(text.begin(), text.end()), category)),
             "put");
+    } else if (verb == "getall" && args.size() == 2) {
+        print_get_all_result(call(client, node, poc::encode_get_all(args[1])));
     } else {
         std::cerr << "usage:\n"
-                  << "  cache_poc_client                              (run demo script)\n"
-                  << "  cache_poc_client get   name <name>\n"
-                  << "  cache_poc_client get   id   <id>\n"
-                  << "  cache_poc_client erase name <name>\n"
-                  << "  cache_poc_client erase id   <id>\n"
-                  << "  cache_poc_client put   name <name> <record-text>\n"
-                  << "  cache_poc_client put   id   <id>   <record-text>\n";
+                  << "  cache_poc_client                                    (run demo script)\n"
+                  << "  cache_poc_client get    name <name>\n"
+                  << "  cache_poc_client get    id   <id>\n"
+                  << "  cache_poc_client erase  name <name>\n"
+                  << "  cache_poc_client erase  id   <id>\n"
+                  << "  cache_poc_client put    name <name> <record-text> [category]\n"
+                  << "  cache_poc_client put    id   <id>   <record-text>\n"
+                  << "  cache_poc_client getall <category>\n";
         std::exit(1);
     }
 }

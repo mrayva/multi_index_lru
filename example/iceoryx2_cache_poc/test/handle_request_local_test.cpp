@@ -10,6 +10,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <chrono>
 #include <optional>
 #include <string>
@@ -30,8 +31,9 @@ protected:
     NameCache name_cache{kCapacity, kTtl};
     IdCache id_cache{kCapacity, kTtl};
 
-    std::vector<std::uint8_t> handle(const std::vector<std::uint8_t>& request) {
-        return handle_request_local(name_cache, id_cache, request.data(), request.size());
+    std::vector<std::uint8_t> handle(const std::vector<std::uint8_t>& request,
+                                      std::size_t max_getall_results = 100) {
+        return handle_request_local(name_cache, id_cache, request.data(), request.size(), max_getall_results);
     }
 };
 
@@ -51,6 +53,27 @@ std::optional<std::vector<std::uint8_t>> decode_get(const std::vector<std::uint8
 
 std::vector<std::uint8_t> text(const std::string& s) {
     return std::vector<std::uint8_t>(s.begin(), s.end());
+}
+
+struct GetAllResult {
+    std::vector<std::vector<std::uint8_t>> records;
+    bool truncated = false;
+};
+
+// For a GetAll response: nullopt means NotFound/Error, otherwise the decoded
+// records plus the truncated flag.
+std::optional<GetAllResult> decode_get_all(const std::vector<std::uint8_t>& response) {
+    wire::Reader r(response.data(), response.size());
+    if (static_cast<wire::Status>(r.u8()) != wire::Status::Ok) {
+        return std::nullopt;
+    }
+    GetAllResult out;
+    const auto count = r.u32();
+    out.truncated = r.u8() != 0;
+    for (std::uint32_t i = 0; i < count; ++i) {
+        out.records.push_back(r.bytes(r.u32()));
+    }
+    return out;
 }
 
 // --- Get on empty caches ----------------------------------------------------
@@ -142,6 +165,88 @@ TEST_F(HandleRequestLocalTest, NameCacheAndIdCacheDoNotCrossPollinate) {
     handle(encode_erase(wire::KeyKind::Id, "", 42));
     auto response = handle(encode_get(wire::KeyKind::Name, "42", 0));
     EXPECT_EQ(decode_get(response), text("name-42"));
+}
+
+// --- Non-unique key lookup (GetAll) -------------------------------------
+// See cache_service.hpp "Non-unique key lookup (GetAll)": NameCache's
+// second, hashed_non_unique index over `category`, kept in sync
+// automatically by boost::multi_index on every Put/Erase.
+
+TEST_F(HandleRequestLocalTest, GetAllReturnsEveryRecordSharingACategory) {
+    handle(encode_put(wire::KeyKind::Name, "alice", 0, text("A"), "friends"));
+    handle(encode_put(wire::KeyKind::Name, "bob", 0, text("B"), "friends"));
+
+    auto result = decode_get_all(handle(encode_get_all("friends")));
+    ASSERT_TRUE(result.has_value());
+    EXPECT_FALSE(result->truncated);
+    ASSERT_EQ(result->records.size(), 2u);
+    EXPECT_NE(std::find(result->records.begin(), result->records.end(), text("A")), result->records.end());
+    EXPECT_NE(std::find(result->records.begin(), result->records.end(), text("B")), result->records.end());
+}
+
+TEST_F(HandleRequestLocalTest, GetAllOfUnknownCategoryReturnsNotFound) {
+    handle(encode_put(wire::KeyKind::Name, "alice", 0, text("A"), "friends"));
+
+    EXPECT_EQ(decode_get_all(handle(encode_get_all("nonexistent"))), std::nullopt);
+}
+
+TEST_F(HandleRequestLocalTest, GetAllDoesNotReturnRecordsFromADifferentCategory) {
+    handle(encode_put(wire::KeyKind::Name, "alice", 0, text("A"), "friends"));
+    handle(encode_put(wire::KeyKind::Name, "carol", 0, text("C"), "coworkers"));
+
+    auto result = decode_get_all(handle(encode_get_all("friends")));
+    ASSERT_TRUE(result.has_value());
+    ASSERT_EQ(result->records.size(), 1u);
+    EXPECT_EQ(result->records[0], text("A"));
+}
+
+TEST_F(HandleRequestLocalTest, PutWithoutCategoryDefaultsToEmptyCategory) {
+    handle(encode_put(wire::KeyKind::Name, "alice", 0, text("A")));  // no category argument at all
+
+    auto result = decode_get_all(handle(encode_get_all("")));
+    ASSERT_TRUE(result.has_value());
+    ASSERT_EQ(result->records.size(), 1u);
+    EXPECT_EQ(result->records[0], text("A"));
+
+    EXPECT_EQ(decode_get_all(handle(encode_get_all("friends"))), std::nullopt)
+        << "an uncategorized entry must not show up under an unrelated real category";
+}
+
+TEST_F(HandleRequestLocalTest, UpsertMovesEntryBetweenCategoriesAutomatically) {
+    handle(encode_put(wire::KeyKind::Name, "dave", 0, text("v1"), "friends"));
+    ASSERT_EQ(decode_get_all(handle(encode_get_all("friends")))->records.size(), 1u);
+
+    handle(encode_put(wire::KeyKind::Name, "dave", 0, text("v2"), "coworkers"));
+
+    EXPECT_EQ(decode_get_all(handle(encode_get_all("friends"))), std::nullopt)
+        << "re-Put under a different category must remove dave from the old category's index";
+    auto result = decode_get_all(handle(encode_get_all("coworkers")));
+    ASSERT_TRUE(result.has_value());
+    ASSERT_EQ(result->records.size(), 1u);
+    EXPECT_EQ(result->records[0], text("v2"));
+}
+
+TEST_F(HandleRequestLocalTest, EraseRemovesEntryFromCategoryIndexToo) {
+    handle(encode_put(wire::KeyKind::Name, "alice", 0, text("A"), "friends"));
+    handle(encode_erase(wire::KeyKind::Name, "alice", 0));
+
+    EXPECT_EQ(decode_get_all(handle(encode_get_all("friends"))), std::nullopt);
+}
+
+TEST_F(HandleRequestLocalTest, GetAllRespectsMaxResultsCapAndSetsTruncatedFlag) {
+    for (int i = 0; i < 5; ++i) {
+        handle(encode_put(wire::KeyKind::Name, "person" + std::to_string(i), 0, text("v"), "crowd"));
+    }
+
+    auto capped = decode_get_all(handle(encode_get_all("crowd"), /*max_getall_results=*/3));
+    ASSERT_TRUE(capped.has_value());
+    EXPECT_EQ(capped->records.size(), 3u);
+    EXPECT_TRUE(capped->truncated);
+
+    auto uncapped = decode_get_all(handle(encode_get_all("crowd"), /*max_getall_results=*/100));
+    ASSERT_TRUE(uncapped.has_value());
+    EXPECT_EQ(uncapped->records.size(), 5u);
+    EXPECT_FALSE(uncapped->truncated);
 }
 
 // --- Exception hardening: a malformed request must not crash/throw ----------

@@ -424,21 +424,33 @@ inline void dispatch_request(NameCache& name_cache, IdCache& id_cache, NatsBridg
         if (op == wire::Op::Put) {
             if (kind == wire::KeyKind::Name) {
                 auto key = r.str();
+                // Category is stored (NameCache's second, non-unique index
+                // -- see cache_service.hpp "Non-unique key lookup
+                // (GetAll)") but GetAll itself isn't implemented against
+                // this NATS-backed server -- read through/write through
+                // only cover the primary key. Still has to be parsed here
+                // regardless, matching encode_put()'s wire format exactly:
+                // this decode has no way to know a category was omitted
+                // versus genuinely empty, and skipping it would misread
+                // every byte after it as part of the record.
+                auto category = r.str();
                 auto record = r.bytes(r.u32());
                 auto qkey = name_queue_key(key);
                 auto request = std::make_shared<ActiveRequestType>(std::move(active_request));
-                if (!key_queue.enqueue(qkey, [&nats, &completions, name_bucket, request, key, record, qkey]() mutable {
+                if (!key_queue.enqueue(qkey, [&nats, &completions, name_bucket, request, key, record, category,
+                                               qkey]() mutable {
                     std::cout << "[server] PUT name=\"" << key << "\" -> dispatched to NATS\n";
                     nats.put_async(name_bucket, key, record,
-                                    [&completions, request, key, record, qkey](bool ok, std::uint64_t revision,
-                                                                                std::string /*err*/) mutable {
-                                        ApplyFn apply = [key, record, ok](NameCache& name_cache,
-                                                                           IdCache&) -> std::vector<std::uint8_t> {
+                                    [&completions, request, key, record, category, qkey](
+                                        bool ok, std::uint64_t revision, std::string /*err*/) mutable {
+                                        ApplyFn apply = [key, record, category, ok](
+                                                             NameCache& name_cache,
+                                                             IdCache&) -> std::vector<std::uint8_t> {
                                             if (!ok) {
                                                 return encode_status(wire::Status::Error);
                                             }
                                             name_cache.erase<NameTag>(key);
-                                            name_cache.emplace(NameEntry{key, record});
+                                            name_cache.emplace(NameEntry{key, record, true, category});
                                             return encode_status(wire::Status::Ok);
                                         };
                                         completions.push(std::move(request), std::move(apply),

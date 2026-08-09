@@ -23,6 +23,9 @@
 ///                                           see README.md "Load testing" for why this is raised)
 ///   --max-active-requests-per-client / MIL_MAX_ACTIVE_REQUESTS_PER_CLIENT
 ///                                          (default 32 -- iceoryx2-cxx's own default is 4)
+///   --max-getall-results / MIL_MAX_GETALL_RESULTS
+///                                          (default 100 -- caps a single GetAll response;
+///                                           see cache_service.hpp "Non-unique key lookup (GetAll)")
 #include "cache_service.hpp"
 #include "config.hpp"
 
@@ -61,11 +64,14 @@ int main(int argc, char** argv) {
     const std::size_t max_clients = poc::config::resolve_size(args, "--max-clients", "MIL_MAX_CLIENTS", 16);
     const std::size_t max_active_requests_per_client = poc::config::resolve_size(
         args, "--max-active-requests-per-client", "MIL_MAX_ACTIVE_REQUESTS_PER_CLIENT", 32);
+    const std::size_t max_getall_results =
+        poc::config::resolve_size(args, "--max-getall-results", "MIL_MAX_GETALL_RESULTS", 100);
 
     // --- seed the caches this process owns --------------------------------
     poc::NameCache name_cache(capacity, ttl);
-    name_cache.emplace(poc::NameEntry{"alice", to_bytes(R"({"name":"Alice"})")});
-    name_cache.emplace(poc::NameEntry{"bob", to_bytes(R"({"name":"Bob"})")});
+    name_cache.emplace(poc::NameEntry{"alice", to_bytes(R"({"name":"Alice"})"), true, "friends"});
+    name_cache.emplace(poc::NameEntry{"bob", to_bytes(R"({"name":"Bob"})"), true, "friends"});
+    name_cache.emplace(poc::NameEntry{"carol", to_bytes(R"({"name":"Carol"})"), true, "coworkers"});
 
     poc::IdCache id_cache(capacity, ttl);
     id_cache.emplace(poc::IdEntry{1, to_bytes(R"({"id":1,"name":"Alice"})")});
@@ -103,7 +109,7 @@ int main(int argc, char** argv) {
 
             const auto& request_payload = active_request->payload();
             auto response_bytes = poc::handle_request_local(
-                name_cache, id_cache, request_payload.data(), request_payload.number_of_bytes());
+                name_cache, id_cache, request_payload.data(), request_payload.number_of_bytes(), max_getall_results);
             std::cout << "[server] handled request (" << request_payload.number_of_bytes() << " bytes in, "
                       << response_bytes.size() << " bytes out), caches now have " << name_cache.size()
                       << " name-keyed + " << id_cache.size() << " id-keyed entries\n";

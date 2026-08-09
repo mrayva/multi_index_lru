@@ -202,11 +202,13 @@ TEST(WireEnums, OpValuesArePinned) {
     EXPECT_EQ(static_cast<std::uint8_t>(Op::Get), 0);
     EXPECT_EQ(static_cast<std::uint8_t>(Op::Put), 1);
     EXPECT_EQ(static_cast<std::uint8_t>(Op::Erase), 2);
+    EXPECT_EQ(static_cast<std::uint8_t>(Op::GetAll), 3);
 }
 
 TEST(WireEnums, KeyKindValuesArePinned) {
     EXPECT_EQ(static_cast<std::uint8_t>(KeyKind::Name), 0);
     EXPECT_EQ(static_cast<std::uint8_t>(KeyKind::Id), 1);
+    EXPECT_EQ(static_cast<std::uint8_t>(KeyKind::Category), 2);
 }
 
 TEST(WireEnums, StatusValuesArePinned) {

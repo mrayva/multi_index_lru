@@ -33,15 +33,18 @@ C++20 compiler (see "Unit tests" below).
   [zerialize](../zerialize_cache.cpp)-produced flexbuffer/msgpack record)
   that expires after a configurable TTL on top of the usual LRU-capacity
   eviction (`--ttl-ms`/`MIL_TTL_MS`, see "Configuration" below). They're
-  unrelated caches, not two indices over the same entries: this exists to
-  demo/test both a string-keyed and an integral-keyed `ExpirableContainer`
-  side by side under one service.
+  unrelated *to each other*, not two indices over the same entries: this
+  exists to demo/test both a string-keyed and an integral-keyed
+  `ExpirableContainer` side by side under one service. `NameCache` does
+  internally have two indices over its own entries, though — see "Non-unique
+  key lookup (GetAll)" below.
 - `wire.hpp` is a tiny little-endian binary encoder/decoder for the
   request/response messages (POC-scope only: assumes a little-endian host).
 - `server.cpp` is the sole owner of both containers (respecting the "not
   thread-safe, no internal locking" constraint documented in the main
   README) and answers `request_response<Slice<u8>, Slice<u8>>` requests
-  carrying **get / put / erase**, each naming which cache to hit.
+  carrying **get / put / erase / getall**, each naming which cache (or, for
+  getall, which category) to hit.
 - `client.cpp` runs a demo script exercising all three operations against
   both caches (see below), or a single manual command when given arguments.
 - `server_readthrough.cpp` / `server_dispatch.hpp` / `nats_bridge.hpp` /
@@ -65,15 +68,26 @@ iceoryx2 only carries bytes across the process boundary.
 
 Request: `[op:u8][key_kind:u8][...]`
 - `Get`/`Erase`: `[name:u32-prefixed-str]` (key_kind=Name) or `[id:i64]` (key_kind=Id)
-- `Put`: same key, then `[record_len:u32][record bytes]`
+- `Put`: same key, then -- for key_kind=Name only -- `[category:u32-prefixed-str]`
+  (see "Non-unique key lookup (GetAll)" below; always present on the wire, empty
+  string if the caller didn't specify one), then `[record_len:u32][record bytes]`
+- `GetAll`: key_kind is always Category, followed by `[category:u32-prefixed-str]`
 
-Response: `[status:u8][record bytes if Get+Ok]` — `status` is `Ok`, `NotFound`, or `Error`
-(`Error` is only ever produced by the NATS-backed server, e.g. on a NATS timeout).
+Response:
+- `Get+Ok`: `[status:u8=Ok][record bytes]`
+- `GetAll+Ok` (at least one match): `[status:u8=Ok][count:u32][truncated:u8]
+  [record_len:u32][record bytes] x count`
+- everything else (a miss, `Erase`, `Put`, or an error): `[status:u8]` alone
+  — `status` is `Ok`, `NotFound`, or `Error` (`Error` is only ever produced
+  by the NATS-backed server, e.g. on a NATS timeout).
 
 `Put` is an upsert against whichever cache `key_kind` selects: the server
 erases any existing entry under that key first (a plain `Container::emplace()`
 only inserts-if-absent, it won't overwrite an existing value on a duplicate
-key) and then inserts fresh.
+key) and then inserts fresh -- which, for `NameCache`, also means an upsert
+under a new category automatically moves the entry out of its old category
+in the `CategoryTag` index; nothing extra needed to keep the two indices
+in sync.
 
 ## Building iceoryx2-cxx
 
@@ -126,9 +140,10 @@ cmake --build build-poc
 # or a single manual command:
 ./build-poc/cache_poc_client get name alice
 ./build-poc/cache_poc_client get id 2
-./build-poc/cache_poc_client put name dave 'some record text'
+./build-poc/cache_poc_client put name dave 'some record text' friends
 ./build-poc/cache_poc_client put id 42 'some record text'
 ./build-poc/cache_poc_client erase id 42
+./build-poc/cache_poc_client getall friends
 ```
 
 Expected demo-script output:
@@ -139,17 +154,33 @@ Expected demo-script output:
   -> {"name":"Alice"}
 [client] GET name="dave" (does not exist yet) ...
   -> not found
-[client] PUT name="dave" record={"name":"Dave"} ...
+[client] PUT name="dave" category="friends" record={"name":"Dave"} ...
   -> put: ok
 [client] GET name="dave" (should be there now) ...
   -> {"name":"Dave"}
-[client] PUT name="dave" record={"name":"Dave","v":2} (update) ...
+
+--- non-unique key lookup (GetAll) ---
+[client] GETALL category="friends" (alice, bob pre-seeded + dave just added) ...
+  -> 3 record(s):
+     {"name":"Dave"}
+     {"name":"Bob"}
+     {"name":"Alice"}
+[client] PUT name="dave" category="friends" record={"name":"Dave","v":2} (update) ...
   -> put: ok
 [client] GET name="dave" (should show the update) ...
   -> {"name":"Dave","v":2}
 [client] ERASE name="dave" ...
   -> erase: ok
 [client] GET name="dave" (erased) ...
+  -> not found
+[client] GETALL category="friends" (dave's erase should have removed him from here too) ...
+  -> 2 record(s):
+     {"name":"Bob"}
+     {"name":"Alice"}
+[client] GETALL category="coworkers" (carol, pre-seeded) ...
+  -> 1 record(s):
+     {"name":"Carol"}
+[client] GETALL category="nonexistent" ...
   -> not found
 
 --- int64-keyed cache ---
@@ -174,18 +205,19 @@ communicating only via iceoryx2 shared memory) to produce the output above.
 ## Configuration
 
 Everything that previously had to be recompiled to change is now a CLI flag
-or env var, resolved by `config.hpp` (shared by all four binaries): **a CLI
+or env var, resolved by `config.hpp` (shared by all five binaries): **a CLI
 flag always wins if both are given for the same setting.** Both forms are
 accepted for flags with a value: `--flag value` or `--flag=value`.
 
 | Flag | Env var | Default | Used by |
 |---|---|---|---|
-| `--service-name` | `MIL_SERVICE_NAME` | `poc::kServiceName` | all four -- client and server must agree |
+| `--service-name` | `MIL_SERVICE_NAME` | `poc::kServiceName` | all five -- client(s) and server must agree |
 | `--cache-capacity` | `MIL_CACHE_CAPACITY` | `1000` | `server.cpp`, `server_readthrough.cpp` (applies to both caches) |
 | `--ttl-ms` | `MIL_TTL_MS` | `300000` (5min) | `server.cpp`, `server_readthrough.cpp` (applies to both caches) |
 | `--max-clients` | `MIL_MAX_CLIENTS` | `16` | `server.cpp`, `server_readthrough.cpp` (iceoryx2-cxx's own default is 8, see "Load testing") |
 | `--max-active-requests-per-client` | `MIL_MAX_ACTIVE_REQUESTS_PER_CLIENT` | `32` | `server.cpp`, `server_readthrough.cpp` (iceoryx2-cxx's own default is 4, see "Load testing") |
 | `--max-queue-depth-per-key` | `MIL_MAX_QUEUE_DEPTH_PER_KEY` | `64` | `server_readthrough.cpp` (`KeyOperationQueue` backpressure, see "Backpressure") |
+| `--max-getall-results` | `MIL_MAX_GETALL_RESULTS` | `100` | `server.cpp` (caps a single GetAll response, see "Non-unique key lookup (GetAll)") |
 | `--nats-host` | `MIL_NATS_HOST` | `127.0.0.1` | `server_readthrough.cpp`, `client_readthrough.cpp` |
 | `--nats-port` | `MIL_NATS_PORT` | `4222` | `server_readthrough.cpp`, `client_readthrough.cpp` |
 | `--name-bucket` | `MIL_NAME_BUCKET` | `poc::kNameBucket` (`mil_by_name`) | `server_readthrough.cpp`, `client_readthrough.cpp` |
@@ -249,7 +281,7 @@ slots proactively instead of waiting on that pressure.
 Verified live: started `cache_poc_server --ttl-ms=500`, `PUT` a key, `GET` it
 immediately (hit), waited 1.2s (past the 500ms TTL), `GET` it again --
 `not found`. The server's own log over that run additionally showed the
-2 seeded name-keyed + 2 seeded id-keyed entries (present at startup, never
+3 seeded name-keyed + 2 seeded id-keyed entries (present at startup, never
 touched again) drop to zero *before* the first `PUT` arrived -- proactive
 `cleanup_expired()` reclaiming them on its own, not something waiting for a
 `GET` to trip over them. `test/handle_request_local_test.cpp`'s
@@ -260,6 +292,58 @@ checking it (`GetBeforeExpiryRefreshesTtlSoEntrySurvivesPastOriginalDeadline`).
 the main repo's `test/expirable_test.cpp` -- these POC tests are scoped to
 confirming the wiring (a real, non-default TTL reaches the constructor and is
 observable through `handle_request_local()`), not re-testing the library.
+
+## Non-unique key lookup (GetAll)
+
+Everything above addresses `NameCache`/`IdCache` by their *unique* primary
+key -- one `Get` names exactly one record. `boost::multi_index`'s actual
+point is multiple simultaneous indices over the same data, though, and
+`NameCache` now has a second one: `CategoryTag`, a `hashed_non_unique` index
+on a new `category` field (default `""`, meaning "uncategorized" -- see
+`NameEntry` in `cache_service.hpp`). `GetAll` looks a category up and
+returns *every* `NameEntry` that shares it in one response, not just the
+first. `IdCache` has no equivalent second index -- one worked example is
+enough to demonstrate the capability without duplicating it.
+
+`Put` gained an optional trailing category (`cache_poc_client put name
+<name> <record-text> [category]`; omitted means `""`). Both indices stay in
+sync automatically, with no extra code: `Put`'s existing erase-then-emplace
+upsert (see "Wire protocol" above) already removes the old entry by primary
+key before inserting the new one, and `boost::multi_index` keeps
+`CategoryTag` consistent with that as a matter of course -- re-`Put`ting an
+entry under a *different* category moves it in the category index for free,
+and `Erase` removes it from both.
+
+Response size scales with however many records share a category, unlike
+every other response in this protocol, which is one record or less --
+`--max-getall-results`/`MIL_MAX_GETALL_RESULTS` (default 100, see
+"Configuration" above) caps it, with a `truncated` flag distinguishing "here
+are all N matches" from "here are the first 100 of more."
+
+**`server.cpp` only** -- `server_readthrough.cpp` does not implement
+`GetAll`. NATS JetStream KV is a primary-key store with no concept of
+"category"; a NATS-backed `GetAll` could only reflect whatever happens to
+already be in the local cache from prior `Get`/`Put`s, not query NATS the
+way every other operation here does. That's a materially different (and
+easy to accidentally rely on as if it *were* authoritative) semantic from
+everything else in this POC, so it's left as an explicit open question --
+see "What this doesn't answer yet" -- rather than shipped half-right.
+`server_dispatch.hpp`'s `Put` (Name) branch still parses and stores the
+category field either way, since it's part of the wire format now
+regardless of which server is on the other end; it's just never queried
+back out there.
+
+Verified live: `PUT` `alice`/`bob` (pre-seeded, category `friends`) plus a
+manually-added `dave` (also `friends`), then `GETALL friends` returned all
+three; erasing `dave` and running `GETALL friends` again returned only
+`alice`/`bob` -- confirming the category index tracks `Erase` automatically,
+not just `Put`. A separate run with `--max-getall-results=2` against four
+records in one category returned exactly 2 with `truncated` set. Covered at
+the unit level by `test/handle_request_local_test.cpp`'s seven new
+`HandleRequestLocalTest.GetAll*`/`*Category*` tests (every record returned,
+unknown category is `NotFound`, categories don't cross-contaminate, the
+default-empty-category case, upsert moving an entry between categories,
+erase removing it from the index, and the truncation cap).
 
 ## Unit tests
 
@@ -835,6 +919,14 @@ This proves the pattern works end-to-end and is easy to wire up, not that
 it's the right architecture for a given workload. Open questions before this
 becomes more than a POC:
 
+- **GetAll has no NATS-backed equivalent.** "Non-unique key lookup (GetAll)"
+  above covers why: NATS JetStream KV has no concept of a secondary,
+  non-unique index, so a `server_readthrough.cpp` `GetAll` could only
+  reflect the local cache's current contents, not query NATS authoritatively
+  the way `Get`/`Put`/`Erase` do there. Building a real one would mean
+  maintaining a second NATS bucket as an explicit category -> set-of-names
+  index, updated on every `Put`/`Erase` -- a materially bigger undertaking
+  than this POC currently takes on, not a small follow-up.
 - **NATS KV's own max-age is unused.** "TTL / expiration" above covers the
   local caches; NATS KV buckets also support a per-bucket max-age for the
   durable data itself, independent of either daemon's local TTL, which isn't
