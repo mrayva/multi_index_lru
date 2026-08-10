@@ -50,10 +50,21 @@ C++20 compiler (see "Unit tests" below).
 - `server_readthrough.cpp` / `server_dispatch.hpp` / `nats_bridge.hpp` /
   `client_readthrough.cpp`: the same wire protocol and caches, but backed by
   NATS JetStream KV — see "Read-through / write-through over NATS" below.
-  `server_dispatch.hpp` holds the actual non-blocking request-dispatch logic
-  (`dispatch_request()`, `CompletionQueue`, `KeyOperationQueue`) so it's
-  includable from `test/dispatch_request_test.cpp`, not just
-  `server_readthrough.cpp`'s `main()`.
+  The non-blocking request-dispatch logic is split by read/write concern
+  across three headers, includable from `test/dispatch_request_test.cpp`,
+  not just `server_readthrough.cpp`'s `main()`:
+    - `server_dispatch_common.hpp` -- machinery both sides share:
+      `CompletionQueue`, `KeyOperationQueue`, cross-daemon coherence
+      (`RevisionTracker`/`InvalidationQueue`/`apply_pending_invalidations()`).
+    - `server_dispatch_read.hpp` -- `dispatch_read_request()` (Get, GetAll).
+      No `--allow-writes` parameter exists in this file at all.
+    - `server_dispatch_write.hpp` -- `dispatch_write_request()` (Put,
+      Erase), the only file that owns the `--allow-writes` gate. Takes no
+      `NameCache&`/`IdCache&` -- a write's cache mutation happens later,
+      inside the `ApplyFn` `CompletionQueue` carries, once NATS confirms it.
+    - `server_dispatch.hpp` -- `dispatch_request()`, a thin router: decode
+      op/kind, then call one of the two above. See "the concurrency model"
+      below for why this split, and what still has to stay shared.
 - `load_test.cpp` fires many concurrent requests at a running `server.cpp` /
   `server_readthrough.cpp` from a pool of iceoryx2 Clients and reports
   throughput/latency — see "Load testing" below.
@@ -340,8 +351,8 @@ easy to accidentally rely on as if it *were* authoritative) semantic from
 everything else in this POC, so it's left as an explicit open question --
 see "What this doesn't answer yet" -- rather than shipped half-right. (There
 *is* a NATS-backed `GetAll` now, just addressed differently -- see "Prefix
-lookup (GetAll, KeyKind::Name)" below.) `server_dispatch.hpp`'s `Put` (Name)
-branch still parses and stores the category field either way, since it's
+lookup (GetAll, KeyKind::Name)" below.) `server_dispatch_write.hpp`'s `Put`
+(Name) branch still parses and stores the category field either way, since it's
 part of the wire format now regardless of which server is on the other end;
 it's just never queried back out there.
 
@@ -761,7 +772,7 @@ no-op against the now-present key (a plain `Container::emplace()` won't
 overwrite an existing value), so the *cache* kept B's fresher value -- but
 A's *response* still carried the stale value it fetched.
 
-`KeyOperationQueue` (`server_dispatch.hpp`) closes both gaps with one
+`KeyOperationQueue` (`server_dispatch_common.hpp`) closes both gaps with one
 mechanism: at most one operation is ever "in flight" for a given
 (cache, key) at a time. `dispatch_request()` funnels every Get/Put/Erase
 through `key_queue.enqueue(composite_key, ...)`; if nothing's in flight for
@@ -793,6 +804,48 @@ a stale overwrite. A second test confirms two concurrent GET-misses on the
 same key coalesce: the second resolves as a local hit in the very same
 completion that resolved the first, with no second NATS round trip visible
 in the daemon's log.
+
+### Read/write separation
+
+`dispatch_request()` used to be one function handling Get, GetAll, Put, and
+Erase together -- correct, but every read and write concern lived in the
+same file, so "does this touch NATS's write path" was a question you had to
+read the whole function to answer. It's now split by concern (see the file
+list above): `dispatch_read_request()` and `dispatch_write_request()` in
+their own headers, with `server_dispatch.hpp` reduced to decoding
+op/key_kind and routing to one or the other. The immediate motivation was
+readability and testability, not new behavior -- this was a pure refactor,
+verified by the full existing `dispatch_request_test.cpp` suite (25 tests,
+none of which needed to change) passing unchanged, plus a live end-to-end
+run through every op via `client_readthrough.cpp`. The farther-out reason
+is that a future migration off iceoryx2 (see "What are alternatives to
+iceoryx2?" -- eCAL is the leading candidate) is far more approachable if
+reads and writes are already independent modules rather than something
+that has to be teased apart at migration time.
+
+Two things fell out of the split for free, not by design intent going in:
+- `dispatch_write_request()` takes no `NameCache&`/`IdCache&` at all --
+  looking at its signature alone tells you a write's cache mutation can't
+  be synchronous, because the parameters to do it aren't there. (It happens
+  later, inside the `ApplyFn` closure `CompletionQueue` carries, once NATS
+  confirms the write -- see "the concurrency model" above.)
+- `--allow-writes` moved from a pre-check in the old combined function to
+  something `dispatch_write_request()` alone owns and checks first thing.
+  `dispatch_read_request()` has no `allow_writes` parameter at all, so a
+  future change can't accidentally gate a read by passing the flag through
+  incorrectly -- the parameter to misuse doesn't exist on that side.
+
+What's still shared, deliberately (`server_dispatch_common.hpp`): a Get and
+a Put on the same key must still serialize against each other (see
+`KeyOperationQueue` above), and their completions both flow through the
+same `CompletionQueue`, drained together in arrival order by
+`server_readthrough.cpp`'s main loop -- there was never a reason to want
+two separate completion queues, since the main loop's per-cycle drain
+doesn't care which kind of operation finished. Cross-daemon coherence
+(`RevisionTracker`/`InvalidationQueue`/`apply_pending_invalidations()`) is
+shared for the same reason: an invalidation can originate from any write,
+anywhere, and both caches need it regardless of which local dispatcher a
+given request happened to go through.
 
 ### The circuit breaker
 
@@ -834,7 +887,7 @@ serving a now-stale value out of its local cache indefinitely.
 delete, purge) in both buckets via NATS JetStream KV's `kv_watch`. When
 *any* process writes a key -- another daemon instance, a raw `nats kv put`,
 anything -- the watch event lands in `InvalidationQueue`
-(`server_dispatch.hpp`); the main loop drains it once per cycle
+(`server_dispatch_common.hpp`); the main loop drains it once per cycle
 (`apply_pending_invalidations()`) and evicts the corresponding entry from
 whichever local cache holds it, so the next GET for that key is a real miss
 and reads the fresh value through from NATS.
@@ -843,7 +896,7 @@ and reads the fresh value through from NATS.
 every daemon invalidate the value it *just wrote*, the instant its own write
 echoes back through its own watch subscription -- a pointless
 write-then-immediately-evict flicker on every PUT. `RevisionTracker`
-(`server_dispatch.hpp`) closes this using NATS KV's per-key revision (a
+(`server_dispatch_common.hpp`) closes this using NATS KV's per-key revision (a
 monotonically increasing sequence number, returned by both `kv_put` and
 `kv_get`/`kv_watch`): whenever this daemon's own GET-populate or PUT
 completes, it records the revision that operation produced or observed. A
@@ -1093,7 +1146,7 @@ nothing was cached yet, a no-op) rather than to populate.
 
 For `--prewarm-window-ms`/`MIL_PREWARM_WINDOW_MS` after the watch
 subscriptions are established (default 2s), `apply_pending_invalidations()`
-(`server_dispatch.hpp`) populates the cache directly from each event's own
+(`server_dispatch_common.hpp`) populates the cache directly from each event's own
 value instead of merely evicting: a `put` event writes the record straight
 in (same as a `GET`'s read-through populate, minus the round trip that
 would otherwise be needed to fetch it), and a `del`/`purge` event
