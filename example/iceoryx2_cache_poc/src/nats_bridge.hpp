@@ -374,6 +374,18 @@ public:
         return fut.get();
     }
 
+    // Blocking wrapper around list_and_get_async(), same pattern as get()
+    // above wraps get_async(). See list_and_get_async()'s own doc comment
+    // for what it does and its known limitations.
+    NatsListResult list_and_get(const std::string& bucket, const std::string& key_pattern,
+                                 std::size_t max_results) {
+        auto prom = std::make_shared<std::promise<NatsListResult>>();
+        auto fut = prom->get_future();
+        list_and_get_async(bucket, key_pattern, max_results,
+                            [prom](NatsListResult result) { prom->set_value(std::move(result)); });
+        return fut.get();
+    }
+
     // --- cross-daemon coherence: watch every key change in a bucket --------
 
     // Subscribes to every key change (put/delete/purge) in `bucket` for the

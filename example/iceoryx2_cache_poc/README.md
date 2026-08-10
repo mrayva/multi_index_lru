@@ -427,6 +427,43 @@ live `nats_tool_integration.sh` case (`kvkeys wildcard pattern`) seeding
 "alice.*"` returns exactly the two `alice.*` keys, not bob's and not a bare
 `"alice"` key.
 
+### Deriving NATS keys from a real composite multi_index key
+
+`"alice.email"` above is one flat `NameCache` string with an *assumed* but
+unenforced `owner.attribute` shape -- the hierarchy exists only by
+convention, not as separate typed fields. `include/multi_index_lru/nats_key.hpp`
+(main repo, not POC-specific) generalizes the idea to a *genuine*
+`boost::multi_index::composite_key`: given an ordered, typed field list, it
+derives both the exact NATS key for a unique lookup and the wildcard
+pattern for a non-unique/prefix one from the *same* declaration, so the two
+can't drift apart via hand-typed string concatenation --
+
+```cpp
+using OwnerAttributeKey = multi_index_lru::NatsCompositeKey<std::string, std::string>;
+
+OwnerAttributeKey::key("alice", "email");            // -> "alice.email"
+OwnerAttributeKey::prefix_pattern("alice");           // -> "alice.*"
+```
+
+`*` vs `>` isn't a guess: `prefix_pattern` knows the full field count from
+the type (`field_count = 2` here), so a 1-field prefix leaves exactly 1
+remaining token, picking `*` automatically; a prefix that leaves more than
+one remaining field falls back to `>`. `example/iceoryx2_cache_poc/src/attribute_cache.hpp`
+wires this up end to end: `AttributeEntry{owner, attribute, record}` with a
+real `composite_key` unique index (`OwnerAttributeTag`), addressed both
+ways through `OwnerAttributeKey`. Verified live against real NATS by
+`test/composite_key_nats_test.cpp`: a unique put/get round trip by
+composite key (populating a local `AttributeCache` and finding it back via
+`find<OwnerAttributeTag>(boost::make_tuple(owner, attribute))`), a prefix
+fetch (`NatsBridge::list_and_get()`, the blocking wrapper around
+`list_and_get_async()` used for `GetAll(prefix)` above) that returns
+exactly one owner's two attributes and none of a second owner's, and
+`nats_key.hpp`'s field validation rejecting a value with an embedded `.`
+before it ever reaches NATS. `nats_key.hpp` itself has its own
+dependency-free unit tests in the main repo's `test/nats_key_test.cpp`
+(`NatsKey`/`NatsPattern`/`NatsCompositeKey` suites) -- pure string
+derivation, no NATS or multi_index container involved.
+
 ## Unit tests
 
 Five `ctest`-integrated GoogleTest suites in total: three dependency-free,

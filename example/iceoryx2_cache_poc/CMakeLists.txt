@@ -138,7 +138,16 @@ if(POC_BUILD_TESTS)
                     GTest::gtest GTest::gtest_main
         )
 
+        # Worked example (attribute_cache.hpp/nats_key.hpp) verified against
+        # real NATS -- same reason as the two above for why this needs
+        # POC_ENABLE_NATS_READTHROUGH and isn't part of poc-unit-tests CI.
+        add_executable(cache_poc_composite_key_nats_test test/composite_key_nats_test.cpp)
+        target_link_libraries(cache_poc_composite_key_nats_test
+            PRIVATE multi_index_lru_headers nats_asio::nats_asio Threads::Threads GTest::gtest GTest::gtest_main
+        )
+
         gtest_discover_tests(cache_poc_nats_bridge_test)
         gtest_discover_tests(cache_poc_dispatch_request_test)
+        gtest_discover_tests(cache_poc_composite_key_nats_test)
     endif()
 endif()

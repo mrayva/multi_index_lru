@@ -14,6 +14,7 @@ add_executable(multi_index_lru_test
     zerialize_test.cpp
     expirable_test.cpp
     sbe_test.cpp
+    nats_key_test.cpp
 )
 
 target_link_libraries(multi_index_lru_test PRIVATE
