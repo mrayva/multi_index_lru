@@ -475,6 +475,53 @@ dependency-free unit tests in the main repo's `test/nats_key_test.cpp`
 (`NatsKey`/`NatsPattern`/`NatsCompositeKey` suites) -- pure string
 derivation, no NATS or multi_index container involved.
 
+### Wildcarding an interior field position
+
+`prefix_pattern` above only wildcards a *trailing run* -- every field after
+the ones you supply. That's not enough once a query's known fields aren't a
+leading prefix. `example/iceoryx2_cache_poc/src/security_cache.hpp` is a
+second worked example built around that gap: a securities reference-data
+row (`SecurityEntry{asset_type, cusip, isin, sedol, ric, record}`), where
+CUSIP/ISIN/SEDOL/RIC are each unique only in combination with `ASSET_TYPE`,
+and a query commonly supplies `ASSET_TYPE` plus exactly *one* of the four
+identifiers -- leaving the other three unknown, not necessarily as a
+trailing run. With the field order `(asset_type, cusip, isin, sedol, ric)`,
+an `ASSET_TYPE`+`ISIN` query wildcards CUSIP (position 1, before the known
+field) *and* SEDOL/RIC (positions 3-4, after it) -- `prefix_pattern` can't
+express that; `NatsCompositeKey::pattern()` can, one argument per position:
+
+```cpp
+using SecurityKey = multi_index_lru::NatsCompositeKey<std::string, std::string, std::string, std::string, std::string>;
+
+SecurityKey::key("EQUITY", "037833100", "US0378331005", "2046251", "AAPL_OQ");
+//   -> "EQUITY.037833100.US0378331005.2046251.AAPL_OQ"
+SecurityKey::pattern("EQUITY", multi_index_lru::nats_any, "US0378331005", multi_index_lru::nats_any, multi_index_lru::nats_any);
+//   -> "EQUITY.*.US0378331005.*.*"
+```
+
+Each argument to `pattern()` is a real field value or the `nats_any`
+placeholder, positionally -- exactly `field_count` arguments, and each
+literal argument is still type-checked against the field it stands for
+(same as `key()`), since the parameter type at that position is
+`std::variant<Field, NatsAny>` and ordinary implicit conversion resolves
+which alternative a plain value or `nats_any` becomes. It always emits one
+`*` per wildcarded position rather than collapsing a run into `>` -- an
+interior wildcard can sit before a literal field, and `>` is only legal as
+a pattern's last token, so `prefix_pattern`'s collapsing trick doesn't
+generalize here.
+
+Verified live against real NATS by `test/security_key_nats_test.cpp`: a
+unique put/get round trip by the full 5-field key, and an
+`ASSET_TYPE`+`ISIN` `pattern()` lookup against three seeded rows -- two
+different `EQUITY` securities plus a `BOND` row that deliberately reuses
+one EQUITY row's ISIN value under a different `ASSET_TYPE` -- confirming
+the match returns exactly the one intended row and crosses neither the
+other identifier's boundary nor the other asset type's. (RIC codes
+routinely carry a literal `.` exchange suffix in real feeds, e.g.
+`"AAPL.OQ"` -- `nats_key.hpp`'s field validation rejects that outright, so
+the test also demonstrates substituting NATS's separator, e.g. `"AAPL_OQ"`,
+before deriving the key.)
+
 ## Unit tests
 
 Five `ctest`-integrated GoogleTest suites in total: three dependency-free,
