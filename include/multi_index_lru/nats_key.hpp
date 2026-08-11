@@ -45,6 +45,7 @@
 #include <cstddef>
 #include <stdexcept>
 #include <string>
+#include <variant>
 
 namespace multi_index_lru {
 
@@ -107,6 +108,15 @@ std::string nats_pattern(NatsWildcard tail, const Fields&... fields) {
     return out;
 }
 
+/// Placeholder for a wildcarded ('*') position in NatsCompositeKey::pattern()
+/// (below) -- pass nats_any in place of a field value at any position that
+/// should be wildcarded. Unlike prefix_pattern(), which can only wildcard a
+/// trailing run of the field list, pattern() lets the wildcarded positions
+/// be anywhere -- e.g. a leading field known, a middle field known, the
+/// rest not.
+struct NatsAny {};
+inline constexpr NatsAny nats_any{};
+
 /// Describes a composite key's ordered field list and lets a strict prefix
 /// of it (a non-unique index over just the leading fields) derive its own
 /// NATS pattern automatically -- the wildcard depth is exactly "however
@@ -134,6 +144,48 @@ struct NatsCompositeKey {
         constexpr std::size_t remaining = field_count - sizeof...(PrefixFields);
         return nats_pattern(remaining == 1 ? NatsWildcard::SingleToken : NatsWildcard::MultiToken,
                              prefix_fields...);
+    }
+
+    /// A NATS wildcard pattern over an arbitrary subset of positions, not
+    /// just a leading prefix -- pass a field's real value for a literal
+    /// position, or nats_any for a wildcarded one. Takes exactly
+    /// field_count arguments, one per position in AllFields... order --
+    /// e.g. for NatsCompositeKey<AssetType, Cusip, Isin, Sedol, Ric>,
+    /// pattern(asset_type, nats_any, isin, nats_any, nats_any) matches
+    /// "ASSET_TYPE and ISIN known, the rest not," even though ISIN isn't
+    /// adjacent to ASSET_TYPE in the field order -- something
+    /// prefix_pattern() can't express, since it only wildcards a trailing
+    /// run.
+    ///
+    /// Each argument's declared type is std::variant<AllFields, NatsAny> at
+    /// that same position, so a literal argument is still type-checked
+    /// against the field it stands for (same as key()'s
+    /// const AllFields&... does), while nats_any is always accepted --
+    /// picking one alternative over the other is ordinary implicit
+    /// conversion, so call sites don't need to spell out the variant.
+    ///
+    /// Always emits one '*' per wildcarded position rather than collapsing
+    /// a trailing run into a single '>', since a wildcarded position can
+    /// sit before a literal one and '>' is only legal as a pattern's last
+    /// token. Prefer prefix_pattern() when the known fields really are a
+    /// leading prefix -- its '>' collapsing produces a shorter pattern for
+    /// the same match.
+    static std::string pattern(const std::variant<AllFields, NatsAny>&... args) {
+        std::string out;
+        bool first = true;
+        auto emit = [&out, &first](const auto& arg) {
+            out += (first ? "" : ".");
+            first = false;
+            if (std::holds_alternative<NatsAny>(arg)) {
+                out += '*';
+            } else {
+                const auto& value = std::get<0>(arg);
+                validate_nats_key_field(value);
+                out += value;
+            }
+        };
+        (emit(args), ...);
+        return out;
     }
 };
 

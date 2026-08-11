@@ -84,5 +84,32 @@ TEST(NatsCompositeKey, ThreeFieldKeyTwoFieldPrefixPicksSingleTokenWildcard) {
     EXPECT_EQ(OwnerCategoryAttributeKey::prefix_pattern("alice", "friends"), "alice.friends.*");
 }
 
+TEST(NatsCompositeKey, PatternWithAllFieldsLiteralMatchesKey) {
+    using ThreeFieldKey = NatsCompositeKey<std::string, std::string, std::string>;
+    EXPECT_EQ(ThreeFieldKey::pattern("alice", "friends", "email"), "alice.friends.email");
+}
+
+TEST(NatsCompositeKey, PatternWildcardsATrailingRunOneStarPerPosition) {
+    using ThreeFieldKey = NatsCompositeKey<std::string, std::string, std::string>;
+    EXPECT_EQ(ThreeFieldKey::pattern("alice", nats_any, nats_any), "alice.*.*");
+}
+
+TEST(NatsCompositeKey, PatternWildcardsALeadingPosition) {
+    using ThreeFieldKey = NatsCompositeKey<std::string, std::string, std::string>;
+    EXPECT_EQ(ThreeFieldKey::pattern(nats_any, "friends", "email"), "*.friends.email");
+}
+
+TEST(NatsCompositeKey, PatternWildcardsAnInteriorPositionNotAdjacentToTheLeadingField) {
+    // The case prefix_pattern() can't express: the known fields (position 0
+    // and 2) aren't a leading prefix -- position 1 is wildcarded in between.
+    using FiveFieldKey = NatsCompositeKey<std::string, std::string, std::string, std::string, std::string>;
+    EXPECT_EQ(FiveFieldKey::pattern("EQUITY", nats_any, "US1234567", nats_any, nats_any), "EQUITY.*.US1234567.*.*");
+}
+
+TEST(NatsCompositeKey, PatternThrowsOnInvalidLiteralFieldSameAsNatsKey) {
+    using ThreeFieldKey = NatsCompositeKey<std::string, std::string, std::string>;
+    EXPECT_THROW(ThreeFieldKey::pattern("al.ice", nats_any, nats_any), std::invalid_argument);
+}
+
 }  // namespace
 }  // namespace multi_index_lru
