@@ -30,6 +30,7 @@ project(multi_index_lru_iceoryx2_poc LANGUAGES CXX)
 
 option(POC_BUILD_ICEORYX2_TARGETS "Build the iceoryx2-backed servers/clients (requires iceoryx2-cxx)" ON)
 option(POC_ENABLE_NATS_READTHROUGH "Also build the NATS-backed read-through/write-through server and client" OFF)
+option(POC_ENABLE_ECAL_READTHROUGH "Also build the eCAL-backed read-through/write-through server and client (requires eCAL, no iceoryx2-cxx/Rust needed)" OFF)
 option(POC_BUILD_TESTS "Build the ctest-integrated unit tests" ON)
 
 set(CMAKE_CXX_STANDARD 20)
@@ -80,6 +81,33 @@ if(POC_BUILD_ICEORYX2_TARGETS)
             PRIVATE multi_index_lru_headers iceoryx2-cxx::static-lib-cxx nats_asio::nats_asio Threads::Threads
         )
     endif()
+endif()
+
+# eCAL port of the NATS read-through/write-through server+client -- same
+# dispatch_request()/CompletionQueue/KeyOperationQueue logic
+# (server_dispatch_common.hpp), served over an eCAL Service instead of an
+# iceoryx2 request-response service. See active_request_ecal.hpp's doc
+# comment for the architectural difference this forces (eCAL's method
+# callback is synchronous, unlike iceoryx2's defer-and-respond-later
+# ActiveRequest) and server_readthrough_ecal.cpp for how it's handled.
+# Deliberately independent of POC_BUILD_ICEORYX2_TARGETS -- eCAL is a fully
+# separate transport, so this needs no Rust toolchain at all.
+if(POC_ENABLE_ECAL_READTHROUGH)
+    find_package(eCAL REQUIRED)
+    find_package(nats_asio CONFIG REQUIRED)
+    find_package(Threads REQUIRED)
+
+    add_executable(cache_poc_server_readthrough_ecal src/server_readthrough_ecal.cpp)
+    target_compile_definitions(cache_poc_server_readthrough_ecal PRIVATE POC_USE_ECAL)
+    target_link_libraries(cache_poc_server_readthrough_ecal
+        PRIVATE multi_index_lru_headers eCAL::core nats_asio::nats_asio Threads::Threads
+    )
+
+    add_executable(cache_poc_client_readthrough_ecal src/client_readthrough_ecal.cpp)
+    target_compile_definitions(cache_poc_client_readthrough_ecal PRIVATE POC_USE_ECAL)
+    target_link_libraries(cache_poc_client_readthrough_ecal
+        PRIVATE multi_index_lru_headers eCAL::core nats_asio::nats_asio Threads::Threads
+    )
 endif()
 
 # wire.hpp has no dependency on iceoryx2/nats_asio/Boost/multi_index_lru --

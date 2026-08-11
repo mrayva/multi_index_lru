@@ -1,11 +1,20 @@
 /// Machinery shared by both the read path (server_dispatch_read.hpp) and
-/// the write path (server_dispatch_write.hpp): the iceoryx2 request type,
+/// the write path (server_dispatch_write.hpp): the request-handle type,
 /// the deferred-completion queue NATS results flow back through,
 /// per-key operation serialization, and cross-daemon coherence (kv_watch
 /// invalidation). Nothing in this file is read-only or write-only --
 /// CompletionQueue and KeyOperationQueue in particular are shared *because*
 /// a Get and a Put on the same key must still serialize against each other,
 /// even though the two operations now live in separate files.
+///
+/// `ActiveRequestType`/`ActiveRequestPtr`/`respond()` -- the only
+/// transport-specific names this file (or dispatch_read/write.hpp) ever
+/// touches -- come from whichever of active_request_iceoryx2.hpp /
+/// active_request_ecal.hpp is selected below, by whether POC_USE_ECAL is
+/// defined (see CMakeLists.txt: cache_poc_server_readthrough_ecal defines
+/// it, cache_poc_server_readthrough does not). Everything else in this
+/// file, and all of dispatch_request()/dispatch_read_request()/
+/// dispatch_write_request(), is identical either way.
 ///
 /// See server_readthrough.cpp's file comment and README.md's "the
 /// concurrency model" for the design this implements, including
@@ -16,7 +25,11 @@
 
 #include "cache_service.hpp"
 
-#include "iox2/iceoryx2.hpp"
+#ifdef POC_USE_ECAL
+#include "active_request_ecal.hpp"
+#else
+#include "active_request_iceoryx2.hpp"
+#endif
 
 #include <chrono>
 #include <deque>
@@ -38,20 +51,6 @@ namespace poc {
 // still want a sensible fixed default to talk to.
 inline constexpr auto kNameBucket = "mil_by_name";
 inline constexpr auto kIdBucket = "mil_by_id";
-
-// request_response<Slice<u8>, Slice<u8>>() with no explicit header types
-// resolves to `void` headers -- see ServiceBuilder::request_response() in
-// iceoryx2-cxx/include/iox2/service_builder.hpp.
-using ActiveRequestType =
-    iox2::ActiveRequest<iox2::ServiceType::Ipc, iox2::bb::Slice<std::uint8_t>, void, iox2::bb::Slice<std::uint8_t>,
-                         void>;
-
-// ActiveRequestType is move-only by design. It now needs to be captured by
-// closures stored in both CompletionQueue and KeyOperationQueue below, both
-// of which need those closures to be copy-constructible (std::function's
-// requirement) -- a shared_ptr is the simplest way to get that without
-// hand-rolling a move-only type-erased callable.
-using ActiveRequestPtr = std::shared_ptr<ActiveRequestType>;
 
 // Runs on the main thread once a deferred request's NATS operation has
 // completed: applies whatever cache mutation is needed (a Get populating the
@@ -112,12 +111,6 @@ private:
     mutable std::mutex mutex_;
     std::deque<PendingCompletion> items_;
 };
-
-inline void respond(ActiveRequestType& active_request, const std::vector<std::uint8_t>& response_bytes) {
-    auto response = active_request.loan_slice_uninit(response_bytes.size()).value();
-    auto initialized = response.write_from_fn([&](auto byte_idx) { return response_bytes[byte_idx]; });
-    send(std::move(initialized)).value();
-}
 
 // Serializes operations on the same (cache, key) so at most one is ever "in
 // flight" at a time -- without this, a GET-miss racing a concurrent PUT for
