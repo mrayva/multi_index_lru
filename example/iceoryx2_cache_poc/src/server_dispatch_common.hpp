@@ -10,11 +10,13 @@
 /// `ActiveRequestType`/`ActiveRequestPtr`/`respond()` -- the only
 /// transport-specific names this file (or dispatch_read/write.hpp) ever
 /// touches -- come from whichever of active_request_iceoryx2.hpp /
-/// active_request_ecal.hpp is selected below, by whether POC_USE_ECAL is
-/// defined (see CMakeLists.txt: cache_poc_server_readthrough_ecal defines
-/// it, cache_poc_server_readthrough does not). Everything else in this
-/// file, and all of dispatch_request()/dispatch_read_request()/
-/// dispatch_write_request(), is identical either way.
+/// active_request_ecal.hpp / active_request_zenoh.hpp is selected below, by
+/// whether POC_USE_ECAL / POC_USE_ZENOH is defined (see CMakeLists.txt:
+/// cache_poc_server_readthrough_ecal / cache_poc_server_readthrough_zenoh
+/// define one or the other, cache_poc_server_readthrough defines neither).
+/// Everything else in this file, and all of dispatch_request()/
+/// dispatch_read_request()/dispatch_write_request(), is identical
+/// regardless of which is selected.
 ///
 /// See server_readthrough.cpp's file comment and README.md's "the
 /// concurrency model" for the design this implements, including
@@ -25,8 +27,10 @@
 
 #include "cache_service.hpp"
 
-#ifdef POC_USE_ECAL
+#if defined(POC_USE_ECAL)
 #include "active_request_ecal.hpp"
+#elif defined(POC_USE_ZENOH)
+#include "active_request_zenoh.hpp"
 #else
 #include "active_request_iceoryx2.hpp"
 #endif

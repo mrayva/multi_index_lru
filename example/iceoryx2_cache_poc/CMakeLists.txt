@@ -25,12 +25,17 @@
 # handle_request_local() (cache_service.hpp) have no dependency on iceoryx2
 # or nats_asio, so their unit tests don't need either. That's what lets the
 # main CI workflow test them without taking on the Rust/iceoryx2-cxx build.
+# (POC_ENABLE_ZENOH_READTHROUGH is its own separate Rust dependency, though --
+# zenoh-c wraps a Rust crate the same way iceoryx2-cxx does, unlike
+# POC_ENABLE_ECAL_READTHROUGH, which needs none. Turning POC_BUILD_ICEORYX2_
+# TARGETS off does not avoid Rust if POC_ENABLE_ZENOH_READTHROUGH is on.)
 cmake_minimum_required(VERSION 3.22)
 project(multi_index_lru_iceoryx2_poc LANGUAGES CXX)
 
 option(POC_BUILD_ICEORYX2_TARGETS "Build the iceoryx2-backed servers/clients (requires iceoryx2-cxx)" ON)
 option(POC_ENABLE_NATS_READTHROUGH "Also build the NATS-backed read-through/write-through server and client" OFF)
 option(POC_ENABLE_ECAL_READTHROUGH "Also build the eCAL-backed read-through/write-through server and client (requires eCAL, no iceoryx2-cxx/Rust needed)" OFF)
+option(POC_ENABLE_ZENOH_READTHROUGH "Also build the zenoh-backed read-through/write-through server and client (requires zenoh-c/zenoh-cpp; zenoh's own core is Rust, unlike eCAL, but the POC itself still needs no iceoryx2-cxx)" OFF)
 option(POC_BUILD_TESTS "Build the ctest-integrated unit tests" ON)
 
 set(CMAKE_CXX_STANDARD 20)
@@ -107,6 +112,36 @@ if(POC_ENABLE_ECAL_READTHROUGH)
     target_compile_definitions(cache_poc_client_readthrough_ecal PRIVATE POC_USE_ECAL)
     target_link_libraries(cache_poc_client_readthrough_ecal
         PRIVATE multi_index_lru_headers eCAL::core nats_asio::nats_asio Threads::Threads
+    )
+endif()
+
+# zenoh port of the NATS read-through/write-through server+client -- same
+# dispatch_request()/CompletionQueue/KeyOperationQueue logic
+# (server_dispatch_common.hpp), served over a zenoh Queryable instead of an
+# iceoryx2 request-response service or an eCAL service. See
+# active_request_zenoh.hpp's doc comment for why zenoh's movable, reply-
+# whenever Query needed no eCAL-style promise/future workaround, and
+# server_readthrough_zenoh.cpp for the resulting (simpler) main loop.
+# Deliberately independent of POC_BUILD_ICEORYX2_TARGETS -- zenoh is a fully
+# separate transport, so this needs no iceoryx2-cxx. Unlike the eCAL port,
+# zenoh's own core IS Rust (zenoh-c wraps a Rust crate) -- pick this option
+# only when that's acceptable; see README.md.
+if(POC_ENABLE_ZENOH_READTHROUGH)
+    find_package(zenohc REQUIRED)
+    find_package(zenohcxx REQUIRED)
+    find_package(nats_asio CONFIG REQUIRED)
+    find_package(Threads REQUIRED)
+
+    add_executable(cache_poc_server_readthrough_zenoh src/server_readthrough_zenoh.cpp)
+    target_compile_definitions(cache_poc_server_readthrough_zenoh PRIVATE POC_USE_ZENOH)
+    target_link_libraries(cache_poc_server_readthrough_zenoh
+        PRIVATE multi_index_lru_headers zenohcxx::zenohc nats_asio::nats_asio Threads::Threads
+    )
+
+    add_executable(cache_poc_client_readthrough_zenoh src/client_readthrough_zenoh.cpp)
+    target_compile_definitions(cache_poc_client_readthrough_zenoh PRIVATE POC_USE_ZENOH)
+    target_link_libraries(cache_poc_client_readthrough_zenoh
+        PRIVATE multi_index_lru_headers zenohcxx::zenohc nats_asio::nats_asio Threads::Threads
     )
 endif()
 

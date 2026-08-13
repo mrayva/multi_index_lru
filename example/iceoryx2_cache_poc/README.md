@@ -879,10 +879,13 @@ readability and testability, not new behavior -- this was a pure refactor,
 verified by the full existing `dispatch_request_test.cpp` suite (25 tests,
 none of which needed to change) passing unchanged, plus a live end-to-end
 run through every op via `client_readthrough.cpp`. The farther-out reason
-is that a future migration off iceoryx2 (see "What are alternatives to
-iceoryx2?" -- eCAL is the leading candidate) is far more approachable if
-reads and writes are already independent modules rather than something
-that has to be teased apart at migration time.
+is that migrating off iceoryx2 is far more approachable if reads and writes
+are already independent modules rather than something that has to be teased
+apart at migration time -- since borne out twice: server_readthrough_ecal
+.cpp and server_readthrough_zenoh.cpp both reuse dispatch_request() and
+everything it calls into completely unmodified (see server_dispatch_common
+.hpp's transport-seam doc comment and active_request_zenoh.hpp's for how
+each swaps in its own ActiveRequestType/respond()).
 
 Two things fell out of the split for free, not by design intent going in:
 - `dispatch_write_request()` takes no `NameCache&`/`IdCache&` at all --
