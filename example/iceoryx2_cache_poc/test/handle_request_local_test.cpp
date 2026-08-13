@@ -1,6 +1,7 @@
 // Tests handle_request_local()'s contract directly: encoded wire request in,
-// encoded wire response out, against a real NameCache/IdCache pair -- no
-// iceoryx2, no NATS, no process boundary. multi_index_lru::ExpirableContainer's
+// encoded wire response out, against a real NameCache/IdCache/SecurityCache
+// triple -- no iceoryx2, no NATS, no process boundary.
+// multi_index_lru::ExpirableContainer's
 // own behavior (LRU eviction, node pooling, TTL expiration, etc.) is
 // exercised generically in the main repo's test/container_test.cpp and
 // test/expirable_test.cpp; these tests are scoped to the decode-operate-encode
@@ -30,10 +31,12 @@ class HandleRequestLocalTest : public ::testing::Test {
 protected:
     NameCache name_cache{kCapacity, kTtl};
     IdCache id_cache{kCapacity, kTtl};
+    SecurityCache security_cache{kCapacity, kTtl};
 
     std::vector<std::uint8_t> handle(const std::vector<std::uint8_t>& request,
                                       std::size_t max_getall_results = 100) {
-        return handle_request_local(name_cache, id_cache, request.data(), request.size(), max_getall_results);
+        return handle_request_local(name_cache, id_cache, security_cache, request.data(), request.size(),
+                                     max_getall_results);
     }
 };
 
@@ -165,6 +168,69 @@ TEST_F(HandleRequestLocalTest, NameCacheAndIdCacheDoNotCrossPollinate) {
     handle(encode_erase(wire::KeyKind::Id, "", 42));
     auto response = handle(encode_get(wire::KeyKind::Name, "42", 0));
     EXPECT_EQ(decode_get(response), text("name-42"));
+}
+
+// --- Security-keyed cache (5-field composite key) ---------------------------
+
+TEST_F(HandleRequestLocalTest, GetSecurityOnEmptyCacheReturnsNotFound) {
+    auto response = handle(encode_get_security("EQUITY", "037833100", "US0378331005", "2046251", "AAPL_OQ"));
+    EXPECT_EQ(decode_status(response), wire::Status::NotFound);
+}
+
+TEST_F(HandleRequestLocalTest, PutSecurityThenGetReturnsTheRecord) {
+    EXPECT_EQ(decode_status(handle(encode_put_security("EQUITY", "037833100", "US0378331005", "2046251", "AAPL_OQ",
+                                                          text("Apple Inc.")))),
+              wire::Status::Ok);
+
+    auto response = handle(encode_get_security("EQUITY", "037833100", "US0378331005", "2046251", "AAPL_OQ"));
+    EXPECT_EQ(decode_status(response), wire::Status::Ok);
+    EXPECT_EQ(decode_get(response), text("Apple Inc."));
+}
+
+TEST_F(HandleRequestLocalTest, SecondPutSecurityOverwritesTheRecord) {
+    handle(encode_put_security("EQUITY", "037833100", "US0378331005", "2046251", "AAPL_OQ", text("v1")));
+    handle(encode_put_security("EQUITY", "037833100", "US0378331005", "2046251", "AAPL_OQ", text("v2")));
+
+    auto response = handle(encode_get_security("EQUITY", "037833100", "US0378331005", "2046251", "AAPL_OQ"));
+    EXPECT_EQ(decode_get(response), text("v2"));
+    EXPECT_EQ(security_cache.size(), 1u) << "upsert must not leave a duplicate entry behind";
+}
+
+TEST_F(HandleRequestLocalTest, EraseExistingSecurityEntryRemovesItAndReportsOk) {
+    handle(encode_put_security("EQUITY", "037833100", "US0378331005", "2046251", "AAPL_OQ", text("Apple Inc.")));
+
+    EXPECT_EQ(decode_status(handle(encode_erase_security("EQUITY", "037833100", "US0378331005", "2046251", "AAPL_OQ"))),
+              wire::Status::Ok);
+    EXPECT_EQ(decode_status(handle(encode_get_security("EQUITY", "037833100", "US0378331005", "2046251", "AAPL_OQ"))),
+              wire::Status::NotFound);
+}
+
+TEST_F(HandleRequestLocalTest, EraseOfMissingSecurityKeyReportsNotFound) {
+    EXPECT_EQ(decode_status(handle(encode_erase_security("EQUITY", "nobody", "nobody", "nobody", "nobody"))),
+              wire::Status::NotFound);
+}
+
+// A security row is addressed by ALL 5 fields, not just some of them --
+// changing any one field is a different key entirely.
+TEST_F(HandleRequestLocalTest, SecurityRowsWithDifferentCusipDoNotCrossPollinate) {
+    handle(encode_put_security("EQUITY", "037833100", "US0378331005", "2046251", "AAPL_OQ", text("apple")));
+    handle(encode_put_security("BOND", "000000000", "US0378331005", "0000000", "N/A", text("bond-same-isin")));
+
+    auto apple = handle(encode_get_security("EQUITY", "037833100", "US0378331005", "2046251", "AAPL_OQ"));
+    EXPECT_EQ(decode_get(apple), text("apple"));
+    auto bond = handle(encode_get_security("BOND", "000000000", "US0378331005", "0000000", "N/A"));
+    EXPECT_EQ(decode_get(bond), text("bond-same-isin"));
+}
+
+// A pattern() find needs NATS's kv_keys() to discover matches -- this
+// purely in-memory handler has no NATS to ask, same treatment as
+// GetAll(prefix)/KeyKind::Name below.
+TEST_F(HandleRequestLocalTest, FindSecurityIsRejectedNoNatsToAskHere) {
+    handle(encode_put_security("EQUITY", "037833100", "US0378331005", "2046251", "AAPL_OQ", text("apple")));
+
+    EXPECT_EQ(decode_status(handle(encode_find_security("EQUITY", std::nullopt, "US0378331005", std::nullopt,
+                                                           std::nullopt))),
+              wire::Status::Error);
 }
 
 // --- Non-unique key lookup (GetAll) -------------------------------------
@@ -321,9 +387,10 @@ class HandleRequestLocalTtlTest : public ::testing::Test {
 protected:
     NameCache name_cache{kCapacity, kShortTtl};
     IdCache id_cache{kCapacity, kShortTtl};
+    SecurityCache security_cache{kCapacity, kShortTtl};
 
     std::vector<std::uint8_t> handle(const std::vector<std::uint8_t>& request) {
-        return handle_request_local(name_cache, id_cache, request.data(), request.size());
+        return handle_request_local(name_cache, id_cache, security_cache, request.data(), request.size());
     }
 };
 

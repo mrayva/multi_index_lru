@@ -33,10 +33,23 @@
 /// pattern string and getting the field order or wildcard count wrong.
 ///
 /// See test/security_key_nats_test.cpp for this wired up end to end
-/// against a real NATS server.
+/// against a real NATS server, and server_dispatch_read.hpp/
+/// server_dispatch_write.hpp for it served live through the cache daemon
+/// (KeyKind::Security) -- read-through/write-through against a dedicated
+/// NATS bucket exactly like NameCache/IdCache, plus a pattern()-driven
+/// GetAll for the interior-wildcard find above.
+///
+/// SecurityCache is an ExpirableContainer, not a plain Container, for the
+/// same reason NameCache/IdCache are (cache_service.hpp): the daemon-served
+/// form needs TTL-based expiration on top of LRU eviction, and `found`
+/// below lets a confirmed-absent key be negative-cached the same way a
+/// NameEntry/IdEntry miss is -- see cache_service.hpp's identical comment
+/// on NameEntry::found. Defaults to true so every existing 6-arg
+/// SecurityEntry{...} construction (this file's own worked-example test) is
+/// unaffected.
 #pragma once
 
-#include <multi_index_lru/container.hpp>
+#include <multi_index_lru/expirable_container.hpp>
 #include <multi_index_lru/nats_key.hpp>
 
 #include <boost/multi_index/composite_key.hpp>
@@ -56,11 +69,12 @@ struct SecurityEntry {
     std::string sedol;
     std::string ric;
     std::vector<std::uint8_t> record;
+    bool found = true;
 };
 
 struct SecurityKeyTag {};
 
-using SecurityCache = multi_index_lru::Container<
+using SecurityCache = multi_index_lru::ExpirableContainer<
     SecurityEntry,
     boost::multi_index::indexed_by<boost::multi_index::hashed_unique<
         boost::multi_index::tag<SecurityKeyTag>,

@@ -94,12 +94,16 @@ protected:
         // spuriously self-invalidate -- see OwnWriteDoesNotSelfInvalidate
         // below for the direct version of that check.
         auto on_kv_change = [](const nats_asio::kv_entry& entry) {
-            invalidations_.push(entry.bucket == kNameBucket, entry.key, entry.revision,
+            const auto cache_kind = (entry.bucket == kNameBucket)  ? CacheKind::Name
+                                     : (entry.bucket == kIdBucket) ? CacheKind::Id
+                                                                     : CacheKind::Security;
+            invalidations_.push(cache_kind, entry.key, entry.revision,
                                  std::vector<std::uint8_t>(entry.value.begin(), entry.value.end()),
                                  entry.op == nats_asio::kv_entry::operation::put);
         };
         nats_->watch(kNameBucket, on_kv_change);
         nats_->watch(kIdBucket, on_kv_change);
+        nats_->watch(kSecurityBucket, on_kv_change);
 
         node_.emplace(iox2::NodeBuilder().create<iox2::ServiceType::Ipc>().value());
 
@@ -141,6 +145,7 @@ protected:
         // handle_request_local_test.cpp's HandleRequestLocalTtlTest.
         name_cache_.emplace(100, std::chrono::minutes(1));
         id_cache_.emplace(100, std::chrono::minutes(1));
+        security_cache_.emplace(100, std::chrono::minutes(1));
     }
 
     // One iteration of what server_readthrough.cpp's main loop does: drain
@@ -148,14 +153,15 @@ protected:
     // every currently-pending new request.
     void pump_server() {
         for (auto& completion : completions_.drain()) {
-            auto response_bytes = completion.apply(*name_cache_, *id_cache_);
+            auto response_bytes = completion.apply(*name_cache_, *id_cache_, *security_cache_);
             respond(*completion.active_request, response_bytes);
             if (completion.has_revision) {
                 revisions_.observe(completion.queue_key, completion.revision);
             }
             key_queue_.complete(completion.queue_key);
         }
-        apply_pending_invalidations(*name_cache_, *id_cache_, revisions_, invalidations_, prewarm_deadline_);
+        apply_pending_invalidations(*name_cache_, *id_cache_, *security_cache_, revisions_, invalidations_,
+                                     prewarm_deadline_);
         while (true) {
             auto active_request_opt = server_->receive().value();
             if (!active_request_opt.has_value()) {
@@ -163,9 +169,9 @@ protected:
             }
             const auto& payload = active_request_opt->payload();
             std::vector<std::uint8_t> request_bytes(payload.data(), payload.data() + payload.number_of_bytes());
-            dispatch_request(*name_cache_, *id_cache_, *nats_, kNameBucket, kIdBucket, completions_, key_queue_,
-                              allow_writes_, max_getall_results_, std::move(active_request_opt.value()),
-                              request_bytes.data(), request_bytes.size());
+            dispatch_request(*name_cache_, *id_cache_, *security_cache_, *nats_, kNameBucket, kIdBucket,
+                              kSecurityBucket, completions_, key_queue_, allow_writes_, max_getall_results_,
+                              std::move(active_request_opt.value()), request_bytes.data(), request_bytes.size());
         }
     }
 
@@ -204,6 +210,7 @@ protected:
 
     std::optional<NameCache> name_cache_;
     std::optional<IdCache> id_cache_;
+    std::optional<SecurityCache> security_cache_;
     CompletionQueue completions_;
     KeyOperationQueue key_queue_{kKeyQueueDepth};
     // true by default so every existing Put/Erase test in this file is
@@ -854,6 +861,154 @@ TEST_F(DispatchRequestTest, GetAllWithCategoryKindIsRejectedNatsHasNoCategoryEqu
     wire::Reader r(response->payload().data(), response->payload().number_of_bytes());
     EXPECT_EQ(static_cast<wire::Status>(r.u8()), wire::Status::Error);
     EXPECT_EQ(completions_.size(), 0u);
+}
+
+// --- Security-keyed cache (5-field composite key) ---------------------------
+
+TEST_F(DispatchRequestTest, SecurityLocalMissReadsThroughToNatsAndPopulatesCache) {
+    const auto nats_key = SecurityKey::key("EQUITY", "037833100", "US0378331005", "2046251", "AAPL_OQ");
+    nats_->erase(kSecurityBucket, nats_key);
+    ASSERT_TRUE(nats_->put(kSecurityBucket, nats_key, bytes("Apple Inc.")).first);
+
+    auto response_bytes =
+        round_trip(encode_get_security("EQUITY", "037833100", "US0378331005", "2046251", "AAPL_OQ"));
+    wire::Reader r(response_bytes.data(), response_bytes.size());
+    ASSERT_EQ(static_cast<wire::Status>(r.u8()), wire::Status::Ok);
+    EXPECT_EQ(str(r.remaining()), "Apple Inc.");
+
+    auto it = security_cache_->find<SecurityKeyTag>(
+        boost::make_tuple(std::string("EQUITY"), std::string("037833100"), std::string("US0378331005"),
+                           std::string("2046251"), std::string("AAPL_OQ")));
+    ASSERT_NE(it, security_cache_->end<SecurityKeyTag>());
+    EXPECT_EQ(str(it->record), "Apple Inc.");
+
+    nats_->erase(kSecurityBucket, nats_key);
+}
+
+TEST_F(DispatchRequestTest, SecurityPutIsWriteThroughAndAppliesOnCompletion) {
+    const auto nats_key = SecurityKey::key("EQUITY", "023135106", "US0231351067", "2044231", "AMZN_OQ");
+    nats_->erase(kSecurityBucket, nats_key);
+
+    auto response_bytes = round_trip(
+        encode_put_security("EQUITY", "023135106", "US0231351067", "2044231", "AMZN_OQ", bytes("Amazon.com Inc.")));
+    wire::Reader r(response_bytes.data(), response_bytes.size());
+    EXPECT_EQ(static_cast<wire::Status>(r.u8()), wire::Status::Ok);
+
+    auto nats_result = nats_->get(kSecurityBucket, nats_key);
+    ASSERT_EQ(nats_result.result, NatsResult::Ok);
+    EXPECT_EQ(str(nats_result.value), "Amazon.com Inc.");
+
+    auto it = security_cache_->find<SecurityKeyTag>(
+        boost::make_tuple(std::string("EQUITY"), std::string("023135106"), std::string("US0231351067"),
+                           std::string("2044231"), std::string("AMZN_OQ")));
+    ASSERT_NE(it, security_cache_->end<SecurityKeyTag>());
+    EXPECT_EQ(str(it->record), "Amazon.com Inc.");
+
+    nats_->erase(kSecurityBucket, nats_key);
+}
+
+TEST_F(DispatchRequestTest, SecurityEraseIsWriteThroughAndAppliesOnCompletion) {
+    const auto nats_key = SecurityKey::key("EQUITY", "88160R101", "US88160R1014", "2542291", "TSLA_OQ");
+    ASSERT_TRUE(nats_->put(kSecurityBucket, nats_key, bytes("Tesla Inc.")).first);
+
+    auto response_bytes =
+        round_trip(encode_erase_security("EQUITY", "88160R101", "US88160R1014", "2542291", "TSLA_OQ"));
+    wire::Reader r(response_bytes.data(), response_bytes.size());
+    EXPECT_EQ(static_cast<wire::Status>(r.u8()), wire::Status::Ok);
+
+    EXPECT_EQ(nats_->get(kSecurityBucket, nats_key).result, NatsResult::NotFound);
+
+    // Negatively cached, same as Name/Id's Erase -- see NegativeCache tests
+    // above.
+    auto it = security_cache_->find<SecurityKeyTag>(
+        boost::make_tuple(std::string("EQUITY"), std::string("88160R101"), std::string("US88160R1014"),
+                           std::string("2542291"), std::string("TSLA_OQ")));
+    ASSERT_NE(it, security_cache_->end<SecurityKeyTag>());
+    EXPECT_FALSE(it->found);
+}
+
+// --- Security-keyed cache: pattern find (the reason pattern() exists) ------
+
+TEST_F(DispatchRequestTest, FindSecurityMatchesInteriorWildcardEvenThoughIsinIsNotALeadingField) {
+    // Same scenario as test/security_key_nats_test.cpp's
+    // PatternFindsByAssetTypeAndIsinEvenThoughIsinIsNotALeadingField, but
+    // driven through dispatch_request() end to end rather than NatsBridge
+    // directly.
+    const auto apple = SecurityKey::key("EQUITY", "037833100", "US0378331005", "2046251", "AAPL_OQ2");
+    const auto msft = SecurityKey::key("EQUITY", "594918104", "US5949181045", "2588173", "MSFT_OQ2");
+    const auto bond_same_isin = SecurityKey::key("BOND", "000000000", "US0378331005", "0000000", "N_A2");
+    nats_->erase(kSecurityBucket, apple);
+    nats_->erase(kSecurityBucket, msft);
+    nats_->erase(kSecurityBucket, bond_same_isin);
+    ASSERT_TRUE(nats_->put(kSecurityBucket, apple, bytes("Apple Inc.")).first);
+    ASSERT_TRUE(nats_->put(kSecurityBucket, msft, bytes("Microsoft Corp.")).first);
+    ASSERT_TRUE(nats_->put(kSecurityBucket, bond_same_isin, bytes("some bond, same ISIN token")).first);
+
+    // ASSET_TYPE+ISIN known; CUSIP/SEDOL/RIC wildcarded -- ISIN sits between
+    // two wildcarded positions, which only pattern() (not prefix_pattern())
+    // can express.
+    auto response_bytes = round_trip(
+        encode_find_security("EQUITY", std::nullopt, std::string("US0378331005"), std::nullopt, std::nullopt));
+    auto [entries, truncated] = decode_found_all_with_keys(response_bytes);
+    EXPECT_FALSE(truncated);
+    ASSERT_EQ(entries.size(), 1u) << "must match Apple's EQUITY row, not MSFT's and not the BOND row that "
+                                      "reuses the same ISIN under a different ASSET_TYPE";
+    EXPECT_EQ(entries[0].key, apple);
+    EXPECT_EQ(entries[0].value, "Apple Inc.");
+
+    // Individually addressable as its own SecurityCache entry now.
+    auto it = security_cache_->find<SecurityKeyTag>(
+        boost::make_tuple(std::string("EQUITY"), std::string("037833100"), std::string("US0378331005"),
+                           std::string("2046251"), std::string("AAPL_OQ2")));
+    ASSERT_NE(it, security_cache_->end<SecurityKeyTag>());
+    EXPECT_EQ(str(it->record), "Apple Inc.");
+
+    nats_->erase(kSecurityBucket, apple);
+    nats_->erase(kSecurityBucket, msft);
+    nats_->erase(kSecurityBucket, bond_same_isin);
+}
+
+TEST_F(DispatchRequestTest, FindSecurityReturnsNotFoundWhenNoKeysMatch) {
+    auto response_bytes = round_trip(encode_find_security(std::string("NO_SUCH_ASSET_TYPE"), std::nullopt,
+                                                             std::nullopt, std::nullopt, std::nullopt));
+    wire::Reader r(response_bytes.data(), response_bytes.size());
+    EXPECT_EQ(static_cast<wire::Status>(r.u8()), wire::Status::NotFound);
+}
+
+// --- Cross-daemon coherence: kv_watch-driven invalidation, security bucket -
+
+TEST_F(DispatchRequestTest, SecurityExternalWriteInvalidatesLocalCacheEntry) {
+    const auto nats_key = SecurityKey::key("EQUITY", "594918104", "US5949181045", "2588173", "MSFT_OQ3");
+    nats_->erase(kSecurityBucket, nats_key);
+
+    ASSERT_TRUE(nats_->put(kSecurityBucket, nats_key, bytes("v1")).first);
+    auto v1_bytes = round_trip(encode_get_security("EQUITY", "594918104", "US5949181045", "2588173", "MSFT_OQ3"));
+    wire::Reader v1_r(v1_bytes.data(), v1_bytes.size());
+    ASSERT_EQ(static_cast<wire::Status>(v1_r.u8()), wire::Status::Ok);
+
+    // Simulate a write from another process, bypassing dispatch_request()
+    // entirely -- same idea as ExternalWriteInvalidatesLocalCacheEntry above.
+    ASSERT_TRUE(nats_->put(kSecurityBucket, nats_key, bytes("v2-from-elsewhere")).first);
+
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    auto still_cached = [&] {
+        return security_cache_->find<SecurityKeyTag>(
+                   boost::make_tuple(std::string("EQUITY"), std::string("594918104"), std::string("US5949181045"),
+                                      std::string("2588173"), std::string("MSFT_OQ3"))) !=
+               security_cache_->end<SecurityKeyTag>();
+    };
+    while (std::chrono::steady_clock::now() < deadline && still_cached()) {
+        pump_server();
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    EXPECT_FALSE(still_cached()) << "external write should have evicted the stale local entry via kv_watch";
+
+    auto v2_bytes = round_trip(encode_get_security("EQUITY", "594918104", "US5949181045", "2588173", "MSFT_OQ3"));
+    wire::Reader v2_r(v2_bytes.data(), v2_bytes.size());
+    ASSERT_EQ(static_cast<wire::Status>(v2_r.u8()), wire::Status::Ok);
+    EXPECT_EQ(str(v2_r.remaining()), "v2-from-elsewhere");
+
+    nats_->erase(kSecurityBucket, nats_key);
 }
 
 }  // namespace

@@ -12,6 +12,7 @@
 
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -23,6 +24,9 @@ namespace {
 constexpr auto kBucket = "mil_security_key_test";
 constexpr auto kHost = "127.0.0.1";
 constexpr std::uint16_t kPort = 4222;
+// SecurityCache is an ExpirableContainer (see security_cache.hpp) -- long
+// enough that this test (which doesn't sleep) could never hit it.
+constexpr auto kTtl = std::chrono::minutes(10);
 
 std::vector<std::uint8_t> bytes(const std::string& s) {
     return std::vector<std::uint8_t>(s.begin(), s.end());
@@ -63,7 +67,7 @@ TEST_F(SecurityKeyNatsTest, PutThenGetByFullKeyRoundTrips) {
     // The exact same derived key addresses the local composite-key index
     // too -- boost::multi_index::composite_key's find() takes a tuple of
     // the component values, in field order.
-    SecurityCache cache(100);
+    SecurityCache cache(100, kTtl);
     cache.emplace(SecurityEntry{"EQUITY", "037833100", "US0378331005", "2046251", "AAPL_OQ", result.value});
     auto it = cache.find<SecurityKeyTag>(boost::make_tuple(std::string("EQUITY"), std::string("037833100"),
                                                              std::string("US0378331005"), std::string("2046251"),

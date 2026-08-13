@@ -16,6 +16,7 @@
 ///   --nats-port / MIL_NATS_PORT          (default 4222)
 ///   --name-bucket / MIL_NAME_BUCKET      (default poc::kNameBucket)
 ///   --id-bucket / MIL_ID_BUCKET          (default poc::kIdBucket)
+///   --security-bucket / MIL_SECURITY_BUCKET (default poc::kSecurityBucket)
 #include "cache_service.hpp"
 #include "config.hpp"
 #include "nats_bridge.hpp"
@@ -25,6 +26,7 @@
 
 #include <chrono>
 #include <iostream>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -37,6 +39,7 @@ namespace {
 // same reasoning as client_readthrough.cpp's identical comment.
 constexpr auto kDefaultNameBucket = "mil_by_name";
 constexpr auto kDefaultIdBucket = "mil_by_id";
+constexpr auto kDefaultSecurityBucket = "mil_by_security";
 
 std::vector<std::uint8_t> call(eCAL::CServiceClient& client, const std::vector<std::uint8_t>& request_bytes) {
     auto instances = client.GetClientInstances();
@@ -78,6 +81,27 @@ void print_put_result(const std::vector<std::uint8_t>& response_bytes) {
     std::cout << "  -> put: " << status_name(status) << "\n";
 }
 
+// Decodes a GetAll(prefix)/FindSecurity response -- see cache_service.hpp's
+// "GetAll(prefix)+Ok" / "GetAll (Security, pattern find)" wire format:
+// unlike category GetAll, each match carries its own full NATS key
+// alongside the record.
+void print_get_all_prefix_result(const std::vector<std::uint8_t>& response_bytes) {
+    poc::wire::Reader r(response_bytes.data(), response_bytes.size());
+    const auto status = static_cast<poc::wire::Status>(r.u8());
+    if (status != poc::wire::Status::Ok) {
+        std::cout << "  -> " << status_name(status) << "\n";
+        return;
+    }
+    const auto count = r.u32();
+    const bool truncated = r.u8() != 0;
+    std::cout << "  -> " << count << " key(s)" << (truncated ? " (truncated -- more matched)" : "") << ":\n";
+    for (std::uint32_t i = 0; i < count; ++i) {
+        auto key = r.str();
+        auto record = r.bytes(r.u32());
+        std::cout << "     " << key << " = " << std::string(record.begin(), record.end()) << "\n";
+    }
+}
+
 std::vector<std::uint8_t> to_bytes(const std::string& s) {
     return std::vector<std::uint8_t>(s.begin(), s.end());
 }
@@ -91,6 +115,8 @@ int main(int argc, char** argv) {
     const std::uint16_t nats_port = poc::config::resolve_u16(args, "--nats-port", "MIL_NATS_PORT", 4222);
     const std::string name_bucket = poc::config::resolve_str(args, "--name-bucket", "MIL_NAME_BUCKET", kDefaultNameBucket);
     const std::string id_bucket = poc::config::resolve_str(args, "--id-bucket", "MIL_ID_BUCKET", kDefaultIdBucket);
+    const std::string security_bucket =
+        poc::config::resolve_str(args, "--security-bucket", "MIL_SECURITY_BUCKET", kDefaultSecurityBucket);
 
     std::cout << "[client] connecting directly to NATS (bypassing the daemon) to seed test data ...\n";
     poc::NatsBridge nats(nats_host, nats_port);
@@ -164,6 +190,55 @@ int main(int argc, char** argv) {
                       ? "not found -- confirmed NATS was updated, not just the local cache"
                       : "still present -- erase did NOT propagate to NATS!")
               << "\n";
+
+    std::cout << "\n--- security-keyed cache: read-through + write-through ---\n";
+
+    // Same scenario as client_readthrough.cpp's identical section -- see
+    // its comment for why the BOND row deliberately reuses Apple's ISIN.
+    const auto apple_key = poc::SecurityKey::key("EQUITY", "037833100", "US0378331005", "2046251", "AAPL_OQ_ecal");
+    const auto msft_key = poc::SecurityKey::key("EQUITY", "594918104", "US5949181045", "2588173", "MSFT_OQ_ecal");
+    const auto bond_key = poc::SecurityKey::key("BOND", "000000000", "US0378331005", "0000000", "N_A_ecal");
+    nats.erase(security_bucket, apple_key);
+    nats.erase(security_bucket, msft_key);
+    nats.erase(security_bucket, bond_key);
+    nats.put(security_bucket, apple_key, to_bytes(R"({"name":"Apple Inc."})"));
+    nats.put(security_bucket, msft_key, to_bytes(R"({"name":"Microsoft Corp."})"));
+    nats.put(security_bucket, bond_key, to_bytes(R"({"name":"some bond, same ISIN token"})"));
+    std::cout << "[client] seeded 3 security rows directly in NATS (never went through the daemon)\n";
+
+    std::cout << "[client] GET security=\"" << apple_key << "\" (never went through the daemon) ...\n";
+    print_get_result(
+        call(client, poc::encode_get_security("EQUITY", "037833100", "US0378331005", "2046251", "AAPL_OQ_ecal")));
+
+    std::cout << "[client] GET security=\"" << apple_key << "\" again (should now be a local cache hit) ...\n";
+    print_get_result(
+        call(client, poc::encode_get_security("EQUITY", "037833100", "US0378331005", "2046251", "AAPL_OQ_ecal")));
+
+    std::cout << "[client] PUT security (write-through to NATS) ...\n";
+    print_put_result(call(client,
+                           poc::encode_put_security("EQUITY", "023135106", "US0231351067", "2044231", "AMZN_OQ_ecal",
+                                                      to_bytes(R"({"note":"written through the daemon"})"))));
+
+    auto direct_security = nats.get(
+        security_bucket, poc::SecurityKey::key("EQUITY", "023135106", "US0231351067", "2044231", "AMZN_OQ_ecal"));
+    std::cout << "[client] direct NATS get of the just-PUT security (bypassing the daemon): "
+              << (direct_security.result == poc::NatsResult::Ok
+                      ? std::string(direct_security.value.begin(), direct_security.value.end())
+                      : "not found in NATS -- write-through failed!")
+              << "\n";
+
+    std::cout << "\n--- security-keyed cache: pattern find (interior wildcard) ---\n";
+
+    std::cout << "[client] FINDSECURITY asset_type=EQUITY isin=US0378331005 (cusip/sedol/ric wildcarded) ...\n";
+    print_get_all_prefix_result(
+        call(client, poc::encode_find_security("EQUITY", std::nullopt, std::string("US0378331005"), std::nullopt,
+                                                 std::nullopt)));
+
+    nats.erase(security_bucket, apple_key);
+    nats.erase(security_bucket, msft_key);
+    nats.erase(security_bucket, bond_key);
+    nats.erase(security_bucket,
+               poc::SecurityKey::key("EQUITY", "023135106", "US0231351067", "2044231", "AMZN_OQ_ecal"));
 
     std::cout << "\n[client] exit\n";
     eCAL::Finalize();

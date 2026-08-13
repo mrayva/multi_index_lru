@@ -31,6 +31,7 @@
 #include "active_request_iceoryx2.hpp"
 #endif
 
+#include <array>
 #include <chrono>
 #include <deque>
 #include <functional>
@@ -46,17 +47,19 @@ namespace poc {
 
 // Defaults only -- dispatch_request() takes the actual bucket names as
 // parameters so server_readthrough.cpp can override them via
-// --name-bucket/--id-bucket or MIL_NAME_BUCKET/MIL_ID_BUCKET (see
-// config.hpp). Kept as named constants since tests and client_readthrough.cpp
-// still want a sensible fixed default to talk to.
+// --name-bucket/--id-bucket/--security-bucket or
+// MIL_NAME_BUCKET/MIL_ID_BUCKET/MIL_SECURITY_BUCKET (see config.hpp). Kept
+// as named constants since tests and client_readthrough.cpp still want a
+// sensible fixed default to talk to.
 inline constexpr auto kNameBucket = "mil_by_name";
 inline constexpr auto kIdBucket = "mil_by_id";
+inline constexpr auto kSecurityBucket = "mil_by_security";
 
 // Runs on the main thread once a deferred request's NATS operation has
 // completed: applies whatever cache mutation is needed (a Get populating the
 // cache on a NATS hit, or a Put/Erase applying now that NATS confirmed it)
 // and returns the response bytes to send.
-using ApplyFn = std::function<std::vector<std::uint8_t>(NameCache&, IdCache&)>;
+using ApplyFn = std::function<std::vector<std::uint8_t>(NameCache&, IdCache&, SecurityCache&)>;
 
 struct PendingCompletion {
     ActiveRequestPtr active_request;
@@ -207,6 +210,31 @@ private:
 
 inline std::string name_queue_key(const std::string& name) { return "N:" + name; }
 inline std::string id_queue_key(std::int64_t id) { return "I:" + std::to_string(id); }
+// SecurityKey::key() both validates the 5 fields and joins them -- reusing
+// it here (rather than hand-joining) means this queue key can never drift
+// from the actual NATS key the same request derives in server_dispatch_read
+// .hpp/server_dispatch_write.hpp.
+inline std::string security_queue_key(const std::string& asset_type, const std::string& cusip,
+                                       const std::string& isin, const std::string& sedol, const std::string& ric) {
+    return "S:" + SecurityKey::key(asset_type, cusip, isin, sedol, ric);
+}
+
+// Splits a SecurityKey composite NATS key ("asset_type.cusip.isin.sedol.ric")
+// back into its 5 fields -- safe because validate_nats_key_field() (nats_key
+// .hpp) already rejects '.' inside any field value, so a key built by
+// SecurityKey::key() has exactly 4 dots, unambiguously. Used by
+// apply_pending_invalidations() below: a kv_watch event only carries the
+// full NATS key, not the individual fields that produced it.
+inline std::array<std::string, 5> split_security_key(const std::string& composite_key) {
+    std::array<std::string, 5> fields;
+    std::size_t start = 0;
+    for (std::size_t i = 0; i < 5; ++i) {
+        const auto dot = (i < 4) ? composite_key.find('.', start) : std::string::npos;
+        fields[i] = composite_key.substr(start, dot == std::string::npos ? std::string::npos : dot - start);
+        start = (dot == std::string::npos) ? composite_key.size() : dot + 1;
+    }
+    return fields;
+}
 
 // Cross-daemon coherence, part 1: tracks the highest NATS KV revision this
 // daemon already knows about for each key. Used two ways:
@@ -259,9 +287,14 @@ private:
 // immediately on subscribe) already hands over the data; no reason to throw
 // it away and pay a separate kv_get for it. Outside the prewarm window
 // they're unused -- ordinary invalidation still just evicts, unchanged.
+enum class CacheKind { Name, Id, Security };
+
 struct PendingInvalidation {
-    bool is_name_cache;             // true -> NameCache, false -> IdCache
-    std::string key;                // NameCache key verbatim, or IdCache key as its decimal string form
+    CacheKind cache_kind;
+    // NameCache key verbatim, IdCache key as its decimal string form, or
+    // SecurityCache's full composite NATS key ("asset_type.cusip.isin.sedol
+    // .ric" -- split back into fields via split_security_key() above).
+    std::string key;
     std::uint64_t revision;
     std::vector<std::uint8_t> value;  // valid iff is_put
     bool is_put;                      // true for a put, false for a del/purge
@@ -270,11 +303,11 @@ struct PendingInvalidation {
 // Thread-safe hand-off for PendingInvalidation, same shape as CompletionQueue.
 class InvalidationQueue {
 public:
-    void push(bool is_name_cache, std::string key, std::uint64_t revision, std::vector<std::uint8_t> value,
+    void push(CacheKind cache_kind, std::string key, std::uint64_t revision, std::vector<std::uint8_t> value,
               bool is_put) {
         std::lock_guard<std::mutex> lock(mutex_);
         items_.push_back(
-            PendingInvalidation{is_name_cache, std::move(key), revision, std::move(value), is_put});
+            PendingInvalidation{cache_kind, std::move(key), revision, std::move(value), is_put});
     }
 
     std::vector<PendingInvalidation> drain() {
@@ -314,18 +347,22 @@ private:
 // refresh mechanism, only the cold-start burst benefits from it. A
 // deadline already in the past (the default in tests that don't care about
 // prewarming) means this is a no-op and every event is handled the old way.
-inline void apply_pending_invalidations(NameCache& name_cache, IdCache& id_cache, RevisionTracker& revisions,
-                                         InvalidationQueue& invalidations,
+inline void apply_pending_invalidations(NameCache& name_cache, IdCache& id_cache, SecurityCache& security_cache,
+                                         RevisionTracker& revisions, InvalidationQueue& invalidations,
                                          std::chrono::steady_clock::time_point prewarm_deadline) {
     const bool prewarming = std::chrono::steady_clock::now() < prewarm_deadline;
     for (auto& invalidation : invalidations.drain()) {
-        const auto qkey = invalidation.is_name_cache ? name_queue_key(invalidation.key)
-                                                       : id_queue_key(std::stoll(invalidation.key));
+        std::string qkey;
+        switch (invalidation.cache_kind) {
+            case CacheKind::Name: qkey = name_queue_key(invalidation.key); break;
+            case CacheKind::Id: qkey = id_queue_key(std::stoll(invalidation.key)); break;
+            case CacheKind::Security: qkey = "S:" + invalidation.key; break;
+        }
         if (!revisions.observe(qkey, invalidation.revision)) {
             continue;  // echo of our own recent write (or an already-processed event) -- nothing to do
         }
         if (prewarming) {
-            if (invalidation.is_name_cache) {
+            if (invalidation.cache_kind == CacheKind::Name) {
                 name_cache.erase<NameTag>(invalidation.key);
                 if (invalidation.is_put) {
                     name_cache.emplace(NameEntry{invalidation.key, invalidation.value});
@@ -333,7 +370,7 @@ inline void apply_pending_invalidations(NameCache& name_cache, IdCache& id_cache
                 } else {
                     name_cache.emplace(NameEntry{invalidation.key, {}, false});
                 }
-            } else {
+            } else if (invalidation.cache_kind == CacheKind::Id) {
                 const auto id = std::stoll(invalidation.key);
                 id_cache.erase<IdTag>(id);
                 if (invalidation.is_put) {
@@ -342,19 +379,36 @@ inline void apply_pending_invalidations(NameCache& name_cache, IdCache& id_cache
                 } else {
                     id_cache.emplace(IdEntry{id, {}, false});
                 }
+            } else {
+                const auto fields = split_security_key(invalidation.key);
+                security_cache.erase<SecurityKeyTag>(boost::make_tuple(fields[0], fields[1], fields[2], fields[3], fields[4]));
+                if (invalidation.is_put) {
+                    security_cache.emplace(
+                        SecurityEntry{fields[0], fields[1], fields[2], fields[3], fields[4], invalidation.value});
+                    std::cout << "[server] prewarmed security=\"" << invalidation.key << "\" from NATS\n";
+                } else {
+                    security_cache.emplace(SecurityEntry{fields[0], fields[1], fields[2], fields[3], fields[4], {}, false});
+                }
             }
             continue;
         }
-        if (invalidation.is_name_cache) {
+        if (invalidation.cache_kind == CacheKind::Name) {
             if (name_cache.erase<NameTag>(invalidation.key)) {
                 std::cout << "[server] invalidated name=\"" << invalidation.key
                           << "\" (external write, revision " << invalidation.revision << ")\n";
             }
-        } else {
+        } else if (invalidation.cache_kind == CacheKind::Id) {
             const auto id = std::stoll(invalidation.key);
             if (id_cache.erase<IdTag>(id)) {
                 std::cout << "[server] invalidated id=" << id << " (external write, revision "
                           << invalidation.revision << ")\n";
+            }
+        } else {
+            const auto fields = split_security_key(invalidation.key);
+            if (security_cache.erase<SecurityKeyTag>(
+                    boost::make_tuple(fields[0], fields[1], fields[2], fields[3], fields[4]))) {
+                std::cout << "[server] invalidated security=\"" << invalidation.key
+                          << "\" (external write, revision " << invalidation.revision << ")\n";
             }
         }
     }

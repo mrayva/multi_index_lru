@@ -49,6 +49,7 @@
 /// server_dispatch.hpp's GetAll/KeyKind::Name case.
 #pragma once
 
+#include "security_cache.hpp"
 #include "wire.hpp"
 
 #include <multi_index_lru/expirable_container.hpp>
@@ -58,6 +59,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -135,7 +137,7 @@ using IdCache = multi_index_lru::ExpirableContainer<
 // proportional to how many *consecutive* least-recently-used entries are
 // actually expired, which is cheap, but there's no reason to pay it more
 // than a few times a second).
-inline void cleanup_expired_periodically(NameCache& name_cache, IdCache& id_cache,
+inline void cleanup_expired_periodically(NameCache& name_cache, IdCache& id_cache, SecurityCache& security_cache,
                                           std::chrono::steady_clock::time_point& last_cleanup,
                                           std::chrono::steady_clock::duration interval) {
     const auto now = std::chrono::steady_clock::now();
@@ -144,6 +146,7 @@ inline void cleanup_expired_periodically(NameCache& name_cache, IdCache& id_cach
     }
     name_cache.cleanup_expired();
     id_cache.cleanup_expired();
+    security_cache.cleanup_expired();
     last_cleanup = now;
 }
 
@@ -161,6 +164,31 @@ inline constexpr auto kServiceName = "multi_index_lru/cache/rpc";
 //               unchanged.
 //   GetAll (category):  [op:u8][key_kind:u8=Category][category:u32-prefixed-str]
 //   GetAll (prefix):    [op:u8][key_kind:u8=Name][prefix:u32-prefixed-str]
+//
+// --- Security-keyed cache (security_cache.hpp's 5-field composite key) ---
+//
+// A third, independent cache alongside NameCache/IdCache -- see
+// security_cache.hpp for SecurityEntry/SecurityKey (ASSET_TYPE, CUSIP,
+// ISIN, SEDOL, RIC) and why a "wide" combined key needs
+// NatsCompositeKey::pattern() rather than prefix_pattern() for its find.
+//
+//   Get/Erase (Security): [op:u8][key_kind:u8=Security][asset_type:str]
+//             [cusip:str][isin:str][sedol:str][ric:str]
+//   Put (Security):       [op:u8][key_kind:u8=Security][asset_type:str]
+//             [cusip:str][isin:str][sedol:str][ric:str][record_len:u32]
+//             [record bytes]
+//   GetAll (Security, pattern find): [op:u8][key_kind:u8=Security]
+//             ([is_wildcard:u8][value:str]) x 5, one pair per field in
+//             SecurityKey's (asset_type, cusip, isin, sedol, ric) order --
+//             is_wildcard=1 means that position is nats_any (value is
+//             empty and ignored), is_wildcard=0 means value is that
+//             position's literal. This is the wire-level mirror of
+//             SecurityKey::pattern()'s std::variant<AllFields, NatsAny>
+//             arguments -- see server_dispatch_read.hpp's Security GetAll
+//             branch, which decodes exactly this shape to build the actual
+//             pattern() call. NATS-backed only (server_readthrough.cpp/
+//             server_readthrough_ecal.cpp); server.cpp (no NATS) rejects
+//             it, same as GetAll(prefix) already does for KeyKind::Name.
 //
 // Response:
 //   Get/GetAll miss, Erase, Put: [status:u8] -- Ok, NotFound, or Error.
@@ -236,6 +264,77 @@ inline std::vector<std::uint8_t> encode_get_all_by_prefix(const std::string& nam
     return w.buffer();
 }
 
+// --- Security-keyed cache request encoding --------------------------------
+
+inline std::vector<std::uint8_t> encode_get_security(const std::string& asset_type, const std::string& cusip,
+                                                       const std::string& isin, const std::string& sedol,
+                                                       const std::string& ric) {
+    wire::Writer w;
+    w.u8(static_cast<std::uint8_t>(wire::Op::Get));
+    w.u8(static_cast<std::uint8_t>(wire::KeyKind::Security));
+    w.str(asset_type);
+    w.str(cusip);
+    w.str(isin);
+    w.str(sedol);
+    w.str(ric);
+    return w.buffer();
+}
+
+inline std::vector<std::uint8_t> encode_erase_security(const std::string& asset_type, const std::string& cusip,
+                                                         const std::string& isin, const std::string& sedol,
+                                                         const std::string& ric) {
+    wire::Writer w;
+    w.u8(static_cast<std::uint8_t>(wire::Op::Erase));
+    w.u8(static_cast<std::uint8_t>(wire::KeyKind::Security));
+    w.str(asset_type);
+    w.str(cusip);
+    w.str(isin);
+    w.str(sedol);
+    w.str(ric);
+    return w.buffer();
+}
+
+inline std::vector<std::uint8_t> encode_put_security(const std::string& asset_type, const std::string& cusip,
+                                                       const std::string& isin, const std::string& sedol,
+                                                       const std::string& ric,
+                                                       const std::vector<std::uint8_t>& record) {
+    wire::Writer w;
+    w.u8(static_cast<std::uint8_t>(wire::Op::Put));
+    w.u8(static_cast<std::uint8_t>(wire::KeyKind::Security));
+    w.str(asset_type);
+    w.str(cusip);
+    w.str(isin);
+    w.str(sedol);
+    w.str(ric);
+    w.u32(static_cast<std::uint32_t>(record.size()));
+    w.bytes(record);
+    return w.buffer();
+}
+
+// A field left as std::nullopt is wildcarded (SecurityKey::pattern()'s
+// nats_any at that position); a field with a value is that position's
+// literal -- see "GetAll (Security, pattern find)" above for the wire
+// shape this produces.
+inline std::vector<std::uint8_t> encode_find_security(const std::optional<std::string>& asset_type,
+                                                        const std::optional<std::string>& cusip,
+                                                        const std::optional<std::string>& isin,
+                                                        const std::optional<std::string>& sedol,
+                                                        const std::optional<std::string>& ric) {
+    wire::Writer w;
+    w.u8(static_cast<std::uint8_t>(wire::Op::GetAll));
+    w.u8(static_cast<std::uint8_t>(wire::KeyKind::Security));
+    auto write_field = [&w](const std::optional<std::string>& field) {
+        w.u8(field.has_value() ? 0 : 1);
+        w.str(field.value_or(""));
+    };
+    write_field(asset_type);
+    write_field(cusip);
+    write_field(isin);
+    write_field(sedol);
+    write_field(ric);
+    return w.buffer();
+}
+
 // --- response encoding (server side) -------------------------------------
 
 inline std::vector<std::uint8_t> encode_status(wire::Status status) {
@@ -299,8 +398,8 @@ inline std::vector<std::uint8_t> encode_found_all_with_keys(
 /// every other response this function returns, which is bounded by one
 /// record.
 inline std::vector<std::uint8_t> handle_request_local(
-    NameCache& name_cache, IdCache& id_cache, const std::uint8_t* data, std::size_t size,
-    std::size_t max_getall_results = 100) {
+    NameCache& name_cache, IdCache& id_cache, SecurityCache& security_cache, const std::uint8_t* data,
+    std::size_t size, std::size_t max_getall_results = 100) {
     // A malformed/truncated request (wire::Reader throws std::out_of_range on
     // that) must never escape this function: this is called from the
     // server's single request loop, and an unhandled exception there would
@@ -313,6 +412,17 @@ inline std::vector<std::uint8_t> handle_request_local(
 
         switch (op) {
             case wire::Op::Get: {
+                if (kind == wire::KeyKind::Security) {
+                    auto asset_type = r.str();
+                    auto cusip = r.str();
+                    auto isin = r.str();
+                    auto sedol = r.str();
+                    auto ric = r.str();
+                    auto it = security_cache.find<SecurityKeyTag>(
+                        boost::make_tuple(asset_type, cusip, isin, sedol, ric));
+                    return (it != security_cache.end<SecurityKeyTag>()) ? encode_found(it->record)
+                                                                          : encode_status(wire::Status::NotFound);
+                }
                 if (kind == wire::KeyKind::Name) {
                     auto it = name_cache.find<NameTag>(r.str());
                     return (it != name_cache.end<NameTag>()) ? encode_found(it->record)
@@ -323,12 +433,33 @@ inline std::vector<std::uint8_t> handle_request_local(
                                                        : encode_status(wire::Status::NotFound);
             }
             case wire::Op::Erase: {
+                if (kind == wire::KeyKind::Security) {
+                    auto asset_type = r.str();
+                    auto cusip = r.str();
+                    auto isin = r.str();
+                    auto sedol = r.str();
+                    auto ric = r.str();
+                    const bool erased = security_cache.erase<SecurityKeyTag>(
+                        boost::make_tuple(asset_type, cusip, isin, sedol, ric));
+                    return encode_status(erased ? wire::Status::Ok : wire::Status::NotFound);
+                }
                 const bool erased = (kind == wire::KeyKind::Name) ? name_cache.erase<NameTag>(r.str())
                                                                     : id_cache.erase<IdTag>(r.i64());
                 return encode_status(erased ? wire::Status::Ok : wire::Status::NotFound);
             }
             case wire::Op::Put: {
-                if (kind == wire::KeyKind::Name) {
+                if (kind == wire::KeyKind::Security) {
+                    auto asset_type = r.str();
+                    auto cusip = r.str();
+                    auto isin = r.str();
+                    auto sedol = r.str();
+                    auto ric = r.str();
+                    auto record = r.bytes(r.u32());
+                    // Upsert -- same reasoning as the Name branch below.
+                    security_cache.erase<SecurityKeyTag>(boost::make_tuple(asset_type, cusip, isin, sedol, ric));
+                    security_cache.emplace(SecurityEntry{std::move(asset_type), std::move(cusip), std::move(isin),
+                                                           std::move(sedol), std::move(ric), std::move(record)});
+                } else if (kind == wire::KeyKind::Name) {
                     auto name = r.str();
                     auto category = r.str();
                     auto record = r.bytes(r.u32());
@@ -350,6 +481,12 @@ inline std::vector<std::uint8_t> handle_request_local(
                 return encode_status(wire::Status::Ok);
             }
             case wire::Op::GetAll: {
+                if (kind == wire::KeyKind::Security) {
+                    // A pattern() find needs NATS's kv_keys() to discover
+                    // what matches -- this purely in-memory handler has no
+                    // NATS to ask, same as the Name-prefix flavor below.
+                    return encode_status(wire::Status::Error);
+                }
                 if (kind != wire::KeyKind::Category) {
                     // KeyKind::Name (prefix lookup) is NATS-backed only --
                     // see "Prefix lookup (GetAll, KeyKind::Name)" above.

@@ -14,6 +14,7 @@
 ///   --nats-port / MIL_NATS_PORT          (default 4222)
 ///   --name-bucket / MIL_NAME_BUCKET      (default poc::kNameBucket)
 ///   --id-bucket / MIL_ID_BUCKET          (default poc::kIdBucket)
+///   --security-bucket / MIL_SECURITY_BUCKET (default poc::kSecurityBucket)
 #include "cache_service.hpp"
 #include "config.hpp"
 #include "nats_bridge.hpp"
@@ -21,6 +22,7 @@
 #include "iox2/iceoryx2.hpp"
 
 #include <iostream>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -32,12 +34,13 @@ using iox2::bb::Slice;
 constexpr iox2::bb::Duration kCycleTime = iox2::bb::Duration::from_millis(50);
 constexpr std::uint64_t kInitialSliceLenHint = 256;
 // Same default bucket names server_readthrough.cpp uses (poc::kNameBucket/
-// poc::kIdBucket, defined in server_dispatch.hpp) -- duplicated here as
-// plain string literals rather than including that header, which would also
-// pull in the (server-only) dispatch/CompletionQueue machinery this client
-// has no use for.
+// poc::kIdBucket/poc::kSecurityBucket, defined in server_dispatch_common
+// .hpp) -- duplicated here as plain string literals rather than including
+// that header, which would also pull in the (server-only) dispatch/
+// CompletionQueue machinery this client has no use for.
 constexpr auto kDefaultNameBucket = "mil_by_name";
 constexpr auto kDefaultIdBucket = "mil_by_id";
+constexpr auto kDefaultSecurityBucket = "mil_by_security";
 
 template <typename Client>
 std::vector<std::uint8_t> call(Client& client, iox2::Node<iox2::ServiceType::Ipc>& node,
@@ -121,6 +124,8 @@ int main(int argc, char** argv) {
     const std::uint16_t nats_port = poc::config::resolve_u16(args, "--nats-port", "MIL_NATS_PORT", 4222);
     const std::string name_bucket = poc::config::resolve_str(args, "--name-bucket", "MIL_NAME_BUCKET", kDefaultNameBucket);
     const std::string id_bucket = poc::config::resolve_str(args, "--id-bucket", "MIL_ID_BUCKET", kDefaultIdBucket);
+    const std::string security_bucket =
+        poc::config::resolve_str(args, "--security-bucket", "MIL_SECURITY_BUCKET", kDefaultSecurityBucket);
 
     std::cout << "[client] connecting directly to NATS (bypassing the daemon) to seed test data ...\n";
     poc::NatsBridge nats(nats_host, nats_port);
@@ -225,6 +230,60 @@ int main(int argc, char** argv) {
 
     std::cout << "[client] GETALL name-prefix=\"nonexistent_prefix\" ...\n";
     print_get_all_prefix_result(call(client, node, poc::encode_get_all_by_prefix("nonexistent_prefix")));
+
+    std::cout << "\n--- security-keyed cache: read-through + write-through ---\n";
+
+    // Two EQUITY rows plus a BOND row that deliberately reuses Apple's ISIN
+    // under a different ASSET_TYPE -- same scenario as
+    // test/security_key_nats_test.cpp's PatternFindsByAssetTypeAndIsin...,
+    // but exercised through the live daemon rather than NatsBridge directly.
+    const auto apple_key = poc::SecurityKey::key("EQUITY", "037833100", "US0378331005", "2046251", "AAPL_OQ");
+    const auto msft_key = poc::SecurityKey::key("EQUITY", "594918104", "US5949181045", "2588173", "MSFT_OQ");
+    const auto bond_key = poc::SecurityKey::key("BOND", "000000000", "US0378331005", "0000000", "N_A");
+    nats.erase(security_bucket, apple_key);
+    nats.erase(security_bucket, msft_key);
+    nats.erase(security_bucket, bond_key);
+    nats.put(security_bucket, apple_key, to_bytes(R"({"name":"Apple Inc."})"));
+    nats.put(security_bucket, msft_key, to_bytes(R"({"name":"Microsoft Corp."})"));
+    nats.put(security_bucket, bond_key, to_bytes(R"({"name":"some bond, same ISIN token"})"));
+    std::cout << "[client] seeded 3 security rows directly in NATS (never went through the daemon)\n";
+
+    std::cout << "[client] GET security=\"" << apple_key << "\" (never went through the daemon) ...\n";
+    print_get_result(
+        call(client, node, poc::encode_get_security("EQUITY", "037833100", "US0378331005", "2046251", "AAPL_OQ")));
+
+    std::cout << "[client] GET security=\"" << apple_key << "\" again (should now be a local cache hit) ...\n";
+    print_get_result(
+        call(client, node, poc::encode_get_security("EQUITY", "037833100", "US0378331005", "2046251", "AAPL_OQ")));
+
+    std::cout << "[client] PUT security (write-through to NATS) ...\n";
+    print_put_result(call(client, node,
+                           poc::encode_put_security("EQUITY", "023135106", "US0231351067", "2044231", "AMZN_OQ",
+                                                      to_bytes(R"({"note":"written through the daemon"})"))));
+
+    auto direct_security =
+        nats.get(security_bucket, poc::SecurityKey::key("EQUITY", "023135106", "US0231351067", "2044231", "AMZN_OQ"));
+    std::cout << "[client] direct NATS get of the just-PUT security (bypassing the daemon): "
+              << (direct_security.result == poc::NatsResult::Ok
+                      ? std::string(direct_security.value.begin(), direct_security.value.end())
+                      : "not found in NATS -- write-through failed!")
+              << "\n";
+
+    std::cout << "\n--- security-keyed cache: pattern find (interior wildcard) ---\n";
+
+    // ASSET_TYPE+ISIN known, CUSIP/SEDOL/RIC not -- ISIN sits between two
+    // wildcarded positions, which only NatsCompositeKey::pattern() (not
+    // prefix_pattern()) can express. Must match Apple's EQUITY row and
+    // *not* the BOND row that happens to reuse the same ISIN token.
+    std::cout << "[client] FINDSECURITY asset_type=EQUITY isin=US0378331005 (cusip/sedol/ric wildcarded) ...\n";
+    print_get_all_prefix_result(call(
+        client, node,
+        poc::encode_find_security("EQUITY", std::nullopt, std::string("US0378331005"), std::nullopt, std::nullopt)));
+
+    nats.erase(security_bucket, apple_key);
+    nats.erase(security_bucket, msft_key);
+    nats.erase(security_bucket, bond_key);
+    nats.erase(security_bucket, poc::SecurityKey::key("EQUITY", "023135106", "US0231351067", "2044231", "AMZN_OQ"));
 
     std::cout << "\n[client] exit\n";
     return 0;

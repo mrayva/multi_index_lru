@@ -16,7 +16,13 @@ namespace poc::wire {
 // "Non-unique key lookup (GetAll)" and README.md for the full design; it's
 // the only Op that pairs with KeyKind::Category.
 enum class Op : std::uint8_t { Get = 0, Put = 1, Erase = 2, GetAll = 3 };
-enum class KeyKind : std::uint8_t { Name = 0, Id = 1, Category = 2 };
+// Security: the 5-field (asset_type, cusip, isin, sedol, ric) composite key
+// from security_cache.hpp -- see cache_service.hpp "Security-keyed cache"
+// for the Get/Put/Erase wire shape, and server_dispatch_read.hpp's Security
+// GetAll branch for the pattern()-based find that's this kind's whole
+// reason for existing (an interior wildcard, not just Name/Category's
+// single-token key or prefix).
+enum class KeyKind : std::uint8_t { Name = 0, Id = 1, Category = 2, Security = 3 };
 // ReadOnly: a Put/Erase reached a server_readthrough.cpp instance that's
 // running without --allow-writes/MIL_ALLOW_WRITES -- distinct from Error so
 // a caller can tell "this daemon deliberately doesn't accept writes" apart

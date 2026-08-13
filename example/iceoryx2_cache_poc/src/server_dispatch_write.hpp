@@ -37,17 +37,58 @@ namespace poc {
 // Same exception-propagation contract as dispatch_read_request(): any
 // exception this throws is expected to reach server_dispatch.hpp's single
 // try/catch, not be caught here, relying on the same "parse before you
-// move `active_request`" invariant.
+// move `active_request`" invariant -- including SecurityKey::key()
+// rejecting an invalid field (nats_key.hpp's validate_nats_key_field()),
+// which is why every Security branch below derives its NATS key before
+// constructing `request`, same as dispatch_read_request()'s Security Get.
 inline void dispatch_write_request(NatsBridge& nats, const std::string& name_bucket, const std::string& id_bucket,
-                                    CompletionQueue& completions, KeyOperationQueue& key_queue, bool allow_writes,
-                                    wire::Op op, wire::KeyKind kind, wire::Reader& r,
-                                    ActiveRequestType& active_request) {
+                                    const std::string& security_bucket, CompletionQueue& completions,
+                                    KeyOperationQueue& key_queue, bool allow_writes, wire::Op op, wire::KeyKind kind,
+                                    wire::Reader& r, ActiveRequestType& active_request) {
     if (!allow_writes) {
         respond(active_request, encode_status(wire::Status::ReadOnly));
         return;
     }
 
     if (op == wire::Op::Put) {
+        if (kind == wire::KeyKind::Security) {
+            auto asset_type = r.str();
+            auto cusip = r.str();
+            auto isin = r.str();
+            auto sedol = r.str();
+            auto ric = r.str();
+            auto record = r.bytes(r.u32());
+            const auto nats_key = SecurityKey::key(asset_type, cusip, isin, sedol, ric);
+            auto qkey = "S:" + nats_key;
+            auto request = std::make_shared<ActiveRequestType>(std::move(active_request));
+            if (!key_queue.enqueue(qkey, [&nats, &completions, security_bucket, request, asset_type, cusip, isin,
+                                           sedol, ric, record, nats_key, qkey]() mutable {
+                std::cout << "[server] PUT security=\"" << nats_key << "\" -> dispatched to NATS\n";
+                nats.put_async(
+                    security_bucket, nats_key, record,
+                    [&completions, request, asset_type, cusip, isin, sedol, ric, record, nats_key, qkey](
+                        bool ok, std::uint64_t revision, std::string /*err*/) mutable {
+                        ApplyFn apply = [asset_type, cusip, isin, sedol, ric, record, ok](
+                                             NameCache&, IdCache&,
+                                             SecurityCache& security_cache) -> std::vector<std::uint8_t> {
+                            if (!ok) {
+                                return encode_status(wire::Status::Error);
+                            }
+                            security_cache.erase<SecurityKeyTag>(boost::make_tuple(asset_type, cusip, isin, sedol, ric));
+                            security_cache.emplace(
+                                SecurityEntry{asset_type, cusip, isin, sedol, ric, record});
+                            return encode_status(wire::Status::Ok);
+                        };
+                        completions.push(std::move(request), std::move(apply), "PUT security=\"" + nats_key + "\"",
+                                          qkey, revision, ok);
+                    });
+            })) {
+                std::cout << "[server] PUT security=\"" << nats_key << "\" -> rejected (queue full for this key)\n";
+                respond(*request, encode_status(wire::Status::Error));
+            }
+            return;
+        }
+
         if (kind == wire::KeyKind::Name) {
             auto key = r.str();
             // Category is stored (NameCache's second, non-unique index
@@ -70,8 +111,8 @@ inline void dispatch_write_request(NatsBridge& nats, const std::string& name_buc
                                 [&completions, request, key, record, category, qkey](
                                     bool ok, std::uint64_t revision, std::string /*err*/) mutable {
                                     ApplyFn apply = [key, record, category, ok](
-                                                         NameCache& name_cache,
-                                                         IdCache&) -> std::vector<std::uint8_t> {
+                                                         NameCache& name_cache, IdCache&,
+                                                         SecurityCache&) -> std::vector<std::uint8_t> {
                                         if (!ok) {
                                             return encode_status(wire::Status::Error);
                                         }
@@ -98,8 +139,9 @@ inline void dispatch_write_request(NatsBridge& nats, const std::string& name_buc
             nats.put_async(id_bucket, std::to_string(key), record,
                             [&completions, request, key, record, qkey](bool ok, std::uint64_t revision,
                                                                         std::string /*err*/) mutable {
-                                ApplyFn apply = [key, record, ok](NameCache&,
-                                                                   IdCache& id_cache) -> std::vector<std::uint8_t> {
+                                ApplyFn apply = [key, record, ok](
+                                                     NameCache&, IdCache& id_cache,
+                                                     SecurityCache&) -> std::vector<std::uint8_t> {
                                     if (!ok) {
                                         return encode_status(wire::Status::Error);
                                     }
@@ -118,6 +160,44 @@ inline void dispatch_write_request(NatsBridge& nats, const std::string& name_buc
     }
 
     // op == Erase
+    if (kind == wire::KeyKind::Security) {
+        auto asset_type = r.str();
+        auto cusip = r.str();
+        auto isin = r.str();
+        auto sedol = r.str();
+        auto ric = r.str();
+        const auto nats_key = SecurityKey::key(asset_type, cusip, isin, sedol, ric);
+        auto qkey = "S:" + nats_key;
+        auto request = std::make_shared<ActiveRequestType>(std::move(active_request));
+        if (!key_queue.enqueue(qkey, [&nats, &completions, security_bucket, request, asset_type, cusip, isin, sedol,
+                                       ric, nats_key, qkey]() mutable {
+            std::cout << "[server] ERASE security=\"" << nats_key << "\" -> dispatched to NATS\n";
+            nats.erase_async(
+                security_bucket, nats_key,
+                [&completions, request, asset_type, cusip, isin, sedol, ric, nats_key, qkey](
+                    bool ok, std::uint64_t revision, std::string /*err*/) mutable {
+                    ApplyFn apply = [asset_type, cusip, isin, sedol, ric, ok](
+                                         NameCache&, IdCache&,
+                                         SecurityCache& security_cache) -> std::vector<std::uint8_t> {
+                        if (!ok) {
+                            return encode_status(wire::Status::Error);
+                        }
+                        // Negative-cache the now-confirmed absence, same
+                        // as Name/Id's Erase below.
+                        security_cache.erase<SecurityKeyTag>(boost::make_tuple(asset_type, cusip, isin, sedol, ric));
+                        security_cache.emplace(SecurityEntry{asset_type, cusip, isin, sedol, ric, {}, false});
+                        return encode_status(wire::Status::Ok);
+                    };
+                    completions.push(std::move(request), std::move(apply), "ERASE security=\"" + nats_key + "\"",
+                                      qkey, revision, ok);
+                });
+        })) {
+            std::cout << "[server] ERASE security=\"" << nats_key << "\" -> rejected (queue full for this key)\n";
+            respond(*request, encode_status(wire::Status::Error));
+        }
+        return;
+    }
+
     if (kind == wire::KeyKind::Name) {
         auto key = r.str();
         auto qkey = name_queue_key(key);
@@ -127,8 +207,9 @@ inline void dispatch_write_request(NatsBridge& nats, const std::string& name_buc
             nats.erase_async(name_bucket, key,
                               [&completions, request, key, qkey](bool ok, std::uint64_t revision,
                                                                   std::string /*err*/) mutable {
-                                  ApplyFn apply = [key, ok](NameCache& name_cache,
-                                                             IdCache&) -> std::vector<std::uint8_t> {
+                                  ApplyFn apply = [key, ok](
+                                                       NameCache& name_cache, IdCache&,
+                                                       SecurityCache&) -> std::vector<std::uint8_t> {
                                       if (!ok) {
                                           return encode_status(wire::Status::Error);
                                       }
@@ -159,7 +240,9 @@ inline void dispatch_write_request(NatsBridge& nats, const std::string& name_buc
         nats.erase_async(id_bucket, std::to_string(key),
                           [&completions, request, key, qkey](bool ok, std::uint64_t revision,
                                                               std::string /*err*/) mutable {
-                              ApplyFn apply = [key, ok](NameCache&, IdCache& id_cache) -> std::vector<std::uint8_t> {
+                              ApplyFn apply = [key, ok](
+                                                   NameCache&, IdCache& id_cache,
+                                                   SecurityCache&) -> std::vector<std::uint8_t> {
                                   if (!ok) {
                                       return encode_status(wire::Status::Error);
                                   }

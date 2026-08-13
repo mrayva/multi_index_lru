@@ -244,6 +244,7 @@ accepted for flags with a value: `--flag value` or `--flag=value`.
 | `--nats-port` | `MIL_NATS_PORT` | `4222` | `server_readthrough.cpp`, `client_readthrough.cpp` |
 | `--name-bucket` | `MIL_NAME_BUCKET` | `poc::kNameBucket` (`mil_by_name`) | `server_readthrough.cpp`, `client_readthrough.cpp` |
 | `--id-bucket` | `MIL_ID_BUCKET` | `poc::kIdBucket` (`mil_by_id`) | `server_readthrough.cpp`, `client_readthrough.cpp` |
+| `--security-bucket` | `MIL_SECURITY_BUCKET` | `poc::kSecurityBucket` (`mil_by_security`) | `server_readthrough.cpp`, `client_readthrough.cpp` |
 | `--nats-timeout-ms` | `MIL_NATS_TIMEOUT_MS` | `3000` | `server_readthrough.cpp` (`NatsBridge` op timeout) |
 | `--cb-failure-threshold` | `MIL_CB_FAILURE_THRESHOLD` | `3` | `server_readthrough.cpp` (circuit breaker) |
 | `--cb-open-duration-ms` | `MIL_CB_OPEN_DURATION_MS` | `2000` | `server_readthrough.cpp` (circuit breaker) |
@@ -662,12 +663,21 @@ ctest --test-dir build-poc --output-on-failure
   durably have. A NATS failure is reported back as `Error` and the local
   cache is left untouched.
 
-Each of the two caches gets its own NATS KV bucket:
+Each cache gets its own NATS KV bucket:
 
 | Cache      | Key type  | NATS bucket    |
 |------------|-----------|----------------|
 | `NameCache`| `string`  | `mil_by_name`  |
 | `IdCache`  | `int64_t` | `mil_by_id` (int keys stored as decimal strings) |
+| `SecurityCache` | `(asset_type, cusip, isin, sedol, ric)` composite, see `security_cache.hpp` | `mil_by_security` (`NatsCompositeKey::key()`-derived dot-joined string) |
+
+`SecurityCache` additionally supports a `GetAll`/`KeyKind::Security` "find"
+request that isn't a single-key lookup at all: it wildcards an *interior*
+field position via `NatsCompositeKey::pattern()` (e.g. ASSET_TYPE+ISIN known,
+CUSIP/SEDOL/RIC not) rather than the trailing-run-only `prefix_pattern()`
+`GetAll`/`KeyKind::Name` uses -- see `cache_service.hpp`'s "GetAll (Security,
+pattern find)" and `security_cache.hpp`'s file comment for why a "wide"
+combined key needs this.
 
 ### Setup
 
@@ -680,13 +690,17 @@ Each of the two caches gets its own NATS KV bucket:
 
 2. **The KV buckets, created once** (`nats_asio` has no bucket-creation call
    — it assumes the backing JetStream stream already exists). `mil_by_name`
-   / `mil_by_id` are what the servers use; `mil_bridge_test` is a third,
-   separate bucket the `nats_bridge_test`/`dispatch_request_test` suites use
-   so they never collide with a running demo daemon's data:
+   / `mil_by_id` / `mil_by_security` are what the servers use;
+   `mil_bridge_test` and `mil_security_key_test` are separate buckets the
+   `nats_bridge_test`/`dispatch_request_test` and
+   `security_key_nats_test` suites use, respectively, so they never collide
+   with a running demo daemon's data:
    ```bash
    nats --server localhost:4222 kv add mil_by_name
    nats --server localhost:4222 kv add mil_by_id
+   nats --server localhost:4222 kv add mil_by_security
    nats --server localhost:4222 kv add mil_bridge_test
+   nats --server localhost:4222 kv add mil_security_key_test
    ```
 
 3. **A built `nats_asio`.** This POC was built and tested against

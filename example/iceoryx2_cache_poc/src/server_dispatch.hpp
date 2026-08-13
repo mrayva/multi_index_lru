@@ -47,21 +47,22 @@ namespace poc {
 // with the still-intact `active_request` parameter directly, whether the
 // exception came from op/kind decoding here or from further parsing inside
 // dispatch_read_request()/dispatch_write_request().
-inline void dispatch_request(NameCache& name_cache, IdCache& id_cache, NatsBridge& nats, const std::string& name_bucket,
-                              const std::string& id_bucket, CompletionQueue& completions, KeyOperationQueue& key_queue,
-                              bool allow_writes, std::size_t max_getall_results, ActiveRequestType active_request,
-                              const std::uint8_t* data, std::size_t size) {
+inline void dispatch_request(NameCache& name_cache, IdCache& id_cache, SecurityCache& security_cache, NatsBridge& nats,
+                              const std::string& name_bucket, const std::string& id_bucket,
+                              const std::string& security_bucket, CompletionQueue& completions,
+                              KeyOperationQueue& key_queue, bool allow_writes, std::size_t max_getall_results,
+                              ActiveRequestType active_request, const std::uint8_t* data, std::size_t size) {
     try {
         wire::Reader r(data, size);
         const auto op = static_cast<wire::Op>(r.u8());
         const auto kind = static_cast<wire::KeyKind>(r.u8());
 
         if (op == wire::Op::Get || op == wire::Op::GetAll) {
-            dispatch_read_request(name_cache, id_cache, nats, name_bucket, id_bucket, completions, key_queue,
-                                   max_getall_results, op, kind, r, active_request);
+            dispatch_read_request(name_cache, id_cache, security_cache, nats, name_bucket, id_bucket, security_bucket,
+                                   completions, key_queue, max_getall_results, op, kind, r, active_request);
         } else {
-            dispatch_write_request(nats, name_bucket, id_bucket, completions, key_queue, allow_writes, op, kind, r,
-                                    active_request);
+            dispatch_write_request(nats, name_bucket, id_bucket, security_bucket, completions, key_queue,
+                                    allow_writes, op, kind, r, active_request);
         }
     } catch (const std::exception&) {
         respond(active_request, encode_status(wire::Status::Error));

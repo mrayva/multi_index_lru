@@ -1,10 +1,11 @@
 /// POC: multi_index_lru served over iceoryx2 request-response, purely
 /// in-memory (no backing store).
 ///
-/// Owns two independent multi_index_lru::Container instances -- one keyed by
-/// string, one keyed by int64 -- and answers get/put/erase requests from
-/// other processes. Request/response bodies are the small binary protocol
-/// defined in cache_service.hpp / wire.hpp.
+/// Owns three independent multi_index_lru caches -- one keyed by string, one
+/// by int64, and one by security_cache.hpp's 5-field (asset_type, cusip,
+/// isin, sedol, ric) composite key -- and answers get/put/erase requests
+/// from other processes. Request/response bodies are the small binary
+/// protocol defined in cache_service.hpp / wire.hpp.
 ///
 /// This process is the only one that touches either container directly, so
 /// the documented single-threaded/no-internal-locking constraints of
@@ -76,6 +77,12 @@ int main(int argc, char** argv) {
     poc::IdCache id_cache(capacity, ttl);
     id_cache.emplace(poc::IdEntry{1, to_bytes(R"({"id":1,"name":"Alice"})")});
     id_cache.emplace(poc::IdEntry{2, to_bytes(R"({"id":2,"name":"Bob"})")});
+
+    poc::SecurityCache security_cache(capacity, ttl);
+    security_cache.emplace(poc::SecurityEntry{"EQUITY", "037833100", "US0378331005", "2046251", "AAPL_OQ",
+                                                to_bytes(R"({"name":"Apple Inc."})")});
+    security_cache.emplace(poc::SecurityEntry{"EQUITY", "594918104", "US5949181045", "2588173", "MSFT_OQ",
+                                                to_bytes(R"({"name":"Microsoft Corp."})")});
     auto last_cleanup = std::chrono::steady_clock::now();
 
     // --- set up the iceoryx2 side ----------------------------------------
@@ -99,7 +106,7 @@ int main(int argc, char** argv) {
               << "Ctrl+C to stop.\n";
 
     while (node.wait(kCycleTime).has_value()) {
-        poc::cleanup_expired_periodically(name_cache, id_cache, last_cleanup, kCleanupInterval);
+        poc::cleanup_expired_periodically(name_cache, id_cache, security_cache, last_cleanup, kCleanupInterval);
 
         while (true) {
             auto active_request = server.receive().value();
@@ -109,7 +116,8 @@ int main(int argc, char** argv) {
 
             const auto& request_payload = active_request->payload();
             auto response_bytes = poc::handle_request_local(
-                name_cache, id_cache, request_payload.data(), request_payload.number_of_bytes(), max_getall_results);
+                name_cache, id_cache, security_cache, request_payload.data(), request_payload.number_of_bytes(),
+                max_getall_results);
             std::cout << "[server] handled request (" << request_payload.number_of_bytes() << " bytes in, "
                       << response_bytes.size() << " bytes out), caches now have " << name_cache.size()
                       << " name-keyed + " << id_cache.size() << " id-keyed entries\n";

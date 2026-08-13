@@ -14,14 +14,22 @@
 ///   cache_poc_client put    id   <id>   <record-text>
 ///   cache_poc_client getall <category>
 ///   cache_poc_client getallprefix <name-prefix>
+///   cache_poc_client get    security <asset_type> <cusip> <isin> <sedol> <ric>
+///   cache_poc_client erase  security <asset_type> <cusip> <isin> <sedol> <ric>
+///   cache_poc_client put    security <asset_type> <cusip> <isin> <sedol> <ric> <record-text>
+///   cache_poc_client findsecurity <asset_type|*> <cusip|*> <isin|*> <sedol|*> <ric|*>
 ///
 /// `getall` and `put name`'s optional trailing [category] exercise
 /// NameCache's second (non-unique) index -- see cache_service.hpp
 /// "Non-unique key lookup (GetAll)". Id-keyed entries have no category.
 ///
-/// `getallprefix` is NATS-backed only (server_readthrough.cpp) -- see
-/// cache_service.hpp "Prefix lookup (GetAll, KeyKind::Name)". Against
-/// server.cpp (no NATS) it always responds "error".
+/// `getallprefix` and `findsecurity` are NATS-backed only
+/// (server_readthrough.cpp/server_readthrough_ecal.cpp) -- see
+/// cache_service.hpp "Prefix lookup (GetAll, KeyKind::Name)" and "GetAll
+/// (Security, pattern find)". Against server.cpp (no NATS) they always
+/// respond "error". `findsecurity` takes a literal value or "*" (wildcard,
+/// SecurityKey::pattern()'s nats_any) per field, in security_cache.hpp's
+/// (asset_type, cusip, isin, sedol, ric) order.
 ///
 /// Run server.cpp (or server_readthrough.cpp) first in one terminal, then
 /// this in another.
@@ -36,6 +44,7 @@
 
 #include <cstdlib>
 #include <iostream>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -130,6 +139,10 @@ void print_get_all_prefix_result(const std::vector<std::uint8_t>& response_bytes
     }
 }
 
+std::vector<std::uint8_t> to_bytes(const std::string& s) {
+    return std::vector<std::uint8_t>(s.begin(), s.end());
+}
+
 template <typename Client>
 void run_demo_script(Client& client, iox2::Node<iox2::ServiceType::Ipc>& node) {
     std::cout << "--- string-keyed cache ---\n";
@@ -203,6 +216,42 @@ void run_demo_script(Client& client, iox2::Node<iox2::ServiceType::Ipc>& node) {
 
     std::cout << "[client] GET id=42 (erased) ...\n";
     print_get_result(call(client, node, poc::encode_get(poc::wire::KeyKind::Id, "", 42)));
+
+    std::cout << "\n--- security-keyed cache (5-field composite key) ---\n";
+
+    std::cout << "[client] GET security AAPL (pre-seeded) ...\n";
+    print_get_result(call(client, node,
+                           poc::encode_get_security("EQUITY", "037833100", "US0378331005", "2046251", "AAPL_OQ")));
+
+    std::cout << "[client] GET security for a CUSIP that does not exist yet ...\n";
+    print_get_result(call(client, node,
+                           poc::encode_get_security("EQUITY", "000000000", "US0000000000", "0000000", "NONE")));
+
+    std::cout << "[client] PUT security (new row) ...\n";
+    print_status_result(
+        call(client, node,
+             poc::encode_put_security("BOND", "912828YK0", "US912828YK00", "BQZTSK1", "T_4.5_2044",
+                                       to_bytes(R"({"name":"US Treasury 4.5% 2044"})"))),
+        "put");
+
+    std::cout << "[client] GET security for the just-PUT row ...\n";
+    print_get_result(
+        call(client, node, poc::encode_get_security("BOND", "912828YK0", "US912828YK00", "BQZTSK1", "T_4.5_2044")));
+
+    std::cout << "[client] ERASE security for the just-PUT row ...\n";
+    print_status_result(
+        call(client, node,
+             poc::encode_erase_security("BOND", "912828YK0", "US912828YK00", "BQZTSK1", "T_4.5_2044")),
+        "erase");
+
+    std::cout << "[client] GET security for the erased row ...\n";
+    print_get_result(
+        call(client, node, poc::encode_get_security("BOND", "912828YK0", "US912828YK00", "BQZTSK1", "T_4.5_2044")));
+
+    std::cout << "[client] FINDSECURITY pattern find (NATS-backed only -- against server.cpp this always errors) ...\n";
+    print_get_all_prefix_result(call(
+        client, node,
+        poc::encode_find_security("EQUITY", std::nullopt, "US0378331005", std::nullopt, std::nullopt)));
 }
 
 template <typename Client>
@@ -219,7 +268,26 @@ void run_manual_command(Client& client, iox2::Node<iox2::ServiceType::Ipc>& node
         }
     };
 
-    if (verb == "get" && args.size() == 3) {
+    if (verb == "get" && args.size() == 7 && args[1] == "security") {
+        print_get_result(call(client, node, poc::encode_get_security(args[2], args[3], args[4], args[5], args[6])));
+    } else if (verb == "erase" && args.size() == 7 && args[1] == "security") {
+        print_status_result(
+            call(client, node, poc::encode_erase_security(args[2], args[3], args[4], args[5], args[6])), "erase");
+    } else if (verb == "put" && args.size() == 8 && args[1] == "security") {
+        const auto& text = args[7];
+        print_status_result(
+            call(client, node,
+                 poc::encode_put_security(args[2], args[3], args[4], args[5], args[6],
+                                           std::vector<std::uint8_t>(text.begin(), text.end()))),
+            "put");
+    } else if (verb == "findsecurity" && args.size() == 6) {
+        auto field = [](const std::string& s) -> std::optional<std::string> {
+            return (s == "*") ? std::nullopt : std::optional<std::string>(s);
+        };
+        print_get_all_prefix_result(call(
+            client, node,
+            poc::encode_find_security(field(args[1]), field(args[2]), field(args[3]), field(args[4]), field(args[5]))));
+    } else if (verb == "get" && args.size() == 3) {
         poc::wire::KeyKind kind{};
         std::string name;
         std::int64_t id = 0;
@@ -259,7 +327,12 @@ void run_manual_command(Client& client, iox2::Node<iox2::ServiceType::Ipc>& node
                   << "  cache_poc_client put    name <name> <record-text> [category]\n"
                   << "  cache_poc_client put    id   <id>   <record-text>\n"
                   << "  cache_poc_client getall <category>\n"
-                  << "  cache_poc_client getallprefix <name-prefix>          (NATS-backed only)\n";
+                  << "  cache_poc_client getallprefix <name-prefix>          (NATS-backed only)\n"
+                  << "  cache_poc_client get    security <asset_type> <cusip> <isin> <sedol> <ric>\n"
+                  << "  cache_poc_client erase  security <asset_type> <cusip> <isin> <sedol> <ric>\n"
+                  << "  cache_poc_client put    security <asset_type> <cusip> <isin> <sedol> <ric> <record-text>\n"
+                  << "  cache_poc_client findsecurity <asset_type|*> <cusip|*> <isin|*> <sedol|*> <ric|*>"
+                     "  (NATS-backed only)\n";
         std::exit(1);
     }
 }

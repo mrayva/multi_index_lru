@@ -3,11 +3,12 @@
 /// request-response protocol as server.cpp (cache_poc_client talks to
 /// either).
 ///
-/// Two independent Container instances (string-keyed / int64-keyed), each
-/// backed by its own NATS KV bucket (default names below, see "Configurable
-/// via..." further down).
-///   - name cache -> bucket "mil_by_name"
-///   - id cache   -> bucket "mil_by_id"
+/// Three independent caches (string-keyed / int64-keyed / security_cache
+/// .hpp's 5-field composite key), each backed by its own NATS KV bucket
+/// (default names below, see "Configurable via..." further down).
+///   - name cache     -> bucket "mil_by_name"
+///   - id cache       -> bucket "mil_by_id"
+///   - security cache -> bucket "mil_by_security"
 ///
 /// Both buckets must already exist -- nats_asio has no bucket-creation call,
 /// see README.md for the one-time `nats kv add` setup commands.
@@ -70,6 +71,7 @@
 ///   --nats-port / MIL_NATS_PORT                      (default 4222)
 ///   --name-bucket / MIL_NAME_BUCKET                  (default poc::kNameBucket)
 ///   --id-bucket / MIL_ID_BUCKET                       (default poc::kIdBucket)
+///   --security-bucket / MIL_SECURITY_BUCKET          (default poc::kSecurityBucket)
 ///   --nats-timeout-ms / MIL_NATS_TIMEOUT_MS          (default 3000)
 ///   --cb-failure-threshold / MIL_CB_FAILURE_THRESHOLD (default 3)
 ///   --cb-open-duration-ms / MIL_CB_OPEN_DURATION_MS   (default 2000)
@@ -126,6 +128,8 @@ int main(int argc, char** argv) {
     const std::uint16_t nats_port = poc::config::resolve_u16(args, "--nats-port", "MIL_NATS_PORT", 4222);
     const std::string name_bucket = poc::config::resolve_str(args, "--name-bucket", "MIL_NAME_BUCKET", poc::kNameBucket);
     const std::string id_bucket = poc::config::resolve_str(args, "--id-bucket", "MIL_ID_BUCKET", poc::kIdBucket);
+    const std::string security_bucket =
+        poc::config::resolve_str(args, "--security-bucket", "MIL_SECURITY_BUCKET", poc::kSecurityBucket);
     const auto nats_timeout = poc::config::resolve_millis(args, "--nats-timeout-ms", "MIL_NATS_TIMEOUT_MS", 3000);
     const int cb_failure_threshold =
         poc::config::resolve_int(args, "--cb-failure-threshold", "MIL_CB_FAILURE_THRESHOLD", 3);
@@ -152,6 +156,7 @@ int main(int argc, char** argv) {
     // loop exits (e.g. on SIGTERM).
     poc::NameCache name_cache(capacity, ttl);
     poc::IdCache id_cache(capacity, ttl);
+    poc::SecurityCache security_cache(capacity, ttl);
     poc::CompletionQueue completions;
     poc::KeyOperationQueue key_queue(max_queue_depth_per_key);
     poc::RevisionTracker revisions;
@@ -170,15 +175,19 @@ int main(int argc, char** argv) {
     // apply_pending_invalidations()) but harmless (and cheap) to always
     // carry -- keeps the decision of whether they matter entirely on the
     // main thread, not duplicated here.
-    auto on_kv_change = [&invalidations, name_bucket](const nats_asio::kv_entry& entry) {
-        invalidations.push(entry.bucket == name_bucket, entry.key, entry.revision,
+    auto on_kv_change = [&invalidations, name_bucket, id_bucket](const nats_asio::kv_entry& entry) {
+        const auto cache_kind = (entry.bucket == name_bucket)  ? poc::CacheKind::Name
+                                 : (entry.bucket == id_bucket) ? poc::CacheKind::Id
+                                                                 : poc::CacheKind::Security;
+        invalidations.push(cache_kind, entry.key, entry.revision,
                             std::vector<std::uint8_t>(entry.value.begin(), entry.value.end()),
                             entry.op == nats_asio::kv_entry::operation::put);
     };
     nats.watch(name_bucket, on_kv_change);
     nats.watch(id_bucket, on_kv_change);
-    std::cout << "[server] watching buckets \"" << name_bucket << "\" / \"" << id_bucket
-              << "\" for external changes, prewarming from their current contents for the next "
+    nats.watch(security_bucket, on_kv_change);
+    std::cout << "[server] watching buckets \"" << name_bucket << "\" / \"" << id_bucket << "\" / \""
+              << security_bucket << "\" for external changes, prewarming from their current contents for the next "
               << prewarm_window.count() << "ms\n";
 
     // Prewarm: for prewarm_window after the watch subscriptions above are
@@ -206,8 +215,8 @@ int main(int argc, char** argv) {
                       .value();
 
     std::cout << "[server] read-through cache daemon ready (non-blocking), service \"" << service_name
-              << "\", buckets \"" << name_bucket << "\" / \"" << id_bucket << "\", writes "
-              << (allow_writes ? "enabled (--allow-writes)" : "disabled (read-only by default)")
+              << "\", buckets \"" << name_bucket << "\" / \"" << id_bucket << "\" / \"" << security_bucket
+              << "\", writes " << (allow_writes ? "enabled (--allow-writes)" : "disabled (read-only by default)")
               << ". Ctrl+C to stop.\n";
 
     while (node.wait(kCycleTime).has_value()) {
@@ -215,7 +224,7 @@ int main(int argc, char** argv) {
         // before looking at new requests, so deferred requests don't wait
         // behind a burst of fresh local-hit ones.
         for (auto& completion : completions.drain()) {
-            auto response_bytes = completion.apply(name_cache, id_cache);
+            auto response_bytes = completion.apply(name_cache, id_cache, security_cache);
             const auto status = static_cast<poc::wire::Status>(response_bytes[0]);
             std::cout << "[server] " << completion.description << " -> "
                       << (status == poc::wire::Status::Ok       ? "ok (NATS)"
@@ -235,8 +244,9 @@ int main(int argc, char** argv) {
             key_queue.complete(completion.queue_key);
         }
 
-        poc::apply_pending_invalidations(name_cache, id_cache, revisions, invalidations, prewarm_deadline);
-        poc::cleanup_expired_periodically(name_cache, id_cache, last_cleanup, kCleanupInterval);
+        poc::apply_pending_invalidations(name_cache, id_cache, security_cache, revisions, invalidations,
+                                          prewarm_deadline);
+        poc::cleanup_expired_periodically(name_cache, id_cache, security_cache, last_cleanup, kCleanupInterval);
 
         while (true) {
             auto active_request_opt = server.receive().value();
@@ -247,9 +257,9 @@ int main(int argc, char** argv) {
             const auto& payload = active_request_opt->payload();
             std::vector<std::uint8_t> request_bytes(payload.data(), payload.data() + payload.number_of_bytes());
 
-            poc::dispatch_request(name_cache, id_cache, nats, name_bucket, id_bucket, completions, key_queue,
-                                   allow_writes, max_getall_results, std::move(active_request_opt.value()),
-                                   request_bytes.data(), request_bytes.size());
+            poc::dispatch_request(name_cache, id_cache, security_cache, nats, name_bucket, id_bucket, security_bucket,
+                                   completions, key_queue, allow_writes, max_getall_results,
+                                   std::move(active_request_opt.value()), request_bytes.data(), request_bytes.size());
         }
     }
 
