@@ -10,6 +10,14 @@ target_link_libraries(zerialize_cache PRIVATE multi_index_lru::multi_index_lru)
 add_executable(expirable_cache expirable_cache.cpp)
 target_link_libraries(expirable_cache PRIVATE multi_index_lru::multi_index_lru)
 
+if(MULTI_INDEX_LRU_BUILD_ZERIALIZE_TESTS)
+    add_executable(zerialize_real_cache zerialize_real_cache.cpp)
+    target_link_libraries(zerialize_real_cache PRIVATE
+        multi_index_lru::multi_index_lru
+        zerialize
+    )
+endif()
+
 if(MULTI_INDEX_LRU_BUILD_SBEPP_EXAMPLE)
     if(NOT DEFINED MULTI_INDEX_LRU_SBEPP_GENERATED_DIR)
         message(FATAL_ERROR "Set MULTI_INDEX_LRU_SBEPP_GENERATED_DIR to the directory with sbepp-generated headers")

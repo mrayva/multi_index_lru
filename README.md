@@ -15,7 +15,7 @@ This library provides an LRU cache that supports multiple indices for efficient 
 - **Configurable node reuse**: Recycles evicted/erased nodes for assignable value types, with an optional retention bound
 - **Access tracking**: `find()` operations automatically refresh the item's position in the LRU order
 - **TTL expiration**: Items automatically expire after a configurable time-to-live
-- **Zerialize support**: Cache serialized binary data (MsgPack, CBOR, JSON, Flex, ZERA) with extracted indices
+- **Zerialize support**: Cache serialized binary data (MsgPack, CBOR, JSON, Flex, ZERA, BSON, Ion, and BEVE) with extracted indices
 - **SBE support**: Cache SBE payload bytes with extracted keys and build non-owning views on demand
 - **C++20**: Modern C++ with concepts, `[[nodiscard]]`, etc.
 - **Based on Boost.MultiIndex**: Leverages the battle-tested Boost library
@@ -25,7 +25,7 @@ This library provides an LRU cache that supports multiple indices for efficient 
 - C++20 compatible compiler (CI covers GCC 11/13 and Clang 14/18)
 - Boost 1.74+ (CI covers 1.74, 1.83, 1.91, and scheduled MultiIndex `develop`)
 - CMake 3.20+ (for building tests/examples)
-- [zerialize](https://github.com/mrayva/zerialize) (optional, for binary format caching)
+- [zerialize](https://github.com/mrayva/zerialize) (optional, for binary format caching; `zerialize_test.cpp`/`zerialize_cache.cpp` build against a hand-written mock with zero external dependencies by default — set `-DMULTI_INDEX_LRU_BUILD_ZERIALIZE_TESTS=ON` to `FetchContent` the real library and additionally build `test/zerialize_real_test.cpp` and `example/zerialize_real_cache.cpp` against it)
 - [sbepp 1.8+](https://github.com/OleksandrKvl/sbepp) (optional, for the concrete SBE example; CI pins 1.8.0 and uses matching `sbeppc` and library revisions)
 
 ## Installation
@@ -293,7 +293,7 @@ class ExpirableContainer;
 
 ## Zerialize Integration
 
-The library provides adapters for caching serialized binary data from [zerialize](https://github.com/mrayva/zerialize), supporting all 5 formats:
+The library provides adapters for caching serialized binary data from [zerialize](https://github.com/mrayva/zerialize). All formats zerialize ships satisfy the same `ZerializeDeserializer` concept used throughout this integration (`D(data)`, `d["field"]`, `d.isMap()`) and are interchangeable as the `Deserializer` template argument to `EntryBuilder`/`ZerializeEntry::deserialize<D>()`:
 
 | Format | Deserializer | Zero-Copy | Best For |
 |--------|--------------|-----------|----------|
@@ -301,7 +301,40 @@ The library provides adapters for caching serialized binary data from [zerialize
 | **MsgPack** | `zerialize::MsgPack::Deserializer` | Yes | Compact binary, wide support |
 | **CBOR** | `zerialize::CBOR::Deserializer` | Yes | IoT, constrained environments |
 | **Flex** | `zerialize::Flex::Deserializer` | Yes | Schema-less with fast access |
-| **ZERA** | `zerialize::ZERA::Deserializer` | Yes | High-performance, tensors |
+| **ZERA** | `zerialize::Zera::Deserializer` | Yes | High-performance, tensors |
+| **BSON** | `zerialize::Bson::Deserializer` | Yes | MongoDB/document-store interop |
+| **Ion** | `zerialize::Ion::Deserializer` | Yes | Amazon Ion interop |
+| **BEVE** | `zerialize::Beve::Deserializer` | Yes | Opt-in in zerialize itself (`ZERIALIZE_ENABLE_BEVE`); raises the required C++ standard to C++23, so it's not exercised by this repo's own C++20 test/example targets |
+
+All seven of JSON/MsgPack/CBOR/Flex/ZERA/BSON/Ion (everything except BEVE, for the C++20 reason
+above) are covered by `test/zerialize_real_test.cpp` when built against the real library — see
+"Testing Against Real zerialize" below.
+
+### Testing Against Real zerialize
+
+By default, `zerialize_test.cpp` and the `zerialize_cache` example build against a small
+hand-written `mock_zerialize` namespace, so this library and its test suite have zero external
+dependencies out of the box. That mock is useful for exercising this library's *own* logic
+(`EntryBuilder`, key extractors, `Container` integration) independently of any serialization
+format — but on its own it says nothing about whether the real zerialize protocols actually work
+here, since `ZerializeFormatsTest`'s JSON/MsgPack/CBOR/Flex/ZERA cases all instantiate the exact
+same mock type under five different aliased names.
+
+Configure with `-DMULTI_INDEX_LRU_BUILD_ZERIALIZE_TESTS=ON` to `FetchContent` the real
+[zerialize](https://github.com/mrayva/zerialize) library (which vendors its own protocol
+dependencies — yyjson, msgpack-c, jsoncons, flatbuffers — via its own `CMakeLists.txt`, so nothing
+further is needed) and additionally build:
+
+- `test/zerialize_real_test.cpp` — the same composite-key/single-key round trip as
+  `ZerializeCacheTest`, but through real `zerialize::serialize<Protocol>(...)`-encoded bytes for
+  each of the seven C++20-buildable formats.
+- `example/zerialize_real_cache.cpp` — the real-library counterpart to `zerialize_cache.cpp`.
+
+```bash
+cmake -B build -DMULTI_INDEX_LRU_BUILD_ZERIALIZE_TESTS=ON
+cmake --build build
+./build/test/multi_index_lru_test --gtest_filter='ZerializeRealFormatsTest.*'
+```
 
 ### Architecture
 

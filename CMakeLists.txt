@@ -22,8 +22,12 @@ option(MULTI_INDEX_LRU_BUILD_EXAMPLES "Build examples" ON)
 option(MULTI_INDEX_LRU_BUILD_BENCHMARKS "Build performance benchmarks" OFF)
 option(MULTI_INDEX_LRU_USE_BOOST_DEVELOP "Fetch a recent Boost.MultiIndex and its header dependencies" OFF)
 option(MULTI_INDEX_LRU_BUILD_SBEPP_EXAMPLE "Build the sbepp integration example" OFF)
+option(MULTI_INDEX_LRU_BUILD_ZERIALIZE_TESTS
+    "Fetch the real zerialize library and test/exercise it directly, instead of only the mocks in zerialize_test.cpp/zerialize_cache.cpp" OFF)
 set(MULTI_INDEX_LRU_BOOST_GIT_TAG "develop" CACHE STRING
     "Git tag or branch used for fetched Boost modules (for example develop or boost-1.91.0)")
+set(MULTI_INDEX_LRU_ZERIALIZE_GIT_TAG "main" CACHE STRING
+    "Git tag/branch/commit of zerialize to fetch when MULTI_INDEX_LRU_BUILD_ZERIALIZE_TESTS is ON")
 
 # Boost.MultiIndex handling
 if(MULTI_INDEX_LRU_USE_BOOST_DEVELOP)
@@ -65,6 +69,31 @@ else()
     # Use system-installed Boost
     find_package(Boost 1.74 REQUIRED)
     set(BOOST_TARGET Boost::boost)
+endif()
+
+# Real zerialize (optional, opt-in)
+#
+# zerialize_test.cpp/zerialize_cache.cpp default to a hand-written
+# mock_zerialize namespace so the library and its tests/examples build with
+# zero external dependencies. That mock is useful for exercising this
+# library's own logic (EntryBuilder, key extractors, Container integration)
+# independently of any serialization format, but on its own it proves
+# nothing about whether the real zerialize protocols actually work as
+# Deserializer types here -- ZerializeFormatsTest's JSON/MsgPack/CBOR/Flex/
+# ZERA cases, for example, all instantiate the exact same MockDeserializer
+# under five different aliased names. Turning this option on fetches the
+# real library (which vendors its own protocol dependencies -- yyjson,
+# msgpack-c, jsoncons, flatbuffers -- via its own CMakeLists.txt) and adds
+# integration coverage against it; see test/zerialize_real_test.cpp and
+# example/zerialize_real_cache.cpp.
+if(MULTI_INDEX_LRU_BUILD_ZERIALIZE_TESTS)
+    include(FetchContent)
+    FetchContent_Declare(
+        zerialize
+        GIT_REPOSITORY https://github.com/mrayva/zerialize.git
+        GIT_TAG ${MULTI_INDEX_LRU_ZERIALIZE_GIT_TAG}
+    )
+    FetchContent_MakeAvailable(zerialize)
 endif()
 
 # Header-only library target

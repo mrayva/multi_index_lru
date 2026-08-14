@@ -39,10 +39,21 @@
 namespace multi_index_lru {
 
 /// @brief Concept for zerialize deserializer
+///
+/// `d["field"]`'s result type is intentionally unconstrained here, matching
+/// zerialize's own `Reader` concept (`concepts.hpp`): "lightweight subviews
+/// [may be] returned by operator[]" rather than the deserializer's own
+/// type. `zerialize::Zera::Deserializer` (`zera::ZeraDeserializer`) is a
+/// real example -- its `operator[]` (inherited from `ZeraViewBase`) returns
+/// a distinct `ZeraValue` subview type, not `ZeraDeserializer` itself.
+/// Requiring `convertible_to<D>` here would reject that legitimate,
+/// shipped backend even though every extractor below only ever calls
+/// `.asInt64()`/`.asString()`/etc. on whatever `operator[]` returns, never
+/// requires the result to *be* `D`.
 template <typename D>
 concept ZerializeDeserializer = requires(D d, std::span<const uint8_t> data) {
     D(data);
-    { d["field"] } -> std::convertible_to<D>;
+    d["field"];
     { d.isMap() } -> std::same_as<bool>;
 };
 

@@ -23,5 +23,10 @@ target_link_libraries(multi_index_lru_test PRIVATE
     GTest::gtest_main
 )
 
+if(MULTI_INDEX_LRU_BUILD_ZERIALIZE_TESTS)
+    target_sources(multi_index_lru_test PRIVATE zerialize_real_test.cpp)
+    target_link_libraries(multi_index_lru_test PRIVATE zerialize)
+endif()
+
 include(GoogleTest)
 gtest_discover_tests(multi_index_lru_test)
