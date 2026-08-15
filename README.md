@@ -304,11 +304,11 @@ The library provides adapters for caching serialized binary data from [zerialize
 | **ZERA** | `zerialize::Zera::Deserializer` | Yes | High-performance, tensors |
 | **BSON** | `zerialize::Bson::Deserializer` | Yes | MongoDB/document-store interop |
 | **Ion** | `zerialize::Ion::Deserializer` | Yes | Amazon Ion interop |
-| **BEVE** | `zerialize::Beve::Deserializer` | Yes | Opt-in in zerialize itself (`ZERIALIZE_ENABLE_BEVE`); raises the required C++ standard to C++23, so it's not exercised by this repo's own C++20 test/example targets |
+| **BEVE** | `zerialize::Beve::Deserializer` | Yes | High-performance binary; needs a separate C++23 opt-in (see below) |
 
-All seven of JSON/MsgPack/CBOR/Flex/ZERA/BSON/Ion (everything except BEVE, for the C++20 reason
-above) are covered by `test/zerialize_real_test.cpp` when built against the real library — see
-"Testing Against Real zerialize" below.
+All eight formats are covered by `test/zerialize_real_test.cpp` (JSON/MsgPack/CBOR/Flex/ZERA/
+BSON/Ion) and `test/zerialize_beve_test.cpp` (BEVE, separately) when built against the real
+library — see "Testing Against Real zerialize" below.
 
 ### Testing Against Real zerialize
 
@@ -317,23 +317,38 @@ hand-written `mock_zerialize` namespace, so this library and its test suite have
 dependencies out of the box. That mock is useful for exercising this library's *own* logic
 (`EntryBuilder`, key extractors, `Container` integration) independently of any serialization
 format — but on its own it says nothing about whether the real zerialize protocols actually work
-here, since `ZerializeFormatsTest`'s JSON/MsgPack/CBOR/Flex/ZERA cases all instantiate the exact
-same mock type under five different aliased names.
+here, since `ZerializeFormatsTest`'s JSON/MsgPack/CBOR/Flex/ZERA/BSON/Ion cases all instantiate the
+exact same mock type under seven differently-named aliases.
 
 Configure with `-DMULTI_INDEX_LRU_BUILD_ZERIALIZE_TESTS=ON` to `FetchContent` the real
 [zerialize](https://github.com/mrayva/zerialize) library (which vendors its own protocol
 dependencies — yyjson, msgpack-c, jsoncons, flatbuffers — via its own `CMakeLists.txt`, so nothing
 further is needed) and additionally build:
 
-- `test/zerialize_real_test.cpp` — the same composite-key/single-key round trip as
-  `ZerializeCacheTest`, but through real `zerialize::serialize<Protocol>(...)`-encoded bytes for
-  each of the seven C++20-buildable formats.
+- `test/zerialize_real_test.cpp` (its own `zerialize_real_test` executable, C++20) — the same
+  composite-key/single-key round trip as `ZerializeCacheTest`, but through real
+  `zerialize::serialize<Protocol>(...)`-encoded bytes, for JSON/MsgPack/CBOR/Flex/ZERA/BSON/Ion.
 - `example/zerialize_real_cache.cpp` — the real-library counterpart to `zerialize_cache.cpp`.
 
 ```bash
 cmake -B build -DMULTI_INDEX_LRU_BUILD_ZERIALIZE_TESTS=ON
 cmake --build build
-./build/test/multi_index_lru_test --gtest_filter='ZerializeRealFormatsTest.*'
+./build/test/zerialize_real_test --gtest_filter='ZerializeRealFormatsTest.*'
+```
+
+BEVE needs a second, separate opt-in: `-DMULTI_INDEX_LRU_BUILD_ZERIALIZE_BEVE_TESTS=ON` (which
+requires `MULTI_INDEX_LRU_BUILD_ZERIALIZE_TESTS=ON` too). BEVE's backend (glaze) hard-requires
+C++23, so it's built as its own `zerialize_beve_test` executable target at C++23 via its own
+`target_compile_features`, rather than raising the whole project's C++ standard. The base
+`multi_index_lru_test` binary (everything not touching zerialize) always stays C++20 regardless —
+only the zerialize-linking targets are affected, and only `zerialize_real_test` additionally moves
+to C++23 alongside `zerialize_beve_test` when this is turned on, since both link the same
+now-BEVE-enabled `zerialize` dependency.
+
+```bash
+cmake -B build -DMULTI_INDEX_LRU_BUILD_ZERIALIZE_TESTS=ON -DMULTI_INDEX_LRU_BUILD_ZERIALIZE_BEVE_TESTS=ON
+cmake --build build
+./build/test/zerialize_beve_test --gtest_filter='ZerializeRealFormatsTest.*'
 ```
 
 ### Architecture

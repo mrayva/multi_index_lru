@@ -24,6 +24,8 @@ option(MULTI_INDEX_LRU_USE_BOOST_DEVELOP "Fetch a recent Boost.MultiIndex and it
 option(MULTI_INDEX_LRU_BUILD_SBEPP_EXAMPLE "Build the sbepp integration example" OFF)
 option(MULTI_INDEX_LRU_BUILD_ZERIALIZE_TESTS
     "Fetch the real zerialize library and test/exercise it directly, instead of only the mocks in zerialize_test.cpp/zerialize_cache.cpp" OFF)
+option(MULTI_INDEX_LRU_BUILD_ZERIALIZE_BEVE_TESTS
+    "Additionally build a separate, C++23-only test target covering zerialize's BEVE backend. Requires MULTI_INDEX_LRU_BUILD_ZERIALIZE_TESTS=ON; raises the required standard only for that one target, not the whole project" OFF)
 set(MULTI_INDEX_LRU_BOOST_GIT_TAG "develop" CACHE STRING
     "Git tag or branch used for fetched Boost modules (for example develop or boost-1.91.0)")
 set(MULTI_INDEX_LRU_ZERIALIZE_GIT_TAG "main" CACHE STRING
@@ -86,6 +88,27 @@ endif()
 # dependencies -- yyjson, msgpack-c, jsoncons, flatbuffers -- via its own
 # CMakeLists.txt) and adds integration coverage against it; see
 # test/zerialize_real_test.cpp and example/zerialize_real_cache.cpp.
+#
+# BEVE is covered by a separate MULTI_INDEX_LRU_BUILD_ZERIALIZE_BEVE_TESTS
+# option (see test/zerialize_beve_test.cpp) rather than being folded into
+# the above: it needs C++23 (glaze's own CMakeLists.txt hard-requires it).
+# Enabling it turns on ZERIALIZE_ENABLE_BEVE for the one shared `zerialize`
+# FetchContent target below, which makes THAT target itself require C++23
+# -- and CMake computes a target's required standard from every target it
+# links, so anything linking `zerialize` inherits that requirement too.
+# test/zerialize_real_test.cpp lives in its own executable target
+# specifically so it (and only it, plus the new zerialize_beve_test) is
+# what moves to C++23 when this is turned on -- multi_index_lru_test never
+# links `zerialize` at all, so it (and every base/compatibility-matrix CI
+# job, none of which touch either zerialize option) stays C++20
+# unconditionally. See test/CMakeLists.txt for the full explanation.
+if(MULTI_INDEX_LRU_BUILD_ZERIALIZE_BEVE_TESTS AND NOT MULTI_INDEX_LRU_BUILD_ZERIALIZE_TESTS)
+    message(FATAL_ERROR
+        "MULTI_INDEX_LRU_BUILD_ZERIALIZE_BEVE_TESTS requires "
+        "MULTI_INDEX_LRU_BUILD_ZERIALIZE_TESTS=ON too (BEVE's test target "
+        "shares the same fetched zerialize dependency).")
+endif()
+
 if(MULTI_INDEX_LRU_BUILD_ZERIALIZE_TESTS)
     include(FetchContent)
     # Without this, zerialize's own CMakeLists.txt (via its CBOR/BSON
@@ -96,6 +119,15 @@ if(MULTI_INDEX_LRU_BUILD_ZERIALIZE_TESTS)
     # removed. Same guard as nats_asio's CMakeLists.txt, which fetches the
     # same zerialize dependency.
     set(JSONCONS_BUILD_TESTS OFF CACHE BOOL "Disable jsoncons tests when vendored" FORCE)
+    if(MULTI_INDEX_LRU_BUILD_ZERIALIZE_BEVE_TESTS)
+        # Off by default in zerialize itself: pulling in glaze (BEVE's
+        # backend) requires C++23, which would otherwise force that
+        # standard on every consumer of the zerialize target. Only the
+        # dedicated zerialize_beve_test executable (see test/CMakeLists.txt)
+        # is actually compiled at C++23 -- this just makes the BEVE headers
+        # available to fetch/link against.
+        set(ZERIALIZE_ENABLE_BEVE ON CACHE BOOL "Enable BEVE (via glaze) for zerialize_beve_test" FORCE)
+    endif()
     FetchContent_Declare(
         zerialize
         GIT_REPOSITORY https://github.com/mrayva/zerialize.git

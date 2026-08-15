@@ -150,6 +150,45 @@ jobs:
       - name: Test
         run: ctest --test-dir _build/zerialize --output-on-failure
 
+  zerialize-beve-integration:
+    name: Real zerialize BEVE integration test (C++23)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y g++-13 libboost1.83-dev ninja-build
+
+      # Same suppressions as the zerialize-integration job above, plus the
+      # same reasoning: these are pre-existing warnings in zerialize's own
+      # vendored headers, not this project's code. Note this job's build
+      # also compiles zerialize_real_test (the other 7 formats) at C++23,
+      # not just the new zerialize_beve_test target -- an unavoidable
+      # consequence of both linking the same now-BEVE-enabled `zerialize`
+      # target, see test/CMakeLists.txt. multi_index_lru_test (the base
+      # test binary, exercised by every other CI job in this file) never
+      # links `zerialize` at all and stays C++20 regardless.
+      - name: Configure
+        env:
+          CC: gcc-13
+          CXX: g++-13
+        run: >-
+          cmake -S . -B _build/zerialize-beve -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DMULTI_INDEX_LRU_BUILD_TESTS=ON
+          -DMULTI_INDEX_LRU_BUILD_EXAMPLES=ON
+          -DMULTI_INDEX_LRU_BUILD_ZERIALIZE_TESTS=ON
+          -DMULTI_INDEX_LRU_BUILD_ZERIALIZE_BEVE_TESTS=ON
+          -DCMAKE_CXX_FLAGS="-Wall -Wextra -Wpedantic -Werror -Wno-misleading-indentation -Wno-unused-function"
+
+      - name: Build
+        run: cmake --build _build/zerialize-beve --parallel 2
+
+      - name: Test
+        run: ctest --test-dir _build/zerialize-beve --output-on-failure
+
   sbepp-integration:
     name: sbepp 1.8.0 integration
     runs-on: ubuntu-24.04
