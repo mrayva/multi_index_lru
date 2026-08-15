@@ -80,14 +80,22 @@ endif()
 # independently of any serialization format, but on its own it proves
 # nothing about whether the real zerialize protocols actually work as
 # Deserializer types here -- ZerializeFormatsTest's JSON/MsgPack/CBOR/Flex/
-# ZERA cases, for example, all instantiate the exact same MockDeserializer
-# under five different aliased names. Turning this option on fetches the
-# real library (which vendors its own protocol dependencies -- yyjson,
-# msgpack-c, jsoncons, flatbuffers -- via its own CMakeLists.txt) and adds
-# integration coverage against it; see test/zerialize_real_test.cpp and
-# example/zerialize_real_cache.cpp.
+# ZERA/BSON/Ion cases, for example, all instantiate the exact same
+# MockDeserializer under seven different aliased names. Turning this
+# option on fetches the real library (which vendors its own protocol
+# dependencies -- yyjson, msgpack-c, jsoncons, flatbuffers -- via its own
+# CMakeLists.txt) and adds integration coverage against it; see
+# test/zerialize_real_test.cpp and example/zerialize_real_cache.cpp.
 if(MULTI_INDEX_LRU_BUILD_ZERIALIZE_TESTS)
     include(FetchContent)
+    # Without this, zerialize's own CMakeLists.txt (via its CBOR/BSON
+    # dependency) builds jsoncons' vendored unit-test suite too, which
+    # currently fails under GCC with -Werror=maybe-uninitialized in one of
+    # jsoncons' own test files (nothing to do with this project or
+    # zerialize) -- confirmed by reproducing the failure with this line
+    # removed. Same guard as nats_asio's CMakeLists.txt, which fetches the
+    # same zerialize dependency.
+    set(JSONCONS_BUILD_TESTS OFF CACHE BOOL "Disable jsoncons tests when vendored" FORCE)
     FetchContent_Declare(
         zerialize
         GIT_REPOSITORY https://github.com/mrayva/zerialize.git

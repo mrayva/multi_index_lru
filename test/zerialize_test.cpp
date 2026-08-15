@@ -18,7 +18,8 @@ namespace {
 
 // =============================================================================
 // Mock deserializer that simulates zerialize API
-// Supports all 5 zerialize format patterns: JSON, MsgPack, CBOR, Flex, ZERA
+// Supports all 7 zerialize format patterns: JSON, MsgPack, CBOR, Flex, ZERA,
+// BSON, Ion (BEVE excluded -- see zerialize_real_test.cpp's header comment)
 // =============================================================================
 
 struct MockData {
@@ -111,6 +112,8 @@ namespace mock_zerialize {
     namespace CBOR { using Deserializer = MockDeserializer; }
     namespace Flex { using Deserializer = MockDeserializer; }
     namespace ZERA { using Deserializer = MockDeserializer; }
+    namespace Bson { using Deserializer = MockDeserializer; }
+    namespace Ion { using Deserializer = MockDeserializer; }
 }
 
 // =============================================================================
@@ -465,6 +468,14 @@ TEST(ZerializeFormatsTest, Flex) {
 
 TEST(ZerializeFormatsTest, ZERA) {
     test_format<mock_zerialize::ZERA::Deserializer>();
+}
+
+TEST(ZerializeFormatsTest, BSON) {
+    test_format<mock_zerialize::Bson::Deserializer>();
+}
+
+TEST(ZerializeFormatsTest, Ion) {
+    test_format<mock_zerialize::Ion::Deserializer>();
 }
 
 // =============================================================================

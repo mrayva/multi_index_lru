@@ -4,8 +4,8 @@
 /// zerialize_test.cpp's ZerializeFormatsTest suite is misleading if read on
 /// its own: test_format<mock_zerialize::JSON::Deserializer>(),
 /// test_format<mock_zerialize::MsgPack::Deserializer>(), and the CBOR/Flex/
-/// ZERA cases all instantiate the *same* MockDeserializer type under five
-/// differently-named aliases (see zerialize_test.cpp's
+/// ZERA/BSON/Ion cases all instantiate the *same* MockDeserializer type
+/// under seven differently-named aliases (see zerialize_test.cpp's
 /// `namespace mock_zerialize { namespace JSON { using Deserializer =
 /// MockDeserializer; } ... }`). That gives zero signal about whether any
 /// real zerialize protocol actually satisfies the ZerializeDeserializer

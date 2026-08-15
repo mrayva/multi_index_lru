@@ -113,6 +113,43 @@ jobs:
       - name: Test
         run: ctest --test-dir build --output-on-failure
 
+  zerialize-integration:
+    name: Real zerialize integration tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y g++-13 libboost1.83-dev ninja-build
+
+      # -Wno-misleading-indentation/-Wno-unused-function: zerialize's own
+      # vendored protocol headers (msgpack.hpp, cbor.hpp, flex.hpp) trip
+      # these under this project's usual -Werror -- misleading-indentation
+      # from one-line `if (cond) return x;` chains in msgpack/cbor, and
+      # unused-function from a Flex debug helper unused outside its own
+      # debug macros. Both are pre-existing in zerialize itself, not this
+      # project's code, so they're suppressed here rather than muted with a
+      # blanket -Wno-error or dropped from the flag set entirely.
+      - name: Configure
+        env:
+          CC: gcc-13
+          CXX: g++-13
+        run: >-
+          cmake -S . -B _build/zerialize -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DMULTI_INDEX_LRU_BUILD_TESTS=ON
+          -DMULTI_INDEX_LRU_BUILD_EXAMPLES=ON
+          -DMULTI_INDEX_LRU_BUILD_ZERIALIZE_TESTS=ON
+          -DCMAKE_CXX_FLAGS="-Wall -Wextra -Wpedantic -Werror -Wno-misleading-indentation -Wno-unused-function"
+
+      - name: Build
+        run: cmake --build _build/zerialize --parallel 2
+
+      - name: Test
+        run: ctest --test-dir _build/zerialize --output-on-failure
+
   sbepp-integration:
     name: sbepp 1.8.0 integration
     runs-on: ubuntu-24.04
