@@ -28,8 +28,13 @@ option(MULTI_INDEX_LRU_BUILD_ZERIALIZE_BEVE_TESTS
     "Additionally build a separate, C++23-only test target covering zerialize's BEVE backend. Requires MULTI_INDEX_LRU_BUILD_ZERIALIZE_TESTS=ON; raises the required standard only for that one target, not the whole project" OFF)
 set(MULTI_INDEX_LRU_BOOST_GIT_TAG "develop" CACHE STRING
     "Git tag or branch used for fetched Boost modules (for example develop or boost-1.91.0)")
-set(MULTI_INDEX_LRU_ZERIALIZE_GIT_TAG "main" CACHE STRING
-    "Git tag/branch/commit of zerialize to fetch when MULTI_INDEX_LRU_BUILD_ZERIALIZE_TESTS is ON")
+set(MULTI_INDEX_LRU_ZERIALIZE_GIT_TAG "e67ed82c90c611db4c65aec946810409d962b3fc" CACHE STRING
+    "Git tag/branch/commit of zerialize to fetch when MULTI_INDEX_LRU_BUILD_ZERIALIZE_TESTS is ON. \
+Pinned to a specific commit rather than a floating branch (was \"main\" until this pin was \
+introduced) so CI is reproducible and a breaking change upstream can't silently break this \
+project's build with no corresponding commit here to bisect against -- override on the CMake \
+command line if you need to track a different revision. e67ed82 fixes zerialize::translate() \
+being O(n^2) in container size for maps/arrays.")
 
 # Boost.MultiIndex handling
 if(MULTI_INDEX_LRU_USE_BOOST_DEVELOP)
